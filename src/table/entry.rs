@@ -34,8 +34,7 @@ impl Entry {
     from_utf8(&self.data[..self.klen]).unwrap()
   }
 
-  #[allow(dead_code)]
-  fn value(&self) -> &str {
+  pub fn value(&self) -> &str {
     from_utf8(&self.data[self.klen..]).unwrap()
   }
 }
