@@ -14,7 +14,7 @@ impl Memtable {
     self.table.len()
   }
 
-  pub fn insert(&mut self, key: &str, value: &str) -> bool {
+  pub fn add(&mut self, key: &str, value: &str) -> bool {
     self.table.replace(Entry::new_value(key, value)).is_none()
   }
 
@@ -47,29 +47,29 @@ mod tests {
   #[test]
   fn insert_get() {
     let mut table = Memtable::new();
-    assert!(table.insert(&"foo", &"bar"));
+    assert!(table.add(&"foo", &"bar"));
     assert_eq!("bar", table.get(&"foo").unwrap());
   }
 
   #[test]
   fn replace_get() {
     let mut table = Memtable::new();
-    assert!(table.insert(&"foo", &"foo"));
-    assert!(!table.insert(&"foo", &"bar"));
+    assert!(table.add(&"foo", &"foo"));
+    assert!(!table.add(&"foo", &"bar"));
     assert_eq!("bar", table.get(&"foo").unwrap());
   }
 
   #[test]
   fn miss_get() {
     let mut table = Memtable::new();
-    table.insert(&"foo", &"bar");
+    table.add(&"foo", &"bar");
     assert!(table.get(&"bar").is_none());
   }
 
   #[test]
   fn miss_deleted() {
     let mut table = Memtable::new();
-    table.insert(&"foo", &"bar");
+    table.add(&"foo", &"bar");
     table.delete(&"foo");
     assert!(table.get(&"foo").is_none());
   }
