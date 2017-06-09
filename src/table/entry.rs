@@ -93,6 +93,18 @@ mod tests {
   use std::mem::size_of;
 
   #[test]
+  fn value_not_deleted() {
+    let entry = Entry::new_value(&"Foo", &"Bar");
+    assert!(!entry.deleted());
+  }
+
+  #[test]
+  fn deletion_is_deleted() {
+    let entry = Entry::new_deletion(&"Foo");
+    assert!(entry.deleted());
+  }
+
+  #[test]
   fn saves_key() {
     let entry = Entry::new_value(&"Foo", &"Bar");
     assert_eq!("Foo", entry.key());
