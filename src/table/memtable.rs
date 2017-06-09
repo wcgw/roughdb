@@ -21,11 +21,7 @@ impl Memtable {
   pub fn get(&self, key: &str) -> Option<&str> {
     match self.table.get(&Entry::new_value(key, "")) {
       None => None,
-      Some(e) => if e.deleted() {
-        None
-      } else {
-        Some(e.value())
-      }
+      Some(e) => e.value(),
     }
   }
 

@@ -19,17 +19,6 @@ pub struct Entry {
 }
 
 impl Entry {
-  pub fn new_deletion(key: &str) -> Entry {
-    let klen = key.len();
-    let mut vec = Vec::with_capacity(klen);
-    vec.extend(key.as_bytes());
-    Entry {
-      vtype: ValueType::Deletion,
-      klen: klen,
-      data: vec,
-    }
-  }
-
   pub fn new_value(key: &str, value: &str) -> Entry {
     // todo Add klen as varints
     let klen = key.len();
@@ -38,6 +27,17 @@ impl Entry {
     vec.extend(value.as_bytes());
     Entry {
       vtype: ValueType::Value,
+      klen: klen,
+      data: vec,
+    }
+  }
+
+  pub fn new_deletion(key: &str) -> Entry {
+    let klen = key.len();
+    let mut vec = Vec::with_capacity(klen);
+    vec.extend(key.as_bytes());
+    Entry {
+      vtype: ValueType::Deletion,
       klen: klen,
       data: vec,
     }
@@ -56,8 +56,11 @@ impl Entry {
     }
   }
 
-  pub fn value(&self) -> &str {
-    from_utf8(&self.data[self.klen..]).unwrap()
+  pub fn value(&self) -> Option<&str> {
+    match self.vtype {
+      ValueType::Deletion => Option::None,
+      _ => Option::Some(from_utf8(&self.data[self.klen..]).unwrap()),
+    }
   }
 }
 
@@ -93,18 +96,6 @@ mod tests {
   use std::mem::size_of;
 
   #[test]
-  fn value_not_deleted() {
-    let entry = Entry::new_value(&"Foo", &"Bar");
-    assert!(!entry.deleted());
-  }
-
-  #[test]
-  fn deletion_is_deleted() {
-    let entry = Entry::new_deletion(&"Foo");
-    assert!(entry.deleted());
-  }
-
-  #[test]
   fn saves_key() {
     let entry = Entry::new_value(&"Foo", &"Bar");
     assert_eq!("Foo", entry.key());
@@ -113,7 +104,13 @@ mod tests {
   #[test]
   fn saves_value() {
     let entry = Entry::new_value(&"Foo", &"Bar");
-    assert_eq!("Bar", entry.value());
+    assert_eq!("Bar", entry.value().unwrap());
+  }
+
+  #[test]
+  fn deletion_value_is_none() {
+    let entry = Entry::new_deletion(&"Foo");
+    assert!(entry.value().is_none());
   }
 
   #[test]
@@ -125,7 +122,7 @@ mod tests {
   #[test]
   fn value_supports_love() {
     let entry = Entry::new_value(&"Bar", &"💖");
-    assert_eq!("💖", entry.value());
+    assert_eq!("💖", entry.value().unwrap());
   }
 
   #[test]
