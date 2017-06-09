@@ -15,6 +15,7 @@
  *
  */
 pub mod table;
+pub mod options;
 
 #[cfg(test)]
 mod tests {
