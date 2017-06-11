@@ -10,8 +10,8 @@ impl Memtable {
     Memtable { table: BTreeSet::new() }
   }
 
-  pub fn add(&mut self, key: &str, value: &str) -> bool {
-    self.table.replace(Entry::new_value(key, value)).is_none()
+  pub fn add(&mut self, key: &str, value: &str) {
+    self.table.replace(Entry::new_value(key, value));
   }
 
   pub fn get(&self, key: &str) -> Option<&str> {
@@ -21,8 +21,8 @@ impl Memtable {
     }
   }
 
-  pub fn delete(&mut self, key: &str) -> bool {
-    self.table.replace(Entry::new_deletion(key)).is_none()
+  pub fn delete(&mut self, key: &str) {
+    self.table.replace(Entry::new_deletion(key));
   }
 }
 
@@ -39,15 +39,15 @@ mod tests {
   #[test]
   fn insert_get() {
     let mut table = Memtable::new();
-    assert!(table.add(&"foo", &"bar"));
+    table.add(&"foo", &"bar");
     assert_eq!("bar", table.get(&"foo").unwrap());
   }
 
   #[test]
   fn replace_get() {
     let mut table = Memtable::new();
-    assert!(table.add(&"foo", &"foo"));
-    assert!(!table.add(&"foo", &"bar"));
+    table.add(&"foo", &"foo");
+    table.add(&"foo", &"bar");
     assert_eq!("bar", table.get(&"foo").unwrap());
   }
 
