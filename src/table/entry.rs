@@ -49,13 +49,6 @@ impl Entry {
     from_utf8(&self.data[..self.klen]).unwrap()
   }
 
-  pub fn deleted(&self) -> bool {
-    match self.vtype {
-      ValueType::Deletion => true,
-      _ => false,
-    }
-  }
-
   pub fn value(&self) -> Option<&str> {
     match self.vtype {
       ValueType::Deletion => Option::None,
