@@ -10,10 +10,6 @@ impl Memtable {
     Memtable { table: BTreeSet::new() }
   }
 
-  pub fn len(&self) -> usize {
-    self.table.len()
-  }
-
   pub fn add(&mut self, key: &str, value: &str) -> bool {
     self.table.replace(Entry::new_value(key, value)).is_none()
   }
@@ -37,7 +33,7 @@ mod tests {
   #[test]
   fn creates_memtable() {
     let table = Memtable::new();
-    assert_eq!(0, table.len());
+    assert_eq!(0, table.table.len());
   }
 
   #[test]
