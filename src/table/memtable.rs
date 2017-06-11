@@ -69,4 +69,19 @@ mod tests {
     table.delete(&"foo");
     assert!(table.get(&"foo").is_none());
   }
+
+  #[test]
+  fn lifecycle() {
+    let mut table = Memtable::new();
+    {
+      let foo = String::from("foo");
+      table.add(&foo, &foo);
+    }
+    {
+      let foo = String::from("foo");
+      let bar = String::from("bar");
+      table.add(&foo, &bar);
+    }
+    assert_eq!("bar", table.get("foo").unwrap());
+  }
 }
