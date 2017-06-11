@@ -12,8 +12,7 @@ use std::str::from_utf8;
 use std::vec::Vec;
 
 pub struct Entry {
-  // todo inline vtype & klen in the data!
-  vtype: ValueType,
+  // todo inline klen in the data!
   klen: usize,
   data: Vec<u8>,
 }
@@ -22,11 +21,11 @@ impl Entry {
   pub fn new_value(key: &str, value: &str) -> Entry {
     // todo Add klen as varints
     let klen = key.len();
-    let mut vec = Vec::with_capacity(klen + value.len());
+    let mut vec = Vec::with_capacity(klen + value.len() + 1);
+    vec.push(ValueType::Value as u8);
     vec.extend(key.as_bytes());
     vec.extend(value.as_bytes());
     Entry {
-      vtype: ValueType::Value,
       klen: klen,
       data: vec,
     }
@@ -35,9 +34,9 @@ impl Entry {
   pub fn new_deletion(key: &str) -> Entry {
     let klen = key.len();
     let mut vec = Vec::with_capacity(klen);
+    vec.push(ValueType::Deletion as u8);
     vec.extend(key.as_bytes());
     Entry {
-      vtype: ValueType::Deletion,
       klen: klen,
       data: vec,
     }
@@ -45,14 +44,18 @@ impl Entry {
 }
 
 impl Entry {
+  fn vtype(&self) -> ValueType {
+    ValueType::from_raw(self.data[0])
+  }
+
   fn key(&self) -> &str {
-    from_utf8(&self.data[..self.klen]).unwrap()
+    from_utf8(&self.data[1..(self.klen + 1)]).unwrap()
   }
 
   pub fn value(&self) -> Option<&str> {
-    match self.vtype {
+    match self.vtype() {
       ValueType::Deletion => Option::None,
-      _ => Option::Some(from_utf8(&self.data[self.klen..]).unwrap()),
+      _ => Option::Some(from_utf8(&self.data[(self.klen + 1)..]).unwrap()),
     }
   }
 
@@ -93,6 +96,12 @@ mod tests {
   use std::mem::size_of;
 
   #[test]
+  fn new_value_is_value() {
+    let entry = Entry::new_value(&"Foo", &"Bar");
+    assert_eq!(ValueType::Value as u8, entry.vtype() as u8);
+  }
+
+  #[test]
   fn saves_key() {
     let entry = Entry::new_value(&"Foo", &"Bar");
     assert_eq!("Foo", entry.key());
@@ -102,6 +111,12 @@ mod tests {
   fn saves_value() {
     let entry = Entry::new_value(&"Foo", &"Bar");
     assert_eq!("Bar", entry.value().unwrap());
+  }
+
+  #[test]
+  fn new_deletion_is_deletion() {
+    let entry = Entry::new_deletion(&"Foo");
+    assert_eq!(ValueType::Deletion as u8, entry.vtype() as u8);
   }
 
   #[test]
@@ -138,7 +153,7 @@ mod tests {
 
   #[test]
   fn size() {
-    assert_eq!(40, size_of::<Entry>()); // todo this should be 24, i.e size_of::<Vec<u8>>()
+    assert_eq!(32, size_of::<Entry>()); // todo this should be 24, i.e size_of::<Vec<u8>>()
   }
 
   #[test]
@@ -146,7 +161,7 @@ mod tests {
     let key = &"Bar";
     let value = &"💖";
     let entry = Entry::new_value(key, value);
-    assert_eq!(key.len() + value.len(), // todo + size_of::<ValueType>() (i.e. 1) + klen's varint
+    assert_eq!(key.len() + value.len() + 1, // todo + klen's varint
                 entry.len());
   }
 
@@ -154,7 +169,7 @@ mod tests {
   fn deletion_len() {
     let key = &"Bar";
     let entry = Entry::new_deletion(key);
-    assert_eq!(key.len(), // todo + size_of::<ValueType>() (i.e. 1) + klen's varint
+    assert_eq!(key.len() + 1, // todo + klen's varint
                 entry.len());
   }
 }

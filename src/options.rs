@@ -5,6 +5,18 @@ pub enum ValueType {
   ValueExplicitExpiry,
 }
 
+impl ValueType {
+  pub fn from_raw(value: u8) -> ValueType {
+    match value {
+      0 => ValueType::Deletion,
+      1 => ValueType::Value,
+      2 => ValueType::ValueWriteTime,
+      3 => ValueType::ValueExplicitExpiry,
+      _ => panic!("WTF?!")
+    }
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -18,6 +30,14 @@ mod tests {
     assert_eq!(3, ValueType::ValueExplicitExpiry as u8);
   }
 
+  #[test]
+  fn from_raw() {
+    assert_eq!(0, ValueType::from_raw(0) as u8);
+    assert_eq!(1, ValueType::from_raw(1) as u8);
+    assert_eq!(2, ValueType::from_raw(2) as u8);
+    assert_eq!(3, ValueType::from_raw(3) as u8);
+
+  }
   #[test]
   fn size() {
     assert_eq!(1, size_of::<ValueType>());
