@@ -55,6 +55,10 @@ impl Entry {
       _ => Option::Some(from_utf8(&self.data[self.klen..]).unwrap()),
     }
   }
+
+  pub fn len(&self) -> usize {
+    self.data.len()
+  }
 }
 
 impl Ord for Entry {
@@ -135,5 +139,22 @@ mod tests {
   #[test]
   fn size() {
     assert_eq!(40, size_of::<Entry>()); // todo this should be 24, i.e size_of::<Vec<u8>>()
+  }
+
+  #[test]
+  fn value_len() {
+    let key = &"Bar";
+    let value = &"💖";
+    let entry = Entry::new_value(key, value);
+    assert_eq!(key.len() + value.len(), // todo + size_of::<ValueType>() (i.e. 1) + klen's varint
+                entry.len());
+  }
+
+  #[test]
+  fn deletion_len() {
+    let key = &"Bar";
+    let entry = Entry::new_deletion(key);
+    assert_eq!(key.len(), // todo + size_of::<ValueType>() (i.e. 1) + klen's varint
+                entry.len());
   }
 }
