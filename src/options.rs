@@ -6,7 +6,7 @@ pub enum ValueType {
 }
 
 impl ValueType {
-  pub fn from_raw(value: u8) -> ValueType {
+  pub fn from_byte(value: u8) -> ValueType {
     match value {
       0 => ValueType::Deletion,
       1 => ValueType::Value,
@@ -31,11 +31,11 @@ mod tests {
   }
 
   #[test]
-  fn from_raw() {
-    assert_eq!(0, ValueType::from_raw(0) as u8);
-    assert_eq!(1, ValueType::from_raw(1) as u8);
-    assert_eq!(2, ValueType::from_raw(2) as u8);
-    assert_eq!(3, ValueType::from_raw(3) as u8);
+  fn from_byte() {
+    assert_eq!(0, ValueType::from_byte(0) as u8);
+    assert_eq!(1, ValueType::from_byte(1) as u8);
+    assert_eq!(2, ValueType::from_byte(2) as u8);
+    assert_eq!(3, ValueType::from_byte(3) as u8);
 
   }
   #[test]

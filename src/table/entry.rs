@@ -50,7 +50,7 @@ impl Entry {
 
 impl Entry {
   fn vtype(&self) -> ValueType {
-    ValueType::from_raw(self.data[0])
+    ValueType::from_byte(self.data[0])
   }
 
   fn key(&self) -> &str {
