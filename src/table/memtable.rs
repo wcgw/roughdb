@@ -39,31 +39,31 @@ mod tests {
   #[test]
   fn insert_get() {
     let mut table = Memtable::new();
-    table.add(&"foo", &"bar");
-    assert_eq!("bar", table.get(&"foo").unwrap());
+    table.add("foo", "bar");
+    assert_eq!("bar", table.get("foo").unwrap());
   }
 
   #[test]
   fn replace_get() {
     let mut table = Memtable::new();
-    table.add(&"foo", &"foo");
-    table.add(&"foo", &"bar");
-    assert_eq!("bar", table.get(&"foo").unwrap());
+    table.add("foo", "foo");
+    table.add("foo", "bar");
+    assert_eq!("bar", table.get("foo").unwrap());
   }
 
   #[test]
   fn miss_get() {
     let mut table = Memtable::new();
-    table.add(&"foo", &"bar");
-    assert!(table.get(&"bar").is_none());
+    table.add("foo", "bar");
+    assert!(table.get("bar").is_none());
   }
 
   #[test]
   fn miss_deleted() {
     let mut table = Memtable::new();
-    table.add(&"foo", &"bar");
-    table.delete(&"foo");
-    assert!(table.get(&"foo").is_none());
+    table.add("foo", "bar");
+    table.delete("foo");
+    assert!(table.get("foo").is_none());
   }
 
   #[test]

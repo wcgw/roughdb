@@ -148,19 +148,19 @@ mod tests {
 
   #[test]
   fn new_value_is_value() {
-    let entry = Entry::new_value(&"Foo", &"Bar");
+    let entry = Entry::new_value("Foo", "Bar");
     assert_eq!(ValueType::Value as u8, entry.vtype() as u8);
   }
 
   #[test]
   fn saves_key() {
-    let entry = Entry::new_value(&"Foo", &"Bar");
+    let entry = Entry::new_value("Foo", "Bar");
     assert_eq!("Foo", entry.key());
   }
 
   #[test]
   fn key_value() {
-    let entry = Entry::new_value(&"Foo", &"Bar");
+    let entry = Entry::new_value("Foo", "Bar");
     let (key, value) = entry.key_value();
     assert_eq!("Foo", key);
     assert_eq!("Bar", value.unwrap());
@@ -169,45 +169,45 @@ mod tests {
 
   #[test]
   fn saves_value() {
-    let entry = Entry::new_value(&"Foo", &"Bar");
+    let entry = Entry::new_value("Foo", "Bar");
     assert_eq!("Bar", entry.value().unwrap());
   }
 
   #[test]
   fn new_deletion_is_deletion() {
-    let entry = Entry::new_deletion(&"Foo");
+    let entry = Entry::new_deletion("Foo");
     assert_eq!(ValueType::Deletion as u8, entry.vtype() as u8);
   }
 
   #[test]
   fn deletion_value_is_none() {
-    let entry = Entry::new_deletion(&"Foo");
+    let entry = Entry::new_deletion("Foo");
     assert!(entry.value().is_none());
   }
 
   #[test]
   fn key_supports_love() {
-    let entry = Entry::new_value(&"💖", &"Bar");
+    let entry = Entry::new_value("💖", "Bar");
     assert_eq!("💖", entry.key());
   }
 
   #[test]
   fn value_supports_love() {
-    let entry = Entry::new_value(&"Bar", &"💖");
+    let entry = Entry::new_value("Bar", "💖");
     assert_eq!("💖", entry.value().unwrap());
   }
 
   #[test]
   fn entries_with_same_key_are_equal() {
-    let entry = Entry::new_value(&"💖", &"Bar");
-    let other = Entry::new_value(&"💖", &"Foo");
+    let entry = Entry::new_value("💖", "Bar");
+    let other = Entry::new_value("💖", "Foo");
     assert_eq!(entry, other);
   }
 
   #[test]
   fn entries_with_different_keys_are_not_equal() {
-    let entry = Entry::new_value(&"💖", &"Bar");
-    let noway = Entry::new_value(&"💀", &"Bar");
+    let entry = Entry::new_value("💖", "Bar");
+    let noway = Entry::new_value("💀", "Bar");
     assert_ne!(noway, entry);
   }
 
@@ -218,18 +218,18 @@ mod tests {
 
   #[test]
   fn value_len() {
-    let key = &"This is a very long key, that will be > 127 and klen will then be 2 bytes long\
+    let key = "This is a very long key, that will be > 127 and klen will then be 2 bytes long\
          This is a very long key, that will be > 127 and klen will then be 2 bytes long\
          ";
     assert!(key.len() > 127);
-    let value = &"💖";
+    let value = "💖";
     let entry = Entry::new_value(key, value);
     assert_eq!(1 + 2 + key.len() + value.len(), entry.len());
   }
 
   #[test]
   fn deletion_len() {
-    let key = &"Bar";
+    let key = "Bar";
     let entry = Entry::new_deletion(key);
     assert_eq!(1 + 1 + key.len(), entry.len());
   }
