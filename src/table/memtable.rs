@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::str::from_utf8;
 use table::entry::Entry;
 
 pub struct Memtable {
@@ -11,18 +12,21 @@ impl Memtable {
   }
 
   pub fn add(&mut self, key: &str, value: &str) {
-    self.table.replace(Entry::new_value(key, value));
+    self.table.replace(Entry::new_value(key.as_bytes(), value.as_bytes()));
   }
 
   pub fn get(&self, key: &str) -> Option<&str> {
-    match self.table.get(&Entry::new_value(key, "")) {
+    match self.table.get(&Entry::new_value(key.as_bytes(), b"")) {
       None => None,
-      Some(e) => e.value(),
+      Some(entry) => match entry.value() {
+        None => None,
+        Some(bytes) => Some(from_utf8(bytes).unwrap()),
+      }
     }
   }
 
   pub fn delete(&mut self, key: &str) {
-    self.table.replace(Entry::new_deletion(key));
+    self.table.replace(Entry::new_deletion(key.as_bytes()));
   }
 }
 

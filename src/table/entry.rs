@@ -16,7 +16,7 @@ pub struct Entry {
 }
 
 impl Entry {
-  pub fn new_value(key: &str, value: &str) -> Entry {
+  pub fn new_value(key: &[u8], value: &[u8]) -> Entry {
     let klen = key.len();
     let mut kdata = [0; 9];
     let ksize = write_varu64(&mut kdata, klen as u64);
@@ -25,14 +25,14 @@ impl Entry {
     for x in 0..ksize {
       vec.push(kdata[x])
     }
-    vec.extend(key.as_bytes());
-    vec.extend(value.as_bytes());
+    vec.extend(key);
+    vec.extend(value);
     Entry {
       data: vec,
     }
   }
 
-  pub fn new_deletion(key: &str) -> Entry {
+  pub fn new_deletion(key: &[u8]) -> Entry {
     let klen = key.len();
     let mut kdata = [0; 9];
     let ksize = write_varu64(&mut kdata, klen as u64);
@@ -41,7 +41,7 @@ impl Entry {
     for x in 0..ksize {
       vec.push(kdata[x])
     }
-    vec.extend(key.as_bytes());
+    vec.extend(key);
     Entry {
       data: vec,
     }
@@ -53,29 +53,29 @@ impl Entry {
     ValueType::from_byte(self.data[0])
   }
 
-  fn key(&self) -> &str {
+  fn key(&self) -> &[u8] {
     let (klen, ksize) = read_varu64(&self.data[1..]);
     let header = ksize + 1;
-    from_utf8(&self.data[header..((klen as usize) + header)]).unwrap()
+    &self.data[header..((klen as usize) + header)]
   }
 
-  pub fn value(&self) -> Option<&str> {
+  pub fn value(&self) -> Option<&[u8]> {
     if let ValueType::Deletion = self.vtype() {
       return Option::None;
     }
     let (klen, ksize) = read_varu64(&self.data[1..]);
     let header = ksize + 1;
-    Option::Some(from_utf8(&self.data[(header + (klen as usize))..]).unwrap())
+    Option::Some(&self.data[(header + (klen as usize))..])
   }
 
-  pub fn key_value(&self) -> (&str, Option<&str>) {
+  pub fn key_value(&self) -> (&[u8], Option<&[u8]>) {
     let vtype = self.vtype();
     let (klen, ksize) = read_varu64(&self.data[1..]);
     let header = ksize + 1;
-    let key = from_utf8(&self.data[header..((klen as usize) + header)]).unwrap();
+    let key = &self.data[header..((klen as usize) + header)];
     let value = match vtype {
       ValueType::Deletion => Option::None,
-      _ => Option::Some(from_utf8(&self.data[(header + (klen as usize))..]).unwrap())
+      _ => Option::Some(&self.data[(header + (klen as usize))..])
     };
     (key, value)
   }
@@ -137,7 +137,7 @@ impl PartialEq for Entry {
 
 impl Debug for Entry {
   fn fmt(&self, f: &mut Formatter) -> Result {
-    write!(f, "table::Entry {{ key: {} }}", self.key())
+    write!(f, "table::Entry {{ key: {} }}", from_utf8(self.key()).unwrap())
   }
 }
 
@@ -148,66 +148,54 @@ mod tests {
 
   #[test]
   fn new_value_is_value() {
-    let entry = Entry::new_value("Foo", "Bar");
+    let entry = Entry::new_value(b"Foo", b"Bar");
     assert_eq!(ValueType::Value as u8, entry.vtype() as u8);
   }
 
   #[test]
   fn saves_key() {
-    let entry = Entry::new_value("Foo", "Bar");
-    assert_eq!("Foo", entry.key());
+    let entry = Entry::new_value(b"Foo", b"Bar");
+    assert_eq!(b"Foo", entry.key());
   }
 
   #[test]
   fn key_value() {
-    let entry = Entry::new_value("Foo", "Bar");
+    let entry = Entry::new_value(b"Foo", b"Bar");
     let (key, value) = entry.key_value();
-    assert_eq!("Foo", key);
-    assert_eq!("Bar", value.unwrap());
+    assert_eq!(b"Foo", key);
+    assert_eq!(b"Bar", value.unwrap());
   }
 
 
   #[test]
   fn saves_value() {
-    let entry = Entry::new_value("Foo", "Bar");
-    assert_eq!("Bar", entry.value().unwrap());
+    let entry = Entry::new_value(b"Foo", b"Bar");
+    assert_eq!(b"Bar", entry.value().unwrap());
   }
 
   #[test]
   fn new_deletion_is_deletion() {
-    let entry = Entry::new_deletion("Foo");
+    let entry = Entry::new_deletion(b"Foo");
     assert_eq!(ValueType::Deletion as u8, entry.vtype() as u8);
   }
 
   #[test]
   fn deletion_value_is_none() {
-    let entry = Entry::new_deletion("Foo");
+    let entry = Entry::new_deletion(b"Foo");
     assert!(entry.value().is_none());
   }
 
   #[test]
-  fn key_supports_love() {
-    let entry = Entry::new_value("💖", "Bar");
-    assert_eq!("💖", entry.key());
-  }
-
-  #[test]
-  fn value_supports_love() {
-    let entry = Entry::new_value("Bar", "💖");
-    assert_eq!("💖", entry.value().unwrap());
-  }
-
-  #[test]
   fn entries_with_same_key_are_equal() {
-    let entry = Entry::new_value("💖", "Bar");
-    let other = Entry::new_value("💖", "Foo");
+    let entry = Entry::new_value(b"fizz", b"Bar");
+    let other = Entry::new_value(b"fizz", b"Foo");
     assert_eq!(entry, other);
   }
 
   #[test]
   fn entries_with_different_keys_are_not_equal() {
-    let entry = Entry::new_value("💖", "Bar");
-    let noway = Entry::new_value("💀", "Bar");
+    let entry = Entry::new_value(b"fizz", b"Bar");
+    let noway = Entry::new_value(b"buzz", b"Bar");
     assert_ne!(noway, entry);
   }
 
@@ -218,18 +206,18 @@ mod tests {
 
   #[test]
   fn value_len() {
-    let key = "This is a very long key, that will be > 127 and klen will then be 2 bytes long\
+    let key = b"This is a very long key, that will be > 127 and klen will then be 2 bytes long\
          This is a very long key, that will be > 127 and klen will then be 2 bytes long\
          ";
     assert!(key.len() > 127);
-    let value = "💖";
+    let value = b"fizz";
     let entry = Entry::new_value(key, value);
     assert_eq!(1 + 2 + key.len() + value.len(), entry.len());
   }
 
   #[test]
   fn deletion_len() {
-    let key = "Bar";
+    let key = b"Bar";
     let entry = Entry::new_deletion(key);
     assert_eq!(1 + 1 + key.len(), entry.len());
   }
