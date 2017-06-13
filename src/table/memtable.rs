@@ -1,5 +1,4 @@
 use std::collections::BTreeSet;
-use std::str::from_utf8;
 use table::entry::Entry;
 
 pub struct Memtable {
@@ -11,28 +10,26 @@ impl Memtable {
     Memtable { table: BTreeSet::new() }
   }
 
-  pub fn add(&mut self, key: &str, value: &str) {
-    self.table.replace(Entry::new_value(key.as_bytes(), value.as_bytes()));
+  pub fn add(&mut self, key: &[u8], value: &[u8]) {
+    self.table.replace(Entry::new_value(key, value));
   }
 
-  pub fn get(&self, key: &str) -> Option<&str> {
-    match self.table.get(&Entry::new_value(key.as_bytes(), b"")) {
+  pub fn get(&self, key: &[u8]) -> Option<&[u8]> {
+    match self.table.get(&Entry::new_value(key, b"")) {
       None => None,
-      Some(entry) => match entry.value() {
-        None => None,
-        Some(bytes) => Some(from_utf8(bytes).unwrap()),
-      }
+      Some(entry) => entry.value()
     }
   }
 
-  pub fn delete(&mut self, key: &str) {
-    self.table.replace(Entry::new_deletion(key.as_bytes()));
+  pub fn delete(&mut self, key: &[u8]) {
+    self.table.replace(Entry::new_deletion(key));
   }
 }
 
 #[cfg(test)]
 mod tests {
   use super::*;
+  use std::str::from_utf8;
 
   #[test]
   fn creates_memtable() {
@@ -43,31 +40,31 @@ mod tests {
   #[test]
   fn insert_get() {
     let mut table = Memtable::new();
-    table.add("foo", "bar");
-    assert_eq!("bar", table.get("foo").unwrap());
+    table.add(b"foo", b"bar");
+    assert_eq!(b"bar", table.get(b"foo").unwrap());
   }
 
   #[test]
   fn replace_get() {
     let mut table = Memtable::new();
-    table.add("foo", "foo");
-    table.add("foo", "bar");
-    assert_eq!("bar", table.get("foo").unwrap());
+    table.add(b"foo", b"foo");
+    table.add(b"foo", b"bar");
+    assert_eq!(b"bar", table.get(b"foo").unwrap());
   }
 
   #[test]
   fn miss_get() {
     let mut table = Memtable::new();
-    table.add("foo", "bar");
-    assert!(table.get("bar").is_none());
+    table.add(b"foo", b"bar");
+    assert!(table.get(b"bar").is_none());
   }
 
   #[test]
   fn miss_deleted() {
     let mut table = Memtable::new();
-    table.add("foo", "bar");
-    table.delete("foo");
-    assert!(table.get("foo").is_none());
+    table.add(b"foo", b"bar");
+    table.delete(b"foo");
+    assert!(table.get(b"foo").is_none());
   }
 
   #[test]
@@ -75,13 +72,14 @@ mod tests {
     let mut table = Memtable::new();
     {
       let foo = String::from("foo");
-      table.add(&foo, &foo);
+      table.add(foo.as_bytes(), foo.as_bytes());
     }
     {
       let foo = String::from("foo");
-      let bar = String::from("bar");
-      table.add(&foo, &bar);
+      let sparkle_heart = String::from("💖");
+      table.add(foo.as_bytes(), sparkle_heart.as_bytes());
     }
-    assert_eq!("bar", table.get("foo").unwrap());
+    let value = table.get(b"foo").unwrap();
+    assert_eq!("💖", from_utf8(value).unwrap());
   }
 }
