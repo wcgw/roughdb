@@ -13,9 +13,8 @@
 //    limitations under the License.
 //
 
-use std::collections::BTreeSet;
-use table::entry::Entry;
 use crate::table::entry::Entry;
+use std::collections::BTreeSet;
 
 pub struct Memtable {
   table: BTreeSet<Entry>,
@@ -41,6 +40,12 @@ impl Memtable {
 
   pub fn delete(&mut self, key: &[u8]) {
     self.table.replace(Entry::new_deletion(key));
+  }
+}
+
+impl Default for Memtable {
+  fn default() -> Self {
+    Self::new()
   }
 }
 

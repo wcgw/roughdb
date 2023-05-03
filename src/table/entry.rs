@@ -13,8 +13,7 @@
 //    limitations under the License.
 //
 
-use options::ValueType;
-
+use crate::options::ValueType;
 use std::cmp::Eq;
 use std::cmp::Ord;
 use std::cmp::Ordering;
@@ -25,7 +24,6 @@ use std::fmt::Formatter;
 use std::fmt::Result;
 use std::str::from_utf8;
 use std::vec::Vec;
-use crate::options::ValueType;
 
 pub struct Entry {
   data: Vec<u8>,
@@ -38,8 +36,8 @@ impl Entry {
     let ksize = write_varu64(&mut kdata, klen as u64);
     let mut vec = Vec::with_capacity(1 + ksize + klen + value.len());
     vec.push(ValueType::Value as u8);
-    for x in 0..ksize {
-      vec.push(kdata[x])
+    for b in kdata.iter().take(ksize) {
+      vec.push(*b);
     }
     vec.extend(key);
     vec.extend(value);
@@ -52,8 +50,8 @@ impl Entry {
     let ksize = write_varu64(&mut kdata, klen as u64);
     let mut vec = Vec::with_capacity(1 + ksize + klen);
     vec.push(ValueType::Deletion as u8);
-    for x in 0..ksize {
-      vec.push(kdata[x])
+    for b in kdata.iter().take(ksize) {
+      vec.push(*b);
     }
     vec.extend(key);
     Entry { data: vec }
@@ -95,6 +93,10 @@ impl Entry {
   pub fn len(&self) -> usize {
     self.data.len()
   }
+
+  pub fn is_empty(&self) -> bool {
+    self.data.is_empty()
+  }
 }
 
 pub fn write_varu64(data: &mut [u8], mut n: u64) -> usize {
@@ -129,13 +131,13 @@ pub fn read_varu64(data: &[u8]) -> (u64, usize) {
 
 impl Ord for Entry {
   fn cmp(&self, other: &Self) -> Ordering {
-    self.key().cmp(&other.key())
+    self.key().cmp(other.key())
   }
 }
 
 impl PartialOrd for Entry {
   fn partial_cmp(&self, other: &Entry) -> Option<Ordering> {
-    Some(self.cmp(&other))
+    Some(self.cmp(other))
   }
 }
 
