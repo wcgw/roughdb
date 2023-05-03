@@ -1,15 +1,31 @@
+//    Copyright (c) 2023 The RoughDB Authors
+//
+//    Licensed under the Apache License, Version 2.0 (the "License");
+//    you may not use this file except in compliance with the License.
+//    You may obtain a copy of the License at
+//
+//        http://www.apache.org/licenses/LICENSE-2.0
+//
+//    Unless required by applicable law or agreed to in writing, software
+//    distributed under the License is distributed on an "AS IS" BASIS,
+//    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+//    See the License for the specific language governing permissions and
+//    limitations under the License.
+//
+
 use options::ValueType;
 
+use std::cmp::Eq;
 use std::cmp::Ord;
 use std::cmp::Ordering;
 use std::cmp::PartialEq;
 use std::cmp::PartialOrd;
-use std::cmp::Eq;
 use std::fmt::Debug;
 use std::fmt::Formatter;
 use std::fmt::Result;
 use std::str::from_utf8;
 use std::vec::Vec;
+use crate::options::ValueType;
 
 pub struct Entry {
   data: Vec<u8>,
@@ -27,9 +43,7 @@ impl Entry {
     }
     vec.extend(key);
     vec.extend(value);
-    Entry {
-      data: vec,
-    }
+    Entry { data: vec }
   }
 
   pub fn new_deletion(key: &[u8]) -> Entry {
@@ -42,9 +56,7 @@ impl Entry {
       vec.push(kdata[x])
     }
     vec.extend(key);
-    Entry {
-      data: vec,
-    }
+    Entry { data: vec }
   }
 }
 
@@ -75,7 +87,7 @@ impl Entry {
     let key = &self.data[header..((klen as usize) + header)];
     let value = match vtype {
       ValueType::Deletion => Option::None,
-      _ => Option::Some(&self.data[(header + (klen as usize))..])
+      _ => Option::Some(&self.data[(header + (klen as usize))..]),
     };
     (key, value)
   }
@@ -137,7 +149,11 @@ impl PartialEq for Entry {
 
 impl Debug for Entry {
   fn fmt(&self, f: &mut Formatter) -> Result {
-    write!(f, "table::Entry {{ key: {} }}", from_utf8(self.key()).unwrap())
+    write!(
+      f,
+      "table::Entry {{ key: {} }}",
+      from_utf8(self.key()).unwrap()
+    )
   }
 }
 
@@ -165,7 +181,6 @@ mod tests {
     assert_eq!(b"Foo", key);
     assert_eq!(b"Bar", value.unwrap());
   }
-
 
   #[test]
   fn saves_value() {
