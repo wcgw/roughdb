@@ -1,6 +1,9 @@
 [package]
 name = "roughdb"
-version = "0.1.0"
-authors = ["Alex Snaps <alex.snaps@gmail.com>"]
+license = "Apache-2.0"
+version = "0.1.0-dev"
+edition = '2021'
+repository = "https://github.com/wcgw/roughdb/"
+authors = ["Alex Snaps <alex@wcgw.dev>"]
 
 [dependencies]
