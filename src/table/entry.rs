@@ -1,10 +1,24 @@
-use options::ValueType;
+//    Copyright (c) 2023 The RoughDB Authors
+//
+//    Licensed under the Apache License, Version 2.0 (the "License");
+//    you may not use this file except in compliance with the License.
+//    You may obtain a copy of the License at
+//
+//        http://www.apache.org/licenses/LICENSE-2.0
+//
+//    Unless required by applicable law or agreed to in writing, software
+//    distributed under the License is distributed on an "AS IS" BASIS,
+//    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+//    See the License for the specific language governing permissions and
+//    limitations under the License.
+//
 
+use crate::options::ValueType;
+use std::cmp::Eq;
 use std::cmp::Ord;
 use std::cmp::Ordering;
 use std::cmp::PartialEq;
 use std::cmp::PartialOrd;
-use std::cmp::Eq;
 use std::fmt::Debug;
 use std::fmt::Formatter;
 use std::fmt::Result;
@@ -22,14 +36,12 @@ impl Entry {
     let ksize = write_varu64(&mut kdata, klen as u64);
     let mut vec = Vec::with_capacity(1 + ksize + klen + value.len());
     vec.push(ValueType::Value as u8);
-    for x in 0..ksize {
-      vec.push(kdata[x])
+    for b in kdata.iter().take(ksize) {
+      vec.push(*b);
     }
     vec.extend(key);
     vec.extend(value);
-    Entry {
-      data: vec,
-    }
+    Entry { data: vec }
   }
 
   pub fn new_deletion(key: &[u8]) -> Entry {
@@ -38,13 +50,11 @@ impl Entry {
     let ksize = write_varu64(&mut kdata, klen as u64);
     let mut vec = Vec::with_capacity(1 + ksize + klen);
     vec.push(ValueType::Deletion as u8);
-    for x in 0..ksize {
-      vec.push(kdata[x])
+    for b in kdata.iter().take(ksize) {
+      vec.push(*b);
     }
     vec.extend(key);
-    Entry {
-      data: vec,
-    }
+    Entry { data: vec }
   }
 }
 
@@ -75,13 +85,17 @@ impl Entry {
     let key = &self.data[header..((klen as usize) + header)];
     let value = match vtype {
       ValueType::Deletion => Option::None,
-      _ => Option::Some(&self.data[(header + (klen as usize))..])
+      _ => Option::Some(&self.data[(header + (klen as usize))..]),
     };
     (key, value)
   }
 
   pub fn len(&self) -> usize {
     self.data.len()
+  }
+
+  pub fn is_empty(&self) -> bool {
+    self.data.is_empty()
   }
 }
 
@@ -117,13 +131,13 @@ pub fn read_varu64(data: &[u8]) -> (u64, usize) {
 
 impl Ord for Entry {
   fn cmp(&self, other: &Self) -> Ordering {
-    self.key().cmp(&other.key())
+    self.key().cmp(other.key())
   }
 }
 
 impl PartialOrd for Entry {
   fn partial_cmp(&self, other: &Entry) -> Option<Ordering> {
-    Some(self.cmp(&other))
+    Some(self.cmp(other))
   }
 }
 
@@ -137,7 +151,11 @@ impl PartialEq for Entry {
 
 impl Debug for Entry {
   fn fmt(&self, f: &mut Formatter) -> Result {
-    write!(f, "table::Entry {{ key: {} }}", from_utf8(self.key()).unwrap())
+    write!(
+      f,
+      "table::Entry {{ key: {} }}",
+      from_utf8(self.key()).unwrap()
+    )
   }
 }
 
@@ -165,7 +183,6 @@ mod tests {
     assert_eq!(b"Foo", key);
     assert_eq!(b"Bar", value.unwrap());
   }
-
 
   #[test]
   fn saves_value() {
