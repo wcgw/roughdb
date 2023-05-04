@@ -58,7 +58,11 @@ impl Entry {
   }
 
   fn vtype(&self) -> ValueType {
-    ValueType::from_byte(self.data[0])
+    let value = self.data[0];
+    match <u8 as TryInto<ValueType>>::try_into(value) {
+      Ok(value_type) => value_type,
+      Err(_) => panic!("Corruption! This needs handling... eventually!"),
+    }
   }
 
   fn key(&self) -> &[u8] {
