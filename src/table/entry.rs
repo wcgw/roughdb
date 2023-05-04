@@ -22,7 +22,6 @@ use std::cmp::PartialOrd;
 use std::fmt::Debug;
 use std::fmt::Formatter;
 use std::fmt::Result;
-use std::str::from_utf8;
 use std::vec::Vec;
 
 pub struct Entry {
@@ -153,11 +152,7 @@ impl PartialEq for Entry {
 
 impl Debug for Entry {
   fn fmt(&self, f: &mut Formatter) -> Result {
-    write!(
-      f,
-      "table::Entry {{ key: {} }}",
-      from_utf8(self.key()).unwrap()
-    )
+    write!(f, "table::Entry {{ key: {:?} }}", self.key())
   }
 }
 
