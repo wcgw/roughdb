@@ -56,9 +56,7 @@ impl Entry {
     vec.extend(key);
     Entry { data: vec }
   }
-}
 
-impl Entry {
   fn vtype(&self) -> ValueType {
     ValueType::from_byte(self.data[0])
   }
