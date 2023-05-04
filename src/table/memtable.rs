@@ -27,14 +27,16 @@ impl Memtable {
     }
   }
 
-  pub fn add(&mut self, key: &[u8], value: &[u8]) {
-    self.table.replace(Entry::new_value(key, value));
+  pub fn add<K: AsRef<[u8]>, V: AsRef<[u8]>>(&mut self, key: K, value: V) {
+    self
+      .table
+      .replace(Entry::new_value(key.as_ref(), value.as_ref()));
   }
 
-  pub fn get(&self, key: &[u8]) -> Option<&[u8]> {
-    match self.table.get(&Entry::new_value(key, b"")) {
+  pub fn get<K: AsRef<[u8]>>(&self, key: K) -> Option<Vec<u8>> {
+    match self.table.get(&Entry::new_value(key.as_ref(), b"")) {
       None => None,
-      Some(entry) => entry.value(),
+      Some(entry) => entry.value().map(Vec::from),
     }
   }
 
@@ -64,7 +66,7 @@ mod tests {
   fn insert_get() {
     let mut table = Memtable::new();
     table.add(b"foo", b"bar");
-    assert_eq!(b"bar", table.get(b"foo").unwrap());
+    assert_eq!(b"bar", table.get(b"foo").unwrap().as_slice());
   }
 
   #[test]
@@ -72,7 +74,7 @@ mod tests {
     let mut table = Memtable::new();
     table.add(b"foo", b"foo");
     table.add(b"foo", b"bar");
-    assert_eq!(b"bar", table.get(b"foo").unwrap());
+    assert_eq!(b"bar", table.get(b"foo").unwrap().as_slice());
   }
 
   #[test]
@@ -98,11 +100,10 @@ mod tests {
       table.add(foo.as_bytes(), foo.as_bytes());
     }
     {
-      let foo = String::from("foo");
       let sparkle_heart = String::from("💖");
-      table.add(foo.as_bytes(), sparkle_heart.as_bytes());
+      table.add(b"foo", sparkle_heart.as_bytes());
     }
     let value = table.get(b"foo").unwrap();
-    assert_eq!("💖", from_utf8(value).unwrap());
+    assert_eq!("💖", from_utf8(value.as_ref()).unwrap());
   }
 }

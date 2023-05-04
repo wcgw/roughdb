@@ -12,6 +12,7 @@
 //    See the License for the specific language governing permissions and
 //    limitations under the License.
 
+#[derive(Debug, PartialEq)]
 pub enum ValueType {
   Deletion,
   Value,
@@ -19,14 +20,16 @@ pub enum ValueType {
   ValueExplicitExpiry,
 }
 
-impl ValueType {
-  pub fn from_byte(value: u8) -> ValueType {
+impl TryFrom<u8> for ValueType {
+  type Error = ();
+
+  fn try_from(value: u8) -> Result<Self, Self::Error> {
     match value {
-      0 => ValueType::Deletion,
-      1 => ValueType::Value,
-      2 => ValueType::ValueWriteTime,
-      3 => ValueType::ValueExplicitExpiry,
-      _ => panic!("WTF?!"),
+      0 => Ok(ValueType::Deletion),
+      1 => Ok(ValueType::Value),
+      2 => Ok(ValueType::ValueWriteTime),
+      3 => Ok(ValueType::ValueExplicitExpiry),
+      _ => Err(()),
     }
   }
 }
@@ -46,10 +49,11 @@ mod tests {
 
   #[test]
   fn from_byte() {
-    assert_eq!(0, ValueType::from_byte(0) as u8);
-    assert_eq!(1, ValueType::from_byte(1) as u8);
-    assert_eq!(2, ValueType::from_byte(2) as u8);
-    assert_eq!(3, ValueType::from_byte(3) as u8);
+    assert_eq!(Ok(ValueType::Deletion), 0u8.try_into());
+    assert_eq!(Ok(ValueType::Value), 1u8.try_into());
+    assert_eq!(Ok(ValueType::ValueWriteTime), 2u8.try_into());
+    assert_eq!(Ok(ValueType::ValueExplicitExpiry), 3u8.try_into());
+    assert!(<u8 as TryInto<ValueType>>::try_into(4u8).is_err());
   }
   #[test]
   fn size() {

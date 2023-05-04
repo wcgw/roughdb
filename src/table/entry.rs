@@ -22,7 +22,6 @@ use std::cmp::PartialOrd;
 use std::fmt::Debug;
 use std::fmt::Formatter;
 use std::fmt::Result;
-use std::str::from_utf8;
 use std::vec::Vec;
 
 pub struct Entry {
@@ -56,11 +55,13 @@ impl Entry {
     vec.extend(key);
     Entry { data: vec }
   }
-}
 
-impl Entry {
   fn vtype(&self) -> ValueType {
-    ValueType::from_byte(self.data[0])
+    let value = self.data[0];
+    match <u8 as TryInto<ValueType>>::try_into(value) {
+      Ok(value_type) => value_type,
+      Err(_) => panic!("Corruption! This needs handling... eventually!"),
+    }
   }
 
   fn key(&self) -> &[u8] {
@@ -71,11 +72,11 @@ impl Entry {
 
   pub fn value(&self) -> Option<&[u8]> {
     if let ValueType::Deletion = self.vtype() {
-      return Option::None;
+      return None;
     }
     let (klen, ksize) = read_varu64(&self.data[1..]);
     let header = ksize + 1;
-    Option::Some(&self.data[(header + (klen as usize))..])
+    Some(&self.data[(header + (klen as usize))..])
   }
 
   pub fn key_value(&self) -> (&[u8], Option<&[u8]>) {
@@ -84,8 +85,8 @@ impl Entry {
     let header = ksize + 1;
     let key = &self.data[header..((klen as usize) + header)];
     let value = match vtype {
-      ValueType::Deletion => Option::None,
-      _ => Option::Some(&self.data[(header + (klen as usize))..]),
+      ValueType::Deletion => None,
+      _ => Some(&self.data[(header + (klen as usize))..]),
     };
     (key, value)
   }
@@ -151,11 +152,7 @@ impl PartialEq for Entry {
 
 impl Debug for Entry {
   fn fmt(&self, f: &mut Formatter) -> Result {
-    write!(
-      f,
-      "table::Entry {{ key: {} }}",
-      from_utf8(self.key()).unwrap()
-    )
+    write!(f, "table::Entry {{ key: {:?} }}", self.key())
   }
 }
 
