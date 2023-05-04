@@ -71,11 +71,11 @@ impl Entry {
 
   pub fn value(&self) -> Option<&[u8]> {
     if let ValueType::Deletion = self.vtype() {
-      return Option::None;
+      return None;
     }
     let (klen, ksize) = read_varu64(&self.data[1..]);
     let header = ksize + 1;
-    Option::Some(&self.data[(header + (klen as usize))..])
+    Some(&self.data[(header + (klen as usize))..])
   }
 
   pub fn key_value(&self) -> (&[u8], Option<&[u8]>) {
@@ -84,8 +84,8 @@ impl Entry {
     let header = ksize + 1;
     let key = &self.data[header..((klen as usize) + header)];
     let value = match vtype {
-      ValueType::Deletion => Option::None,
-      _ => Option::Some(&self.data[(header + (klen as usize))..]),
+      ValueType::Deletion => None,
+      _ => Some(&self.data[(header + (klen as usize))..]),
     };
     (key, value)
   }
