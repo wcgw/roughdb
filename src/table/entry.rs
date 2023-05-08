@@ -29,7 +29,7 @@ pub struct Entry {
 }
 
 impl Entry {
-  pub fn new_value(seq: u64, key: &[u8], value: &[u8]) -> Entry {
+  pub fn new_value(seq: u64, key: &[u8], value: &[u8]) -> Self {
     let mut kdata = [0; 20];
     let seq_size = write_varu64(&mut kdata, seq);
     let klen = key.len();
@@ -45,7 +45,7 @@ impl Entry {
     Entry { data: vec }
   }
 
-  pub fn new_deletion(seq: u64, key: &[u8]) -> Entry {
+  pub fn new_deletion(seq: u64, key: &[u8]) -> Self {
     let mut kdata = [0; 20];
     let seq_size = write_varu64(&mut kdata, seq);
     let klen = key.len();
@@ -58,6 +58,10 @@ impl Entry {
     }
     vec.extend(key);
     Entry { data: vec }
+  }
+
+  pub(crate) fn new_lookup_key(key: &[u8]) -> Self {
+    Self::new_value(u64::MAX, key, b"")
   }
 
   pub fn vtype(&self) -> ValueType {

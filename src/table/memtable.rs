@@ -38,7 +38,7 @@ impl Memtable {
   pub fn get<K: AsRef<[u8]>>(&self, key: K) -> Option<Vec<u8>> {
     match self
       .table
-      .range(&Entry::new_value(u64::MAX, key.as_ref(), b"")..)
+      .range(&Entry::new_lookup_key(key.as_ref())..)
       .next()
     {
       Some(entry) if entry.key() == key.as_ref() => entry.value().map(Vec::from),
