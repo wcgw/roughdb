@@ -109,6 +109,7 @@ impl Entry {
     Some(&self.data[(header + (klen as usize))..])
   }
 
+  #[cfg(test)]
   pub fn key_value(&self) -> (&[u8], Option<&[u8]>) {
     let vtype = self.vtype();
     let (_, seq_size) = read_varu64(&self.data[1..]);
@@ -122,12 +123,9 @@ impl Entry {
     (key, value)
   }
 
-  pub fn len(&self) -> usize {
+  #[cfg(test)]
+  fn len(&self) -> usize {
     self.data.len()
-  }
-
-  pub fn is_empty(&self) -> bool {
-    self.data.is_empty()
   }
 }
 
