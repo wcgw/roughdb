@@ -93,7 +93,7 @@ impl Entry {
   pub fn key_value(&self) -> (&[u8], Option<&[u8]>) {
     let vtype = self.vtype();
     let (_, seq_size) = read_varu64(&self.data[1..]);
-    let (klen, ksize) = read_varu64(&self.data[1+seq_size..]);
+    let (klen, ksize) = read_varu64(&self.data[1 + seq_size..]);
     let header = ksize + seq_size + 1;
     let key = &self.data[header..((klen as usize) + header)];
     let value = match vtype {
@@ -144,7 +144,11 @@ pub fn read_varu64(data: &[u8]) -> (u64, usize) {
 
 impl Ord for Entry {
   fn cmp(&self, other: &Self) -> Ordering {
-    self.key().cmp(other.key())
+    let ordering = self.key().cmp(other.key());
+    match ordering {
+      Ordering::Equal => other.sequence_id().cmp(&self.sequence_id()),
+      _ => ordering,
+    }
   }
 }
 
