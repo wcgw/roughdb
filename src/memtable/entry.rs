@@ -11,9 +11,7 @@
 //    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 //    See the License for the specific language governing permissions and
 //    limitations under the License.
-//
 
-use crate::options::ValueType;
 use std::cmp::Eq;
 use std::cmp::Ord;
 use std::cmp::Ordering;
@@ -21,8 +19,25 @@ use std::cmp::PartialEq;
 use std::cmp::PartialOrd;
 use std::fmt::Debug;
 use std::fmt::Formatter;
-use std::fmt::Result;
 use std::vec::Vec;
+
+#[derive(Debug, PartialEq)]
+enum ValueType {
+  Deletion,
+  Value,
+}
+
+impl TryFrom<u8> for ValueType {
+  type Error = ();
+
+  fn try_from(value: u8) -> Result<Self, Self::Error> {
+    match value {
+      0 => Ok(ValueType::Deletion),
+      1 => Ok(ValueType::Value),
+      _ => Err(()),
+    }
+  }
+}
 
 pub struct Entry {
   data: Vec<u8>,
@@ -64,7 +79,7 @@ impl Entry {
     Self::new_value(u64::MAX, key, b"")
   }
 
-  pub fn vtype(&self) -> ValueType {
+  fn vtype(&self) -> ValueType {
     let value = self.data[0];
     match <u8 as TryInto<ValueType>>::try_into(value) {
       Ok(value_type) => value_type,
@@ -94,6 +109,7 @@ impl Entry {
     Some(&self.data[(header + (klen as usize))..])
   }
 
+  #[cfg(test)]
   pub fn key_value(&self) -> (&[u8], Option<&[u8]>) {
     let vtype = self.vtype();
     let (_, seq_size) = read_varu64(&self.data[1..]);
@@ -107,16 +123,13 @@ impl Entry {
     (key, value)
   }
 
-  pub fn len(&self) -> usize {
+  #[cfg(test)]
+  fn len(&self) -> usize {
     self.data.len()
-  }
-
-  pub fn is_empty(&self) -> bool {
-    self.data.is_empty()
   }
 }
 
-pub fn write_varu64(data: &mut [u8], mut n: u64) -> usize {
+fn write_varu64(data: &mut [u8], mut n: u64) -> usize {
   let mut i = 0;
   while n >= 0b1000_0000 {
     data[i] = (n as u8) | 0b1000_0000;
@@ -127,7 +140,7 @@ pub fn write_varu64(data: &mut [u8], mut n: u64) -> usize {
   i + 1
 }
 
-pub fn read_varu64(data: &[u8]) -> (u64, usize) {
+fn read_varu64(data: &[u8]) -> (u64, usize) {
   let mut n: u64 = 0;
   let mut shift: u32 = 0;
   for (i, &b) in data.iter().enumerate() {
@@ -171,8 +184,8 @@ impl PartialEq for Entry {
 }
 
 impl Debug for Entry {
-  fn fmt(&self, f: &mut Formatter) -> Result {
-    write!(f, "table::Entry {{ key: {:?} }}", self.key())
+  fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+    write!(f, "memtable::Entry {{ key: {:?} }}", self.key())
   }
 }
 
@@ -234,7 +247,7 @@ mod tests {
   }
 
   #[test]
-  fn size() {
+  fn size_of_entry() {
     assert_eq!(size_of::<Vec<u8>>(), size_of::<Entry>());
   }
 
@@ -267,5 +280,22 @@ mod tests {
     assert_eq!(read_varu64(&data), (128, 2));
     assert_eq!(write_varu64(&mut data, u64::MAX), 10);
     assert_eq!(read_varu64(&data), (u64::MAX, 10));
+  }
+
+  #[test]
+  fn as_byte() {
+    assert_eq!(0, ValueType::Deletion as u8);
+    assert_eq!(1, ValueType::Value as u8);
+  }
+
+  #[test]
+  fn from_byte() {
+    assert_eq!(Ok(ValueType::Deletion), 0u8.try_into());
+    assert_eq!(Ok(ValueType::Value), 1u8.try_into());
+    assert!(<u8 as TryInto<ValueType>>::try_into(2u8).is_err());
+  }
+  #[test]
+  fn size_of_vtype() {
+    assert_eq!(1, size_of::<ValueType>());
   }
 }

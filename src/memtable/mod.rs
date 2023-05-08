@@ -11,9 +11,10 @@
 //    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 //    See the License for the specific language governing permissions and
 //    limitations under the License.
-//
 
-use crate::table::entry::Entry;
+mod entry;
+
+use entry::Entry;
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -23,8 +24,8 @@ pub struct Memtable {
 }
 
 impl Memtable {
-  pub fn new() -> Memtable {
-    Memtable {
+  pub fn new() -> Self {
+    Self {
       table: BTreeSet::new(),
       sequence: AtomicU64::default(),
     }
