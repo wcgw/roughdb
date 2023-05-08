@@ -15,33 +15,43 @@
 
 use crate::table::entry::Entry;
 use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub struct Memtable {
   table: BTreeSet<Entry>,
+  sequence: AtomicU64,
 }
 
 impl Memtable {
   pub fn new() -> Memtable {
     Memtable {
       table: BTreeSet::new(),
+      sequence: AtomicU64::default(),
     }
   }
 
   pub fn add<K: AsRef<[u8]>, V: AsRef<[u8]>>(&mut self, key: K, value: V) {
-    self
-      .table
-      .replace(Entry::new_value(key.as_ref(), value.as_ref()));
+    let entry = Entry::new_value(self.next_seq(), key.as_ref(), value.as_ref());
+    self.table.insert(entry);
   }
 
   pub fn get<K: AsRef<[u8]>>(&self, key: K) -> Option<Vec<u8>> {
-    match self.table.get(&Entry::new_value(key.as_ref(), b"")) {
-      None => None,
-      Some(entry) => entry.value().map(Vec::from),
+    match self
+      .table
+      .range(&Entry::new_lookup_key(key.as_ref())..)
+      .next()
+    {
+      Some(entry) if entry.key() == key.as_ref() => entry.value().map(Vec::from),
+      _ => None,
     }
   }
 
   pub fn delete(&mut self, key: &[u8]) {
-    self.table.replace(Entry::new_deletion(key));
+    self.table.insert(Entry::new_deletion(self.next_seq(), key));
+  }
+
+  fn next_seq(&self) -> u64 {
+    self.sequence.fetch_add(1, Ordering::SeqCst)
   }
 }
 
@@ -73,6 +83,7 @@ mod tests {
   fn replace_get() {
     let mut table = Memtable::new();
     table.add(b"foo", b"foo");
+    assert_eq!(b"foo", table.get(b"foo").unwrap().as_slice());
     table.add(b"foo", b"bar");
     assert_eq!(b"bar", table.get(b"foo").unwrap().as_slice());
   }
@@ -98,6 +109,8 @@ mod tests {
     {
       let foo = String::from("foo");
       table.add(foo.as_bytes(), foo.as_bytes());
+      let value = table.get(b"foo").unwrap();
+      assert_eq!("foo", from_utf8(value.as_ref()).unwrap());
     }
     {
       let sparkle_heart = String::from("💖");
@@ -105,5 +118,7 @@ mod tests {
     }
     let value = table.get(b"foo").unwrap();
     assert_eq!("💖", from_utf8(value.as_ref()).unwrap());
+    table.delete(b"foo");
+    assert_eq!(3, table.table.len());
   }
 }

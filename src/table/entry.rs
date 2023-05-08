@@ -29,13 +29,15 @@ pub struct Entry {
 }
 
 impl Entry {
-  pub fn new_value(key: &[u8], value: &[u8]) -> Entry {
+  pub fn new_value(seq: u64, key: &[u8], value: &[u8]) -> Self {
+    let mut kdata = [0; 20];
+    let seq_size = write_varu64(&mut kdata, seq);
     let klen = key.len();
-    let mut kdata = [0; 9];
-    let ksize = write_varu64(&mut kdata, klen as u64);
-    let mut vec = Vec::with_capacity(1 + ksize + klen + value.len());
+    let header_size = write_varu64(&mut kdata[seq_size..], klen as u64) + seq_size;
+
+    let mut vec = Vec::with_capacity(header_size + klen + value.len() + 1);
     vec.push(ValueType::Value as u8);
-    for b in kdata.iter().take(ksize) {
+    for b in kdata.iter().take(header_size) {
       vec.push(*b);
     }
     vec.extend(key);
@@ -43,20 +45,26 @@ impl Entry {
     Entry { data: vec }
   }
 
-  pub fn new_deletion(key: &[u8]) -> Entry {
+  pub fn new_deletion(seq: u64, key: &[u8]) -> Self {
+    let mut kdata = [0; 20];
+    let seq_size = write_varu64(&mut kdata, seq);
     let klen = key.len();
-    let mut kdata = [0; 9];
-    let ksize = write_varu64(&mut kdata, klen as u64);
-    let mut vec = Vec::with_capacity(1 + ksize + klen);
+    let header_size = write_varu64(&mut kdata[seq_size..], klen as u64) + seq_size;
+
+    let mut vec = Vec::with_capacity(header_size + klen + 1);
     vec.push(ValueType::Deletion as u8);
-    for b in kdata.iter().take(ksize) {
+    for b in kdata.iter().take(header_size) {
       vec.push(*b);
     }
     vec.extend(key);
     Entry { data: vec }
   }
 
-  fn vtype(&self) -> ValueType {
+  pub(crate) fn new_lookup_key(key: &[u8]) -> Self {
+    Self::new_value(u64::MAX, key, b"")
+  }
+
+  pub fn vtype(&self) -> ValueType {
     let value = self.data[0];
     match <u8 as TryInto<ValueType>>::try_into(value) {
       Ok(value_type) => value_type,
@@ -64,9 +72,15 @@ impl Entry {
     }
   }
 
-  fn key(&self) -> &[u8] {
-    let (klen, ksize) = read_varu64(&self.data[1..]);
-    let header = ksize + 1;
+  pub fn sequence_id(&self) -> u64 {
+    let (seq, _length) = read_varu64(&self.data[1..]);
+    seq
+  }
+
+  pub fn key(&self) -> &[u8] {
+    let (_, seq_size) = read_varu64(&self.data[1..]);
+    let (klen, ksize) = read_varu64(&self.data[1 + seq_size..]);
+    let header = 1 + seq_size + ksize;
     &self.data[header..((klen as usize) + header)]
   }
 
@@ -74,15 +88,17 @@ impl Entry {
     if let ValueType::Deletion = self.vtype() {
       return None;
     }
-    let (klen, ksize) = read_varu64(&self.data[1..]);
-    let header = ksize + 1;
+    let (_, seq_size) = read_varu64(&self.data[1..]);
+    let (klen, ksize) = read_varu64(&self.data[1 + seq_size..]);
+    let header = 1 + seq_size + ksize;
     Some(&self.data[(header + (klen as usize))..])
   }
 
   pub fn key_value(&self) -> (&[u8], Option<&[u8]>) {
     let vtype = self.vtype();
-    let (klen, ksize) = read_varu64(&self.data[1..]);
-    let header = ksize + 1;
+    let (_, seq_size) = read_varu64(&self.data[1..]);
+    let (klen, ksize) = read_varu64(&self.data[1 + seq_size..]);
+    let header = ksize + seq_size + 1;
     let key = &self.data[header..((klen as usize) + header)];
     let value = match vtype {
       ValueType::Deletion => None,
@@ -132,7 +148,11 @@ pub fn read_varu64(data: &[u8]) -> (u64, usize) {
 
 impl Ord for Entry {
   fn cmp(&self, other: &Self) -> Ordering {
-    self.key().cmp(other.key())
+    let ordering = self.key().cmp(other.key());
+    match ordering {
+      Ordering::Equal => other.sequence_id().cmp(&self.sequence_id()),
+      _ => ordering,
+    }
   }
 }
 
@@ -163,19 +183,19 @@ mod tests {
 
   #[test]
   fn new_value_is_value() {
-    let entry = Entry::new_value(b"Foo", b"Bar");
+    let entry = Entry::new_value(u64::MAX, b"Foo", b"Bar");
     assert_eq!(ValueType::Value as u8, entry.vtype() as u8);
   }
 
   #[test]
   fn saves_key() {
-    let entry = Entry::new_value(b"Foo", b"Bar");
+    let entry = Entry::new_value(u64::MIN, b"Foo", b"Bar");
     assert_eq!(b"Foo", entry.key());
   }
 
   #[test]
   fn key_value() {
-    let entry = Entry::new_value(b"Foo", b"Bar");
+    let entry = Entry::new_value(u64::MAX, b"Foo", b"Bar");
     let (key, value) = entry.key_value();
     assert_eq!(b"Foo", key);
     assert_eq!(b"Bar", value.unwrap());
@@ -183,33 +203,33 @@ mod tests {
 
   #[test]
   fn saves_value() {
-    let entry = Entry::new_value(b"Foo", b"Bar");
+    let entry = Entry::new_value(2, b"Foo", b"Bar");
     assert_eq!(b"Bar", entry.value().unwrap());
   }
 
   #[test]
   fn new_deletion_is_deletion() {
-    let entry = Entry::new_deletion(b"Foo");
+    let entry = Entry::new_deletion(3, b"Foo");
     assert_eq!(ValueType::Deletion as u8, entry.vtype() as u8);
   }
 
   #[test]
   fn deletion_value_is_none() {
-    let entry = Entry::new_deletion(b"Foo");
+    let entry = Entry::new_deletion(4, b"Foo");
     assert!(entry.value().is_none());
   }
 
   #[test]
   fn entries_with_same_key_are_equal() {
-    let entry = Entry::new_value(b"fizz", b"Bar");
-    let other = Entry::new_value(b"fizz", b"Foo");
+    let entry = Entry::new_value(5, b"fizz", b"Bar");
+    let other = Entry::new_value(6, b"fizz", b"Foo");
     assert_eq!(entry, other);
   }
 
   #[test]
   fn entries_with_different_keys_are_not_equal() {
-    let entry = Entry::new_value(b"fizz", b"Bar");
-    let noway = Entry::new_value(b"buzz", b"Bar");
+    let entry = Entry::new_value(7, b"fizz", b"Bar");
+    let noway = Entry::new_value(8, b"buzz", b"Bar");
     assert_ne!(noway, entry);
   }
 
@@ -225,14 +245,27 @@ mod tests {
          ";
     assert!(key.len() > 127);
     let value = b"fizz";
-    let entry = Entry::new_value(key, value);
-    assert_eq!(1 + 2 + key.len() + value.len(), entry.len());
+    let entry = Entry::new_value(42, key, value);
+    assert_eq!(1 + 1 + 2 + key.len() + value.len(), entry.len());
   }
 
   #[test]
   fn deletion_len() {
     let key = b"Bar";
-    let entry = Entry::new_deletion(key);
-    assert_eq!(1 + 1 + key.len(), entry.len());
+    let entry = Entry::new_deletion(42, key);
+    assert_eq!(1 + 1 + 1 + key.len(), entry.len());
+  }
+
+  #[test]
+  fn u64var_encoding() {
+    let mut data = [0; 18];
+    assert_eq!(write_varu64(&mut data, 0), 1);
+    assert_eq!(read_varu64(&data), (0, 1));
+    assert_eq!(write_varu64(&mut data, 127), 1);
+    assert_eq!(read_varu64(&data), (127, 1));
+    assert_eq!(write_varu64(&mut data, 128), 2);
+    assert_eq!(read_varu64(&data), (128, 2));
+    assert_eq!(write_varu64(&mut data, u64::MAX), 10);
+    assert_eq!(read_varu64(&data), (u64::MAX, 10));
   }
 }

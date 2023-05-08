@@ -16,8 +16,6 @@
 pub enum ValueType {
   Deletion,
   Value,
-  ValueWriteTime,
-  ValueExplicitExpiry,
 }
 
 impl TryFrom<u8> for ValueType {
@@ -27,8 +25,6 @@ impl TryFrom<u8> for ValueType {
     match value {
       0 => Ok(ValueType::Deletion),
       1 => Ok(ValueType::Value),
-      2 => Ok(ValueType::ValueWriteTime),
-      3 => Ok(ValueType::ValueExplicitExpiry),
       _ => Err(()),
     }
   }
@@ -43,17 +39,13 @@ mod tests {
   fn as_byte() {
     assert_eq!(0, ValueType::Deletion as u8);
     assert_eq!(1, ValueType::Value as u8);
-    assert_eq!(2, ValueType::ValueWriteTime as u8);
-    assert_eq!(3, ValueType::ValueExplicitExpiry as u8);
   }
 
   #[test]
   fn from_byte() {
     assert_eq!(Ok(ValueType::Deletion), 0u8.try_into());
     assert_eq!(Ok(ValueType::Value), 1u8.try_into());
-    assert_eq!(Ok(ValueType::ValueWriteTime), 2u8.try_into());
-    assert_eq!(Ok(ValueType::ValueExplicitExpiry), 3u8.try_into());
-    assert!(<u8 as TryInto<ValueType>>::try_into(4u8).is_err());
+    assert!(<u8 as TryInto<ValueType>>::try_into(2u8).is_err());
   }
   #[test]
   fn size() {
