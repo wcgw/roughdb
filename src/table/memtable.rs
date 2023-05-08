@@ -15,33 +15,42 @@
 
 use crate::table::entry::Entry;
 use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub struct Memtable {
   table: BTreeSet<Entry>,
+  sequence: AtomicU64
 }
 
 impl Memtable {
   pub fn new() -> Memtable {
     Memtable {
       table: BTreeSet::new(),
+      sequence: AtomicU64::default(),
     }
   }
 
   pub fn add<K: AsRef<[u8]>, V: AsRef<[u8]>>(&mut self, key: K, value: V) {
+    let entry = Entry::new_value(self.next_seq(), key.as_ref(), value.as_ref());
     self
       .table
-      .replace(Entry::new_value(key.as_ref(), value.as_ref()));
+      .replace(entry);
   }
 
   pub fn get<K: AsRef<[u8]>>(&self, key: K) -> Option<Vec<u8>> {
-    match self.table.get(&Entry::new_value(key.as_ref(), b"")) {
+    match self.table.get(&Entry::new_value(0, key.as_ref(), b"")) {
       None => None,
       Some(entry) => entry.value().map(Vec::from),
     }
   }
 
   pub fn delete(&mut self, key: &[u8]) {
-    self.table.replace(Entry::new_deletion(key));
+    self.table.replace(Entry::new_deletion(self.next_seq(), key));
+  }
+
+  fn next_seq(&self) -> u64 {
+    let seq = self.sequence.fetch_add(1, Ordering::SeqCst);
+    seq
   }
 }
 
