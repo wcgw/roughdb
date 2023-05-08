@@ -24,8 +24,8 @@ pub struct Memtable {
 }
 
 impl Memtable {
-  pub fn new() -> Memtable {
-    Memtable {
+  pub fn new() -> Self {
+    Self {
       table: BTreeSet::new(),
       sequence: AtomicU64::default(),
     }
