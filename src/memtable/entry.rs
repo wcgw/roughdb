@@ -185,7 +185,7 @@ impl PartialEq for Entry {
 
 impl Debug for Entry {
   fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
-    write!(f, "table::Entry {{ key: {:?} }}", self.key())
+    write!(f, "memtable::Entry {{ key: {:?} }}", self.key())
   }
 }
 
