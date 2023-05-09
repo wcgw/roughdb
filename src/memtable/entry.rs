@@ -92,8 +92,10 @@ impl Entry {
   #[cfg(test)]
   fn vtype(&self) -> ValueType {
     let (klen, ksize) = read_varu64(&self.data);
-    let (_seq, seq_size) = read_varu64(&self.data[ksize + klen as usize..]);
-    match <u8 as TryInto<ValueType>>::try_into(self.data[ksize + klen as usize + seq_size]) {
+    let mut pos = ksize + klen as usize;
+    let (_seq, seq_size) = read_varu64(&self.data[pos..]);
+    pos += seq_size;
+    match <u8 as TryInto<ValueType>>::try_into(self.data[pos]) {
       Ok(value_type) => value_type,
       Err(_) => panic!("Corruption! This needs handling... eventually!"),
     }
@@ -101,47 +103,54 @@ impl Entry {
 
   pub fn sequence_id(&self) -> u64 {
     let (klen, ksize) = read_varu64(&self.data);
-    let (seq, _length) = read_varu64(&self.data[ksize + klen as usize..]);
+    let pos = ksize + klen as usize;
+    let (seq, _length) = read_varu64(&self.data[pos..]);
     seq
   }
 
   pub fn key(&self) -> &[u8] {
-    let (klen, ksize) = read_varu64(&self.data);
-    &self.data[ksize..=klen as usize]
+    let (len, pos) = read_varu64(&self.data);
+    &self.data[pos..pos + len as usize]
   }
 
   pub fn value(&self) -> Option<&[u8]> {
     let (klen, ksize) = read_varu64(&self.data);
-    let (_seq, seq_size) = read_varu64(&self.data[ksize + klen as usize..]);
+    let mut pos = ksize + klen as usize;
+    let (_seq, seq_size) = read_varu64(&self.data[pos..]);
+    pos += seq_size;
     let vtype =
-      match <u8 as TryInto<ValueType>>::try_into(self.data[ksize + klen as usize + seq_size]) {
+      match <u8 as TryInto<ValueType>>::try_into(self.data[pos]) {
         Ok(value_type) => value_type,
         Err(_) => panic!("Corruption! This needs handling... eventually!"),
       };
+    pos += 1;
     match vtype {
       ValueType::Deletion => None,
       _ => {
-        let (_val_len, val_size) = read_varu64(&self.data[ksize + klen as usize + seq_size + 1..]);
-        Some(&self.data[ksize + klen as usize + 1 + seq_size + val_size..])
+        let (_val_len, val_size) = read_varu64(&self.data[pos..]);
+        Some(&self.data[pos + val_size..])
       }
     }
   }
 
   #[cfg(test)]
   pub fn key_value(&self) -> (&[u8], Option<&[u8]>) {
-    let (klen, ksize) = read_varu64(&self.data);
-    let key = &self.data[ksize..ksize + klen as usize];
-    let (_seq, seq_size) = read_varu64(&self.data[ksize + klen as usize..]);
+    let (klen, mut pos) = read_varu64(&self.data);
+    let key = &self.data[pos..pos + klen as usize];
+    pos += klen as usize;
+    let (_seq, seq_size) = read_varu64(&self.data[pos..]);
+    pos += seq_size;
     let vtype =
-      match <u8 as TryInto<ValueType>>::try_into(self.data[ksize + klen as usize + seq_size]) {
+      match <u8 as TryInto<ValueType>>::try_into(self.data[pos]) {
         Ok(value_type) => value_type,
         Err(_) => panic!("Corruption! This needs handling... eventually!"),
       };
+    pos += 1;
     let value = match vtype {
       ValueType::Deletion => None,
       _ => {
-        let (_val_len, val_size) = read_varu64(&self.data[ksize + klen as usize + seq_size + 1..]);
-        Some(&self.data[ksize + klen as usize + 1 + seq_size + val_size..])
+        let (_val_len, val_size) = read_varu64(&self.data[pos..]);
+        Some(&self.data[pos + val_size..])
       }
     };
     (key, value)
