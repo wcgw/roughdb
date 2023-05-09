@@ -36,14 +36,14 @@ impl Memtable {
     self.table.insert(entry);
   }
 
-  pub fn get<K: AsRef<[u8]>>(&self, key: K) -> Option<Vec<u8>> {
+  pub fn get<K: AsRef<[u8]>>(&self, key: K) -> (bool, Option<Vec<u8>>) {
     match self
       .table
       .range(&Entry::new_lookup_key(key.as_ref())..)
       .next()
     {
-      Some(entry) if entry.key() == key.as_ref() => entry.value().map(Vec::from),
-      _ => None,
+      Some(entry) if entry.key() == key.as_ref() => (true, entry.value().map(Vec::from)),
+      _ => (false, None),
     }
   }
 
@@ -77,31 +77,37 @@ mod tests {
   fn insert_get() {
     let mut table = Memtable::new();
     table.add(b"foo", b"bar");
-    assert_eq!(b"bar", table.get(b"foo").unwrap().as_slice());
+    assert_eq!(b"bar", table.get(b"foo").1.unwrap().as_slice());
   }
 
   #[test]
   fn replace_get() {
     let mut table = Memtable::new();
     table.add(b"foo", b"foo");
-    assert_eq!(b"foo", table.get(b"foo").unwrap().as_slice());
+    assert_eq!(b"foo", table.get(b"foo").1.unwrap().as_slice());
     table.add(b"foo", b"bar");
-    assert_eq!(b"bar", table.get(b"foo").unwrap().as_slice());
+    assert_eq!(b"bar", table.get(b"foo").1.unwrap().as_slice());
   }
 
   #[test]
   fn miss_get() {
     let mut table = Memtable::new();
     table.add(b"foo", b"bar");
-    assert!(table.get(b"bar").is_none());
+    assert_eq!(table.get(b"bar"), (false, None));
   }
 
   #[test]
-  fn miss_deleted() {
+  fn miss_empty() {
+    let table = Memtable::new();
+    assert_eq!(table.get(b"foo"), (false, None));
+  }
+
+  #[test]
+  fn hit_deleted() {
     let mut table = Memtable::new();
     table.add(b"foo", b"bar");
     table.delete(b"foo");
-    assert!(table.get(b"foo").is_none());
+    assert_eq!(table.get(b"foo"), (true, None));
   }
 
   #[test]
@@ -110,14 +116,14 @@ mod tests {
     {
       let foo = String::from("foo");
       table.add(foo.as_bytes(), foo.as_bytes());
-      let value = table.get(b"foo").unwrap();
+      let value = table.get(b"foo").1.unwrap();
       assert_eq!("foo", from_utf8(value.as_ref()).unwrap());
     }
     {
       let sparkle_heart = String::from("💖");
       table.add(b"foo", sparkle_heart.as_bytes());
     }
-    let value = table.get(b"foo").unwrap();
+    let value = table.get(b"foo").1.unwrap();
     assert_eq!("💖", from_utf8(value.as_ref()).unwrap());
     table.delete(b"foo");
     assert_eq!(3, table.table.len());
