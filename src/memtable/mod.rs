@@ -14,9 +14,34 @@
 
 mod entry;
 
+use crate::memtable::MemtableResult::{Hit, Miss};
 use entry::Entry;
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+#[derive(Debug, PartialEq)]
+pub enum MemtableResult<T> {
+  Miss,
+  Hit(Option<T>),
+}
+
+#[cfg(test)]
+impl<T> MemtableResult<T> {
+  pub fn unwrap(self) -> Option<T> {
+    match self {
+      Hit(val) => val,
+      Miss => panic!("called `MemtableResult::unwrap()` on a `Missed` value!"),
+    }
+  }
+
+  pub fn unwrap_value(self) -> T {
+    match self {
+      Hit(Some(val)) => val,
+      Hit(None) => panic!("called `MemtableResult::unwrap_value()` on a `Hit(None)`!"),
+      Miss => panic!("called `MemtableResult::unwrap_value()` on a `Missed` value!"),
+    }
+  }
+}
 
 pub struct Memtable {
   table: BTreeSet<Entry>,
@@ -36,14 +61,14 @@ impl Memtable {
     self.table.insert(entry);
   }
 
-  pub fn get<K: AsRef<[u8]>>(&self, key: K) -> (bool, Option<Vec<u8>>) {
+  pub fn get<K: AsRef<[u8]>>(&self, key: K) -> MemtableResult<Vec<u8>> {
     match self
       .table
       .range(&Entry::new_lookup_key(key.as_ref())..)
       .next()
     {
-      Some(entry) if entry.key() == key.as_ref() => (true, entry.value().map(Vec::from)),
-      _ => (false, None),
+      Some(entry) if entry.key() == key.as_ref() => Hit(entry.value().map(Vec::from)),
+      _ => Miss,
     }
   }
 
@@ -77,29 +102,29 @@ mod tests {
   fn insert_get() {
     let mut table = Memtable::new();
     table.add(b"foo", b"bar");
-    assert_eq!(b"bar", table.get(b"foo").1.unwrap().as_slice());
+    assert_eq!(b"bar", table.get(b"foo").unwrap_value().as_slice());
   }
 
   #[test]
   fn replace_get() {
     let mut table = Memtable::new();
     table.add(b"foo", b"foo");
-    assert_eq!(b"foo", table.get(b"foo").1.unwrap().as_slice());
+    assert_eq!(b"foo", table.get(b"foo").unwrap_value().as_slice());
     table.add(b"foo", b"bar");
-    assert_eq!(b"bar", table.get(b"foo").1.unwrap().as_slice());
+    assert_eq!(b"bar", table.get(b"foo").unwrap_value().as_slice());
   }
 
   #[test]
   fn miss_get() {
     let mut table = Memtable::new();
     table.add(b"foo", b"bar");
-    assert_eq!(table.get(b"bar"), (false, None));
+    assert_eq!(table.get(b"bar"), Miss);
   }
 
   #[test]
   fn miss_empty() {
     let table = Memtable::new();
-    assert_eq!(table.get(b"foo"), (false, None));
+    assert_eq!(table.get(b"foo"), Miss);
   }
 
   #[test]
@@ -107,7 +132,7 @@ mod tests {
     let mut table = Memtable::new();
     table.add(b"foo", b"bar");
     table.delete(b"foo");
-    assert_eq!(table.get(b"foo"), (true, None));
+    assert_eq!(table.get(b"foo"), Hit(None));
   }
 
   #[test]
@@ -116,14 +141,14 @@ mod tests {
     {
       let foo = String::from("foo");
       table.add(foo.as_bytes(), foo.as_bytes());
-      let value = table.get(b"foo").1.unwrap();
+      let value = table.get(b"foo").unwrap_value();
       assert_eq!("foo", from_utf8(value.as_ref()).unwrap());
     }
     {
       let sparkle_heart = String::from("💖");
       table.add(b"foo", sparkle_heart.as_bytes());
     }
-    let value = table.get(b"foo").1.unwrap();
+    let value = table.get(b"foo").unwrap_value();
     assert_eq!("💖", from_utf8(value.as_ref()).unwrap());
     table.delete(b"foo");
     assert_eq!(3, table.table.len());
