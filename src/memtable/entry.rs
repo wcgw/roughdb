@@ -45,33 +45,43 @@ pub struct Entry {
 
 impl Entry {
   pub fn new_value(seq: u64, key: &[u8], value: &[u8]) -> Self {
-    let mut kdata = [0; 20];
-    let seq_size = write_varu64(&mut kdata, seq);
-    let klen = key.len();
-    let header_size = write_varu64(&mut kdata[seq_size..], klen as u64) + seq_size;
+    let key_length = key.len();
+    let value_length = value.len();
 
-    let mut vec = Vec::with_capacity(header_size + klen + value.len() + 1);
-    vec.push(ValueType::Value as u8);
-    for b in kdata.iter().take(header_size) {
-      vec.push(*b);
-    }
+    let mut key_data = [0; 10];
+    let key_size = write_varu64(&mut key_data, key_length as u64);
+
+    let mut seq_data = [0; 10];
+    let seq_size = write_varu64(&mut seq_data, seq);
+
+    let mut val_data = [0; 10];
+    let val_size = write_varu64(&mut val_data, value_length as u64);
+
+    let mut vec =
+      Vec::with_capacity(key_size + key_length + 1 + seq_size + val_size + value_length);
+    vec.extend(&key_data[..key_size]);
     vec.extend(key);
+    vec.extend(&seq_data[..seq_size]);
+    vec.push(ValueType::Value as u8);
+    vec.extend(&val_data[..val_size]);
     vec.extend(value);
     Entry { data: vec }
   }
 
   pub fn new_deletion(seq: u64, key: &[u8]) -> Self {
-    let mut kdata = [0; 20];
-    let seq_size = write_varu64(&mut kdata, seq);
-    let klen = key.len();
-    let header_size = write_varu64(&mut kdata[seq_size..], klen as u64) + seq_size;
+    let key_length = key.len();
 
-    let mut vec = Vec::with_capacity(header_size + klen + 1);
-    vec.push(ValueType::Deletion as u8);
-    for b in kdata.iter().take(header_size) {
-      vec.push(*b);
-    }
+    let mut key_data = [0; 10];
+    let key_size = write_varu64(&mut key_data, key_length as u64);
+
+    let mut seq_data = [0; 10];
+    let seq_size = write_varu64(&mut seq_data, seq);
+
+    let mut vec = Vec::with_capacity(key_size + key_length + 1 + seq_size);
+    vec.extend(&key_data[..key_size]);
     vec.extend(key);
+    vec.extend(&seq_data[..seq_size]);
+    vec.push(ValueType::Deletion as u8);
     Entry { data: vec }
   }
 
@@ -79,46 +89,60 @@ impl Entry {
     Self::new_value(u64::MAX, key, b"")
   }
 
+  #[cfg(test)]
   fn vtype(&self) -> ValueType {
-    let value = self.data[0];
-    match <u8 as TryInto<ValueType>>::try_into(value) {
+    let (klen, ksize) = read_varu64(&self.data);
+    let (_seq, seq_size) = read_varu64(&self.data[ksize + klen as usize..]);
+    match <u8 as TryInto<ValueType>>::try_into(self.data[ksize + klen as usize + seq_size]) {
       Ok(value_type) => value_type,
       Err(_) => panic!("Corruption! This needs handling... eventually!"),
     }
   }
 
   pub fn sequence_id(&self) -> u64 {
-    let (seq, _length) = read_varu64(&self.data[1..]);
+    let (klen, ksize) = read_varu64(&self.data);
+    let (seq, _length) = read_varu64(&self.data[ksize + klen as usize..]);
     seq
   }
 
   pub fn key(&self) -> &[u8] {
-    let (_, seq_size) = read_varu64(&self.data[1..]);
-    let (klen, ksize) = read_varu64(&self.data[1 + seq_size..]);
-    let header = 1 + seq_size + ksize;
-    &self.data[header..((klen as usize) + header)]
+    let (klen, ksize) = read_varu64(&self.data);
+    &self.data[ksize..=klen as usize]
   }
 
   pub fn value(&self) -> Option<&[u8]> {
-    if let ValueType::Deletion = self.vtype() {
-      return None;
+    let (klen, ksize) = read_varu64(&self.data);
+    let (_seq, seq_size) = read_varu64(&self.data[ksize + klen as usize..]);
+    let vtype =
+      match <u8 as TryInto<ValueType>>::try_into(self.data[ksize + klen as usize + seq_size]) {
+        Ok(value_type) => value_type,
+        Err(_) => panic!("Corruption! This needs handling... eventually!"),
+      };
+    match vtype {
+      ValueType::Deletion => None,
+      _ => {
+        let (_val_len, val_size) = read_varu64(&self.data[ksize + klen as usize + seq_size + 1..]);
+        Some(&self.data[ksize + klen as usize + 1 + seq_size + val_size..])
+      }
     }
-    let (_, seq_size) = read_varu64(&self.data[1..]);
-    let (klen, ksize) = read_varu64(&self.data[1 + seq_size..]);
-    let header = 1 + seq_size + ksize;
-    Some(&self.data[(header + (klen as usize))..])
   }
 
   #[cfg(test)]
   pub fn key_value(&self) -> (&[u8], Option<&[u8]>) {
-    let vtype = self.vtype();
-    let (_, seq_size) = read_varu64(&self.data[1..]);
-    let (klen, ksize) = read_varu64(&self.data[1 + seq_size..]);
-    let header = ksize + seq_size + 1;
-    let key = &self.data[header..((klen as usize) + header)];
+    let (klen, ksize) = read_varu64(&self.data);
+    let key = &self.data[ksize..ksize + klen as usize];
+    let (_seq, seq_size) = read_varu64(&self.data[ksize + klen as usize..]);
+    let vtype =
+      match <u8 as TryInto<ValueType>>::try_into(self.data[ksize + klen as usize + seq_size]) {
+        Ok(value_type) => value_type,
+        Err(_) => panic!("Corruption! This needs handling... eventually!"),
+      };
     let value = match vtype {
       ValueType::Deletion => None,
-      _ => Some(&self.data[(header + (klen as usize))..]),
+      _ => {
+        let (_val_len, val_size) = read_varu64(&self.data[ksize + klen as usize + seq_size + 1..]);
+        Some(&self.data[ksize + klen as usize + 1 + seq_size + val_size..])
+      }
     };
     (key, value)
   }
@@ -197,7 +221,24 @@ mod tests {
   #[test]
   fn new_value_is_value() {
     let entry = Entry::new_value(u64::MAX, b"Foo", b"Bar");
-    assert_eq!(ValueType::Value as u8, entry.vtype() as u8);
+    let (klen, ksize) = read_varu64(&entry.data);
+    let (_seq, ssize) = read_varu64(&entry.data[ksize + klen as usize..]);
+    let value = entry.data[ksize + klen as usize + ssize];
+    assert_eq!(
+      ValueType::Value as u8,
+      (match <u8 as TryInto<ValueType>>::try_into(value) {
+        Ok(value_type) => value_type,
+        Err(_) => panic!("Corruption! This needs handling... eventually!"),
+      }) as u8
+    );
+  }
+
+  #[test]
+  fn sequence_id() {
+    let entry = Entry::new_value(u64::MIN, b"Foo", b"Bar");
+    assert_eq!(u64::MIN, entry.sequence_id());
+    let entry = Entry::new_value(u64::MAX, b"Foo", b"Bar");
+    assert_eq!(u64::MAX, entry.sequence_id());
   }
 
   #[test]
@@ -223,7 +264,7 @@ mod tests {
   #[test]
   fn new_deletion_is_deletion() {
     let entry = Entry::new_deletion(3, b"Foo");
-    assert_eq!(ValueType::Deletion as u8, entry.vtype() as u8);
+    assert_eq!(ValueType::Deletion, entry.vtype());
   }
 
   #[test]
@@ -253,13 +294,24 @@ mod tests {
 
   #[test]
   fn value_len() {
-    let key = b"This is a very long key, that will be > 127 and klen will then be 2 bytes long\
+    {
+      let key = b"bar";
+      let value = b"fizz";
+      let entry = Entry::new_value(42, key, value);
+      assert_eq!(1 + 3 + 1 + 1 + 1 + 4, entry.len());
+      assert_eq!(entry.len(), entry.data.capacity());
+    }
+
+    {
+      let key = b"This is a very long key, that will be > 127 and klen will then be 2 bytes long\
          This is a very long key, that will be > 127 and klen will then be 2 bytes long\
          ";
-    assert!(key.len() > 127);
-    let value = b"fizz";
-    let entry = Entry::new_value(42, key, value);
-    assert_eq!(1 + 1 + 2 + key.len() + value.len(), entry.len());
+      assert!(key.len() > 127);
+      let value = b"fizz";
+      let entry = Entry::new_value(42, key, value);
+      assert_eq!(2 + key.len() + 1 + 1 + 1 + value.len(), entry.len());
+      assert_eq!(entry.len(), entry.data.capacity());
+    }
   }
 
   #[test]
