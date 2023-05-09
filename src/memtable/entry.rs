@@ -127,8 +127,11 @@ impl Entry {
     match vtype {
       ValueType::Deletion => None,
       _ => {
-        let (_val_len, val_size) = read_varu64(&self.data[pos..]);
-        Some(&self.data[pos + val_size..])
+        let (val_len, val_size) = read_varu64(&self.data[pos..]);
+        pos += val_size;
+        let end = pos + val_len as usize;
+        assert_eq!(self.data.len(), end);
+        Some(&self.data[pos..end])
       }
     }
   }
@@ -149,8 +152,11 @@ impl Entry {
     let value = match vtype {
       ValueType::Deletion => None,
       _ => {
-        let (_val_len, val_size) = read_varu64(&self.data[pos..]);
-        Some(&self.data[pos + val_size..])
+        let (val_len, val_size) = read_varu64(&self.data[pos..]);
+        pos += val_size;
+        let end = pos + val_len as usize;
+        assert_eq!(self.data.len(), end);
+        Some(&self.data[pos..end])
       }
     };
     (key, value)
