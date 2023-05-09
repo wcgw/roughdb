@@ -309,6 +309,9 @@ mod tests {
       assert!(key.len() > 127);
       let value = b"fizz";
       let entry = Entry::new_value(42, key, value);
+      assert_eq!(key, entry.key());
+      assert_eq!(value, entry.value().unwrap().as_ref());
+      assert_eq!(42, entry.sequence_id());
       assert_eq!(2 + key.len() + 1 + 1 + 1 + value.len(), entry.len());
       assert_eq!(entry.len(), entry.data.capacity());
     }
