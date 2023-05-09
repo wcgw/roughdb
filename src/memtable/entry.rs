@@ -118,11 +118,10 @@ impl Entry {
     let mut pos = ksize + klen as usize;
     let (_seq, seq_size) = read_varu64(&self.data[pos..]);
     pos += seq_size;
-    let vtype =
-      match <u8 as TryInto<ValueType>>::try_into(self.data[pos]) {
-        Ok(value_type) => value_type,
-        Err(_) => panic!("Corruption! This needs handling... eventually!"),
-      };
+    let vtype = match <u8 as TryInto<ValueType>>::try_into(self.data[pos]) {
+      Ok(value_type) => value_type,
+      Err(_) => panic!("Corruption! This needs handling... eventually!"),
+    };
     pos += 1;
     match vtype {
       ValueType::Deletion => None,
@@ -143,11 +142,10 @@ impl Entry {
     pos += klen as usize;
     let (_seq, seq_size) = read_varu64(&self.data[pos..]);
     pos += seq_size;
-    let vtype =
-      match <u8 as TryInto<ValueType>>::try_into(self.data[pos]) {
-        Ok(value_type) => value_type,
-        Err(_) => panic!("Corruption! This needs handling... eventually!"),
-      };
+    let vtype = match <u8 as TryInto<ValueType>>::try_into(self.data[pos]) {
+      Ok(value_type) => value_type,
+      Err(_) => panic!("Corruption! This needs handling... eventually!"),
+    };
     pos += 1;
     let value = match vtype {
       ValueType::Deletion => None,
