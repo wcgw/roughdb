@@ -16,6 +16,7 @@ use crate::memtable::{Memtable, MemtableResult};
 
 pub(crate) mod memtable;
 
+#[derive(Default)]
 pub struct Db<'a> {
   mem: Memtable<'a>,
   imm: Option<Memtable<'a>>,
@@ -59,15 +60,6 @@ impl<'a> Db<'a> {
   {
     let key = key.as_ref();
     self.mem.delete(key);
-  }
-}
-
-impl Default for Db<'_> {
-  fn default() -> Self {
-    Db {
-      mem: Memtable::default(),
-      imm: None,
-    }
   }
 }
 
