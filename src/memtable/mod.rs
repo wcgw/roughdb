@@ -30,13 +30,6 @@ pub enum MemtableResult<T> {
 
 #[cfg(test)]
 impl<T> MemtableResult<T> {
-  pub fn unwrap(self) -> Option<T> {
-    match self {
-      Hit(val) => val,
-      Miss => panic!("called `MemtableResult::unwrap()` on a `Missed` value!"),
-    }
-  }
-
   pub fn unwrap_value(self) -> T {
     match self {
       Hit(Some(val)) => val,
