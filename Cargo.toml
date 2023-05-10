@@ -7,3 +7,4 @@ repository = "https://github.com/wcgw/roughdb/"
 authors = ["Alex Snaps <alex@wcgw.dev>"]
 
 [dependencies]
+bumpalo = "3.12.1"

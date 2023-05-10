@@ -12,12 +12,15 @@
 //    See the License for the specific language governing permissions and
 //    limitations under the License.
 
+mod arena;
 mod entry;
 
+use crate::memtable::arena::Arena;
 use crate::memtable::MemtableResult::{Hit, Miss};
 use entry::Entry;
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::RwLock;
 
 #[derive(Debug, PartialEq)]
 pub enum MemtableResult<T> {
@@ -43,37 +46,43 @@ impl<T> MemtableResult<T> {
   }
 }
 
-pub struct Memtable {
-  table: BTreeSet<Entry>,
+pub struct Memtable<'a> {
+  table: RwLock<BTreeSet<Entry<'a>>>,
   sequence: AtomicU64,
+  arena: Arena,
 }
 
-impl Memtable {
+impl<'a> Memtable<'a> {
   pub fn new() -> Self {
     Self {
-      table: BTreeSet::new(),
+      table: RwLock::new(BTreeSet::new()),
       sequence: AtomicU64::default(),
+      arena: Arena::default(),
     }
   }
 
-  pub fn add<K: AsRef<[u8]>, V: AsRef<[u8]>>(&mut self, key: K, value: V) {
-    let entry = Entry::new_value(self.next_seq(), key.as_ref(), value.as_ref());
-    self.table.insert(entry);
+  pub fn add<K: AsRef<[u8]>, V: AsRef<[u8]>>(&'a self, key: K, value: V) {
+    let entry = Entry::new_value(&self.arena, self.next_seq(), key.as_ref(), value.as_ref());
+    let mut table = self.table.write().unwrap();
+    table.insert(entry);
   }
 
-  pub fn get<K: AsRef<[u8]>>(&self, key: K) -> MemtableResult<Vec<u8>> {
-    match self
-      .table
-      .range(&Entry::new_lookup_key(key.as_ref())..)
+  pub fn get<K: AsRef<[u8]>>(&'a self, key: K) -> MemtableResult<Vec<u8>> {
+    let table = self.table.read().unwrap();
+    let key = key.as_ref();
+    let mut buffer = vec![0u8; 20 + key.len()];
+    match table
+      .range(&Entry::new_lookup_key(buffer.as_mut_slice(), key)..)
       .next()
     {
-      Some(entry) if entry.key() == key.as_ref() => Hit(entry.value().map(Vec::from)),
+      Some(entry) if entry.key() == key => Hit(entry.value().map(Vec::from)),
       _ => Miss,
     }
   }
 
-  pub fn delete(&mut self, key: &[u8]) {
-    self.table.insert(Entry::new_deletion(self.next_seq(), key));
+  pub fn delete(&'a self, key: &[u8]) {
+    let mut table = self.table.write().unwrap();
+    table.insert(Entry::new_deletion(&self.arena, self.next_seq(), key));
   }
 
   fn next_seq(&self) -> u64 {
@@ -81,7 +90,7 @@ impl Memtable {
   }
 }
 
-impl Default for Memtable {
+impl Default for Memtable<'_> {
   fn default() -> Self {
     Self::new()
   }
@@ -95,19 +104,19 @@ mod tests {
   #[test]
   fn creates_memtable() {
     let table = Memtable::new();
-    assert_eq!(0, table.table.len());
+    assert_eq!(0, table.table.read().unwrap().len());
   }
 
   #[test]
   fn insert_get() {
-    let mut table = Memtable::new();
+    let table = Memtable::new();
     table.add(b"foo", b"bar");
     assert_eq!(b"bar", table.get(b"foo").unwrap_value().as_slice());
   }
 
   #[test]
   fn replace_get() {
-    let mut table = Memtable::new();
+    let table = Memtable::new();
     table.add(b"foo", b"foo");
     assert_eq!(b"foo", table.get(b"foo").unwrap_value().as_slice());
     table.add(b"foo", b"bar");
@@ -116,7 +125,7 @@ mod tests {
 
   #[test]
   fn miss_get() {
-    let mut table = Memtable::new();
+    let table = Memtable::new();
     table.add(b"foo", b"bar");
     assert_eq!(table.get(b"bar"), Miss);
   }
@@ -129,7 +138,7 @@ mod tests {
 
   #[test]
   fn hit_deleted() {
-    let mut table = Memtable::new();
+    let table = Memtable::new();
     table.add(b"foo", b"bar");
     table.delete(b"foo");
     assert_eq!(table.get(b"foo"), Hit(None));
@@ -137,7 +146,7 @@ mod tests {
 
   #[test]
   fn lifecycle() {
-    let mut table = Memtable::new();
+    let table = Memtable::new();
     {
       let foo = String::from("foo");
       table.add(foo.as_bytes(), foo.as_bytes());
@@ -151,6 +160,6 @@ mod tests {
     let value = table.get(b"foo").unwrap_value();
     assert_eq!("💖", from_utf8(value.as_ref()).unwrap());
     table.delete(b"foo");
-    assert_eq!(3, table.table.len());
+    assert_eq!(3, table.table.read().unwrap().len());
   }
 }
