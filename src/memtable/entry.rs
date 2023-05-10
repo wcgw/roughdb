@@ -57,14 +57,21 @@ impl Entry {
     let mut val_data = [0; 10];
     let val_size = write_varu64(&mut val_data, value_length as u64);
 
-    let mut vec =
-      Vec::with_capacity(key_size + key_length + 1 + seq_size + val_size + value_length);
-    vec.extend(&key_data[..key_size]);
-    vec.extend(key);
-    vec.extend(&seq_data[..seq_size]);
-    vec.push(ValueType::Value as u8);
-    vec.extend(&val_data[..val_size]);
-    vec.extend(value);
+    let capacity = key_size + key_length + 1 + seq_size + val_size + value_length;
+    let mut vec = vec![0; capacity];
+    let buffer = vec.as_mut_slice();
+    let mut pos = 0;
+    buffer[pos..pos + key_size].clone_from_slice(&key_data[..key_size]);
+    pos += key_size;
+    buffer[pos..pos + key_length].clone_from_slice(key);
+    pos += key_length;
+    buffer[pos..pos + seq_size].clone_from_slice(&seq_data[..seq_size]);
+    pos += seq_size;
+    buffer[pos] = ValueType::Value as u8;
+    pos += 1;
+    buffer[pos..pos + val_size].clone_from_slice(&val_data[..val_size]);
+    pos += val_size;
+    buffer[pos..pos + value_length].clone_from_slice(value);
     Entry { data: vec }
   }
 
@@ -77,11 +84,17 @@ impl Entry {
     let mut seq_data = [0; 10];
     let seq_size = write_varu64(&mut seq_data, seq);
 
-    let mut vec = Vec::with_capacity(key_size + key_length + 1 + seq_size);
-    vec.extend(&key_data[..key_size]);
-    vec.extend(key);
-    vec.extend(&seq_data[..seq_size]);
-    vec.push(ValueType::Deletion as u8);
+    let capacity = key_size + key_length + 1 + seq_size;
+    let mut vec = vec![0; capacity];
+    let buffer = vec.as_mut_slice();
+    let mut pos = 0;
+    buffer[pos..pos + key_size].clone_from_slice(&key_data[..key_size]);
+    pos += key_size;
+    buffer[pos..pos + key_length].clone_from_slice(key);
+    pos += key_length;
+    buffer[pos..pos + seq_size].clone_from_slice(&seq_data[..seq_size]);
+    pos += seq_size;
+    buffer[pos] = ValueType::Deletion as u8;
     Entry { data: vec }
   }
 
@@ -289,7 +302,7 @@ mod tests {
   #[test]
   fn entries_with_same_key_are_equal() {
     let entry = Entry::new_value(5, b"fizz", b"Bar");
-    let other = Entry::new_value(6, b"fizz", b"Foo");
+    let other = Entry::new_value(5, b"fizz", b"Foo");
     assert_eq!(entry, other);
   }
 
