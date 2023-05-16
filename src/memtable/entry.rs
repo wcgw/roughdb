@@ -58,7 +58,7 @@ impl<'a> Entry<'a> {
     let val_size = write_varu64(&mut val_data, value_length as u64);
 
     let entry_size = key_size + key_length + 1 + seq_size + val_size + value_length;
-    let buffer = arena.allocate(entry_size);
+    let buffer = arena.allocate(entry_size).expect("Allocation failed");
     let mut pos = 0;
     buffer[pos..pos + key_size].clone_from_slice(&key_data[..key_size]);
     pos += key_size;
@@ -84,7 +84,7 @@ impl<'a> Entry<'a> {
     let seq_size = write_varu64(&mut seq_data, seq);
 
     let entry_size = key_size + key_length + 1 + seq_size;
-    let buffer = arena.allocate(entry_size);
+    let buffer = arena.allocate(entry_size).expect("Allocation failed!");
     let mut pos = 0;
     buffer[pos..pos + key_size].clone_from_slice(&key_data[..key_size]);
     pos += key_size;
@@ -119,7 +119,7 @@ impl<'a> Entry<'a> {
 
   #[cfg(test)]
   fn vtype(&self) -> ValueType {
-    let (klen, ksize) = read_varu64(&self.data);
+    let (klen, ksize) = read_varu64(self.data);
     let mut pos = ksize + klen as usize;
     let (_seq, seq_size) = read_varu64(&self.data[pos..]);
     pos += seq_size;
@@ -165,7 +165,7 @@ impl<'a> Entry<'a> {
 
   #[cfg(test)]
   pub fn key_value(&self) -> (&[u8], Option<&[u8]>) {
-    let (klen, mut pos) = read_varu64(&self.data);
+    let (klen, mut pos) = read_varu64(self.data);
     let key = &self.data[pos..pos + klen as usize];
     pos += klen as usize;
     let (_seq, seq_size) = read_varu64(&self.data[pos..]);
@@ -263,7 +263,7 @@ mod tests {
   fn new_value_is_value() {
     let arena = Arena::default();
     let entry = Entry::new_value(&arena, u64::MAX, b"Foo", b"Bar");
-    let (klen, ksize) = read_varu64(&entry.data);
+    let (klen, ksize) = read_varu64(entry.data);
     let (_seq, ssize) = read_varu64(&entry.data[ksize + klen as usize..]);
     let value = entry.data[ksize + klen as usize + ssize];
     assert_eq!(
@@ -361,7 +361,7 @@ mod tests {
       let value = b"fizz";
       let entry = Entry::new_value(&arena, 42, key, value);
       assert_eq!(key, entry.key());
-      assert_eq!(value, entry.value().unwrap().as_ref());
+      assert_eq!(value, entry.value().unwrap());
       assert_eq!(42, entry.sequence_id());
       assert_eq!(2 + key.len() + 1 + 1 + 1 + value.len(), entry.len());
       assert_eq!(entry.len(), entry.data.len());
