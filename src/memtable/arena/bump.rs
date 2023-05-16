@@ -22,9 +22,9 @@ pub struct Arena {
 
 impl Arena {
   pub fn new(capacity: usize) -> Self {
-    Arena {
-      arena: Bump::with_capacity(capacity),
-    }
+    let bump = Bump::new();
+    bump.set_allocation_limit(Some(capacity));
+    Arena { arena: bump }
   }
 
   pub fn allocate(&self, size: usize) -> Option<&mut [u8]> {
@@ -46,5 +46,26 @@ impl Arena {
 impl Default for Arena {
   fn default() -> Self {
     Self::new(10 << 20) // 10 MB
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use crate::memtable::arena::Arena;
+
+  #[test]
+  fn initializes_slice_to_zeros() {
+    let arena = Arena::new(64);
+    let slice = arena.allocate(32).expect("This should succeed");
+    for byte in slice {
+      assert_eq!(0, *byte);
+    }
+  }
+
+  #[test]
+  fn returns_none_on_oom() {
+    let arena = Arena::new(32);
+    let some_mem = arena.allocate(64);
+    assert!(some_mem.is_none());
   }
 }
