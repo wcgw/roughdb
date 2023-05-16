@@ -13,6 +13,8 @@
 //    limitations under the License.
 
 use bumpalo::Bump;
+use std::alloc::Layout;
+use std::ptr;
 
 pub struct Arena {
   arena: Bump,
@@ -25,8 +27,19 @@ impl Arena {
     }
   }
 
-  pub fn allocate(&self, size: usize) -> &mut [u8] {
-    self.arena.alloc_slice_fill_clone(size, &0u8)
+  pub fn allocate(&self, size: usize) -> Option<&mut [u8]> {
+    match Layout::array::<u8>(size) {
+      Ok(layout) => match self.arena.try_alloc_layout(layout) {
+        Ok(ptr) => unsafe {
+          let data = ptr.as_ptr();
+          ptr::write_bytes(data, 0, size);
+          let slice = std::slice::from_raw_parts_mut(data, size);
+          Some(slice)
+        },
+        Err(_) => None,
+      },
+      Err(_) => None,
+    }
   }
 }
 
