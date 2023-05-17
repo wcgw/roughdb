@@ -79,7 +79,7 @@ impl<'a> Memtable<'a> {
   }
 
   fn next_seq(&self) -> u64 {
-    self.sequence.fetch_add(1, Ordering::SeqCst)
+    self.sequence.fetch_add(1, Ordering::Relaxed)
   }
 }
 
