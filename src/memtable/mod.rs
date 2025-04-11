@@ -16,7 +16,6 @@ mod arena;
 mod entry;
 
 use crate::memtable::arena::Arena;
-use crate::memtable::MemtableResult::{Hit, Miss};
 use entry::Entry;
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -25,16 +24,21 @@ use std::sync::RwLock;
 #[derive(Debug, PartialEq)]
 pub enum MemtableResult<T> {
   Miss,
-  Hit(Option<T>),
+  Deleted,
+  Hit(T),
 }
 
 #[cfg(test)]
 impl<T> MemtableResult<T> {
   pub fn unwrap_value(self) -> T {
     match self {
-      Hit(Some(val)) => val,
-      Hit(None) => panic!("called `MemtableResult::unwrap_value()` on a `Hit(None)`!"),
-      Miss => panic!("called `MemtableResult::unwrap_value()` on a `Missed` value!"),
+      MemtableResult::Hit(val) => val,
+      MemtableResult::Deleted => {
+        panic!("called `MemtableResult::unwrap_value()` on a `Deleted` value!")
+      }
+      MemtableResult::Miss => {
+        panic!("called `MemtableResult::unwrap_value()` on a `Missed` value!")
+      }
     }
   }
 }
@@ -68,8 +72,11 @@ impl<'a> Memtable<'a> {
       .range(&Entry::new_lookup_key(buffer.as_mut_slice(), key)..)
       .next()
     {
-      Some(entry) if entry.key() == key => Hit(entry.value().map(Vec::from)),
-      _ => Miss,
+      Some(entry) if entry.key() == key => match entry.value().map(Vec::from) {
+        None => MemtableResult::Deleted,
+        Some(val) => MemtableResult::Hit(val),
+      },
+      _ => MemtableResult::Miss,
     }
   }
 
@@ -120,13 +127,13 @@ mod tests {
   fn miss_get() {
     let table = Memtable::new();
     table.add(b"foo", b"bar");
-    assert_eq!(table.get(b"bar"), Miss);
+    assert_eq!(table.get(b"bar"), MemtableResult::Miss);
   }
 
   #[test]
   fn miss_empty() {
     let table = Memtable::new();
-    assert_eq!(table.get(b"foo"), Miss);
+    assert_eq!(table.get(b"foo"), MemtableResult::Miss);
   }
 
   #[test]
@@ -134,7 +141,7 @@ mod tests {
     let table = Memtable::new();
     table.add(b"foo", b"bar");
     table.delete(b"foo");
-    assert_eq!(table.get(b"foo"), Hit(None));
+    assert_eq!(table.get(b"foo"), MemtableResult::Deleted);
   }
 
   #[test]

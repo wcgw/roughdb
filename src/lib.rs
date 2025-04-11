@@ -31,11 +31,14 @@ impl<'a> Db<'a> {
     let key = key.as_ref();
 
     match self.mem.get(key) {
-      MemtableResult::Hit(hit) => hit,
+      MemtableResult::Hit(hit) => Some(hit),
+      MemtableResult::Deleted => None,
       MemtableResult::Miss => {
         if let Some(imm) = self.imm.as_ref() {
           if let MemtableResult::Hit(hit) = imm.get(key) {
-            return hit;
+            return Some(hit);
+          } else if let MemtableResult::Deleted = imm.get(key) {
+            return None;
           }
         }
         // return self.disk
