@@ -224,7 +224,7 @@ fn read_varu64(data: &[u8]) -> (u64, usize) {
   (0, 0)
 }
 
-impl<'a> Ord for Entry<'a> {
+impl Ord for Entry<'_> {
   fn cmp(&self, other: &Self) -> Ordering {
     let ordering = self.key().cmp(other.key());
     match ordering {
@@ -234,21 +234,21 @@ impl<'a> Ord for Entry<'a> {
   }
 }
 
-impl<'a> PartialOrd for Entry<'a> {
+impl PartialOrd for Entry<'_> {
   fn partial_cmp(&self, other: &Entry) -> Option<Ordering> {
     Some(self.cmp(other))
   }
 }
 
-impl<'a> Eq for Entry<'a> {}
+impl Eq for Entry<'_> {}
 
-impl<'a> PartialEq for Entry<'a> {
+impl PartialEq for Entry<'_> {
   fn eq(&self, other: &Entry) -> bool {
     self.key() == other.key()
   }
 }
 
-impl<'a> Debug for Entry<'a> {
+impl Debug for Entry<'_> {
   fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
     write!(f, "memtable::Entry {{ key: {:?} }}", self.key())
   }
