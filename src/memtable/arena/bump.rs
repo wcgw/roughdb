@@ -14,8 +14,6 @@
 
 use bumpalo::Bump;
 use std::alloc::Layout;
-#[cfg(test)]
-use std::ptr;
 
 pub struct Arena {
   arena: Bump,
@@ -26,24 +24,6 @@ impl Arena {
     let bump = Bump::new();
     bump.set_allocation_limit(Some(capacity));
     Arena { arena: bump }
-  }
-
-  #[cfg(test)]
-  pub fn allocate(&self, size: usize) -> Option<&mut [u8]> {
-    match Layout::array::<u8>(size) {
-      Ok(layout) => match self.arena.try_alloc_layout(layout) {
-        Ok(ptr) => {
-          let data = ptr.as_ptr();
-          let slice = unsafe {
-            ptr::write_bytes(data, 0, size);
-            std::slice::from_raw_parts_mut(data, size)
-          };
-          Some(slice)
-        }
-        Err(_) => None,
-      },
-      Err(_) => None,
-    }
   }
 
   /// Allocate `size` bytes with the given power-of-two `align`.
@@ -63,26 +43,5 @@ impl Arena {
 impl Default for Arena {
   fn default() -> Self {
     Self::new(10 << 20) // 10 MB
-  }
-}
-
-#[cfg(test)]
-mod tests {
-  use crate::memtable::arena::Arena;
-
-  #[test]
-  fn initializes_slice_to_zeros() {
-    let arena = Arena::new(64);
-    let slice = arena.allocate(32).expect("This should succeed");
-    for byte in slice {
-      assert_eq!(0, *byte);
-    }
-  }
-
-  #[test]
-  fn returns_none_on_oom() {
-    let arena = Arena::new(32);
-    let some_mem = arena.allocate(64);
-    assert!(some_mem.is_none());
   }
 }

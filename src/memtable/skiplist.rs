@@ -224,7 +224,9 @@ impl Rng {
 
   fn new(seed: u32) -> Self {
     let s = seed & Self::M;
-    Rng { seed: if s == 0 { 1 } else { s } }
+    Rng {
+      seed: if s == 0 { 1 } else { s },
+    }
   }
 
   fn next_u32(&mut self) -> u32 {
@@ -307,7 +309,7 @@ impl SkipList {
   /// geometric distribution identical to LevelDB's.
   fn random_height(&mut self) -> usize {
     let mut h = 1;
-    while h < MAX_HEIGHT && self.rng.next_u32() % BRANCHING == 0 {
+    while h < MAX_HEIGHT && self.rng.next_u32().is_multiple_of(BRANCHING) {
       h += 1;
     }
     h
@@ -331,7 +333,6 @@ impl SkipList {
     let ne = Entry::from_slice(node_payload);
     ke.cmp(&ne) == std::cmp::Ordering::Greater
   }
-
 
   // ── Public operations ────────────────────────────────────────────────────
 
@@ -530,7 +531,7 @@ fn recompute_splice_levels(key_data: &[u8], splice: &mut Splice, recompute_heigh
 /// * The returned pointer is valid only for the lifetime of `arena`.  The
 ///   caller must ensure `arena` outlives every use of the returned pointer.
 unsafe fn alloc_node_raw(arena: &Arena, data_size: usize, height: usize) -> *mut Node {
-  debug_assert!(height >= 1 && height <= MAX_HEIGHT);
+  debug_assert!((1..=MAX_HEIGHT).contains(&height));
 
   // Layout: prefix of (height−1) higher-level AtomicPtrs, then the Node
   // struct (the level-0 AtomicPtr), then the u32 data length, then the data.

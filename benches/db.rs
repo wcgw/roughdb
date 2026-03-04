@@ -182,5 +182,10 @@ fn delete_benchmarks(c: &mut Criterion) {
   group.finish();
 }
 
-criterion_group!(benches, write_benchmarks, read_benchmarks, delete_benchmarks);
+criterion_group!(
+  benches,
+  write_benchmarks,
+  read_benchmarks,
+  delete_benchmarks
+);
 criterion_main!(benches);

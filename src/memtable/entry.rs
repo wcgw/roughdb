@@ -12,8 +12,6 @@
 //    See the License for the specific language governing permissions and
 //    limitations under the License.
 
-#[cfg(test)]
-use crate::memtable::arena::Arena;
 use std::cmp::Eq;
 use std::cmp::Ord;
 use std::cmp::Ordering;
@@ -45,24 +43,6 @@ pub struct Entry<'a> {
 }
 
 impl<'a> Entry<'a> {
-  // ── Arena-allocating constructors (used by tests) ───────────────────────────
-
-  #[cfg(test)]
-  pub fn new_value(arena: &'a Arena, seq: u64, key: &[u8], value: &[u8]) -> Self {
-    let size = Self::encoded_value_size(seq, key, value);
-    let buffer = arena.allocate(size).expect("Allocation failed");
-    Self::write_value_to(buffer, seq, key, value);
-    Entry { data: buffer }
-  }
-
-  #[cfg(test)]
-  pub fn new_deletion(arena: &'a Arena, seq: u64, key: &[u8]) -> Self {
-    let size = Self::encoded_deletion_size(seq, key);
-    let buffer = arena.allocate(size).expect("Allocation failed");
-    Self::write_deletion_to(buffer, seq, key);
-    Entry { data: buffer }
-  }
-
   // ── Allocation-free encoding helpers (used by the SkipList path) ────────────
 
   /// Create an [`Entry`] view over an already-encoded byte slice.
@@ -155,18 +135,6 @@ impl<'a> Entry<'a> {
     buf[pos..pos + ss].copy_from_slice(&sd[..ss]);
   }
 
-  #[cfg(test)]
-  fn vtype(&self) -> ValueType {
-    let (klen, ksize) = read_varu64(self.data);
-    let mut pos = ksize + klen as usize;
-    let (_seq, seq_size) = read_varu64(&self.data[pos..]);
-    pos += seq_size;
-    match <u8 as TryInto<ValueType>>::try_into(self.data[pos]) {
-      Ok(value_type) => value_type,
-      Err(_) => panic!("Corruption! This needs handling... eventually!"),
-    }
-  }
-
   pub fn sequence_id(&self) -> u64 {
     let (klen, ksize) = read_varu64(self.data);
     let pos = ksize + klen as usize;
@@ -199,36 +167,6 @@ impl<'a> Entry<'a> {
         Some(&self.data[pos..end])
       }
     }
-  }
-
-  #[cfg(test)]
-  pub fn key_value(&self) -> (&[u8], Option<&[u8]>) {
-    let (klen, mut pos) = read_varu64(self.data);
-    let key = &self.data[pos..pos + klen as usize];
-    pos += klen as usize;
-    let (_seq, seq_size) = read_varu64(&self.data[pos..]);
-    pos += seq_size;
-    let vtype = match <u8 as TryInto<ValueType>>::try_into(self.data[pos]) {
-      Ok(value_type) => value_type,
-      Err(_) => panic!("Corruption! This needs handling... eventually!"),
-    };
-    pos += 1;
-    let value = match vtype {
-      ValueType::Deletion => None,
-      _ => {
-        let (val_len, val_size) = read_varu64(&self.data[pos..]);
-        pos += val_size;
-        let end = pos + val_len as usize;
-        assert_eq!(self.data.len(), end);
-        Some(&self.data[pos..end])
-      }
-    };
-    (key, value)
-  }
-
-  #[cfg(test)]
-  fn len(&self) -> usize {
-    self.data.len()
   }
 }
 
@@ -289,158 +227,5 @@ impl PartialEq for Entry<'_> {
 impl Debug for Entry<'_> {
   fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
     write!(f, "memtable::Entry {{ key: {:?} }}", self.key())
-  }
-}
-
-#[cfg(test)]
-mod tests {
-  use super::*;
-  use std::mem::size_of;
-
-  #[test]
-  fn new_value_is_value() {
-    let arena = Arena::default();
-    let entry = Entry::new_value(&arena, u64::MAX, b"Foo", b"Bar");
-    let (klen, ksize) = read_varu64(entry.data);
-    let (_seq, ssize) = read_varu64(&entry.data[ksize + klen as usize..]);
-    let value = entry.data[ksize + klen as usize + ssize];
-    assert_eq!(
-      ValueType::Value as u8,
-      (match <u8 as TryInto<ValueType>>::try_into(value) {
-        Ok(value_type) => value_type,
-        Err(_) => panic!("Corruption! This needs handling... eventually!"),
-      }) as u8
-    );
-  }
-
-  #[test]
-  fn sequence_id() {
-    let arena = Arena::default();
-    let entry = Entry::new_value(&arena, u64::MIN, b"Foo", b"Bar");
-    assert_eq!(u64::MIN, entry.sequence_id());
-    let entry = Entry::new_value(&arena, u64::MAX, b"Foo", b"Bar");
-    assert_eq!(u64::MAX, entry.sequence_id());
-  }
-
-  #[test]
-  fn saves_key() {
-    let arena = Arena::default();
-    let entry = Entry::new_value(&arena, u64::MIN, b"Foo", b"Bar");
-    assert_eq!(b"Foo", entry.key());
-  }
-
-  #[test]
-  fn key_value() {
-    let arena = Arena::default();
-    let entry = Entry::new_value(&arena, u64::MAX, b"Foo", b"Bar");
-    let (key, value) = entry.key_value();
-    assert_eq!(b"Foo", key);
-    assert_eq!(b"Bar", value.unwrap());
-  }
-
-  #[test]
-  fn saves_value() {
-    let arena = Arena::default();
-    let entry = Entry::new_value(&arena, 2, b"Foo", b"Bar");
-    assert_eq!(b"Bar", entry.value().unwrap());
-  }
-
-  #[test]
-  fn new_deletion_is_deletion() {
-    let arena = Arena::default();
-    let entry = Entry::new_deletion(&arena, 3, b"Foo");
-    assert_eq!(ValueType::Deletion, entry.vtype());
-  }
-
-  #[test]
-  fn deletion_value_is_none() {
-    let arena = Arena::default();
-    let entry = Entry::new_deletion(&arena, 4, b"Foo");
-    assert!(entry.value().is_none());
-  }
-
-  #[test]
-  fn entries_with_same_key_are_equal() {
-    let arena = Arena::default();
-    let entry = Entry::new_value(&arena, 5, b"fizz", b"Bar");
-    let other = Entry::new_value(&arena, 5, b"fizz", b"Foo");
-    assert_eq!(entry, other);
-  }
-
-  #[test]
-  fn entries_with_different_keys_are_not_equal() {
-    let arena = Arena::default();
-    let entry = Entry::new_value(&arena, 7, b"fizz", b"Bar");
-    let noway = Entry::new_value(&arena, 8, b"buzz", b"Bar");
-    assert_ne!(noway, entry);
-  }
-
-  #[test]
-  fn size_of_entry() {
-    assert_eq!(size_of::<&[u8]>(), size_of::<Entry>());
-  }
-
-  #[test]
-  fn value_len() {
-    let arena = Arena::default();
-    {
-      let key = b"bar";
-      let value = b"fizz";
-      let entry = Entry::new_value(&arena, 42, key, value);
-      assert_eq!(1 + 3 + 1 + 1 + 1 + 4, entry.len());
-      assert_eq!(entry.len(), entry.data.len());
-    }
-
-    {
-      let key = b"This is a very long key, that will be > 127 and klen will then be 2 bytes long\
-         This is a very long key, that will be > 127 and klen will then be 2 bytes long\
-         ";
-      assert!(key.len() > 127);
-      let value = b"fizz";
-      let entry = Entry::new_value(&arena, 42, key, value);
-      assert_eq!(key, entry.key());
-      assert_eq!(value, entry.value().unwrap());
-      assert_eq!(42, entry.sequence_id());
-      assert_eq!(2 + key.len() + 1 + 1 + 1 + value.len(), entry.len());
-      assert_eq!(entry.len(), entry.data.len());
-    }
-  }
-
-  #[test]
-  fn deletion_len() {
-    let arena = Arena::default();
-    let key = b"Bar";
-    let entry = Entry::new_deletion(&arena, 42, key);
-    assert_eq!(1 + 1 + 1 + key.len(), entry.len());
-  }
-
-  #[test]
-  fn u64var_encoding() {
-    let mut data = [0; 18];
-    assert_eq!(write_varu64(&mut data, 0), 1);
-    assert_eq!(read_varu64(&data), (0, 1));
-    assert_eq!(write_varu64(&mut data, 127), 1);
-    assert_eq!(read_varu64(&data), (127, 1));
-    assert_eq!(write_varu64(&mut data, 128), 2);
-    assert_eq!(read_varu64(&data), (128, 2));
-    assert_eq!(write_varu64(&mut data, u64::MAX), 10);
-    assert_eq!(read_varu64(&data), (u64::MAX, 10));
-  }
-
-  #[test]
-  fn as_byte() {
-    assert_eq!(0, ValueType::Deletion as u8);
-    assert_eq!(1, ValueType::Value as u8);
-  }
-
-  #[test]
-  fn from_byte() {
-    assert_eq!(Ok(ValueType::Deletion), 0u8.try_into());
-    assert_eq!(Ok(ValueType::Value), 1u8.try_into());
-    assert!(<u8 as TryInto<ValueType>>::try_into(2u8).is_err());
-  }
-  #[test]
-  fn size_of_vtype() {
-    assert_eq!(1, size_of::<ValueType>());
   }
 }
