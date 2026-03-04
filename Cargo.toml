@@ -8,3 +8,10 @@ authors = ["Alex Snaps <alex@wcgw.dev>"]
 
 [dependencies]
 bumpalo = "3.12.1"
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "db"
+harness = false
