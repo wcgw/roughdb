@@ -14,6 +14,7 @@
 
 use bumpalo::Bump;
 use std::alloc::Layout;
+#[cfg(test)]
 use std::ptr;
 
 pub struct Arena {
@@ -27,18 +28,34 @@ impl Arena {
     Arena { arena: bump }
   }
 
+  #[cfg(test)]
   pub fn allocate(&self, size: usize) -> Option<&mut [u8]> {
     match Layout::array::<u8>(size) {
       Ok(layout) => match self.arena.try_alloc_layout(layout) {
-        Ok(ptr) => unsafe {
+        Ok(ptr) => {
           let data = ptr.as_ptr();
-          ptr::write_bytes(data, 0, size);
-          let slice = std::slice::from_raw_parts_mut(data, size);
+          let slice = unsafe {
+            ptr::write_bytes(data, 0, size);
+            std::slice::from_raw_parts_mut(data, size)
+          };
           Some(slice)
-        },
+        }
         Err(_) => None,
       },
       Err(_) => None,
+    }
+  }
+
+  /// Allocate `size` bytes with the given power-of-two `align`.
+  ///
+  /// The allocation is *not* zero-initialised; callers must initialise every
+  /// byte before use.  Panics on OOM — matching LevelDB's behaviour, since a
+  /// memtable allocation failure is unrecoverable.
+  pub fn allocate_aligned(&self, size: usize, align: usize) -> *mut u8 {
+    let layout = Layout::from_size_align(size, align).expect("invalid layout");
+    match self.arena.try_alloc_layout(layout) {
+      Ok(ptr) => ptr.as_ptr(),
+      Err(_) => panic!("Arena OOM: failed to allocate {size} bytes (align {align})"),
     }
   }
 }

@@ -14,10 +14,11 @@
 
 mod arena;
 mod entry;
+mod skiplist;
 
-use crate::memtable::arena::Arena;
+use arena::Arena;
 use entry::Entry;
-use std::collections::BTreeSet;
+use skiplist::SkipList;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 
@@ -43,46 +44,55 @@ impl<T> MemtableResult<T> {
   }
 }
 
-pub struct Memtable<'a> {
-  table: RwLock<BTreeSet<Entry<'a>>>,
+pub struct Memtable {
+  table: RwLock<SkipList>,
   sequence: AtomicU64,
-  arena: Arena,
 }
 
-impl<'a> Memtable<'a> {
+impl Memtable {
   pub fn new() -> Self {
     Self {
-      table: RwLock::new(BTreeSet::new()),
+      table: RwLock::new(SkipList::new(Arena::default())),
       sequence: AtomicU64::default(),
-      arena: Arena::default(),
     }
   }
 
-  pub fn add<K: AsRef<[u8]>, V: AsRef<[u8]>>(&'a self, key: K, value: V) {
-    let entry = Entry::new_value(&self.arena, self.next_seq(), key.as_ref(), value.as_ref());
-    let mut table = self.table.write().unwrap();
-    table.insert(entry);
-  }
-
-  pub fn get<K: AsRef<[u8]>>(&'a self, key: K) -> MemtableResult<Vec<u8>> {
-    let table = self.table.read().unwrap();
+  pub fn add<K: AsRef<[u8]>, V: AsRef<[u8]>>(&self, key: K, value: V) {
     let key = key.as_ref();
-    let mut buffer = vec![0u8; 20 + key.len()];
-    match table
-      .range(&Entry::new_lookup_key(buffer.as_mut_slice(), key)..)
-      .next()
-    {
-      Some(entry) if entry.key() == key => match entry.value().map(Vec::from) {
-        None => MemtableResult::Deleted,
-        Some(val) => MemtableResult::Hit(val),
-      },
-      _ => MemtableResult::Miss,
+    let value = value.as_ref();
+    let seq = self.next_seq();
+    let size = Entry::encoded_value_size(seq, key, value);
+    let mut table = self.table.write().unwrap();
+    table.alloc_and_insert(size, |buf| Entry::write_value_to(buf, seq, key, value));
+  }
+
+  pub fn get<K: AsRef<[u8]>>(&self, key: K) -> MemtableResult<Vec<u8>> {
+    let key = key.as_ref();
+    let lsize = Entry::lookup_size(key);
+    let mut lbuf = vec![0u8; lsize];
+    Entry::write_lookup_to(&mut lbuf, key);
+    let table = self.table.read().unwrap();
+    match table.find_first_at_or_after(&lbuf) {
+      Some(payload) => {
+        let e = Entry::from_slice(payload);
+        if e.key() == key {
+          match e.value().map(Vec::from) {
+            None => MemtableResult::Deleted,
+            Some(val) => MemtableResult::Hit(val),
+          }
+        } else {
+          MemtableResult::Miss
+        }
+      }
+      None => MemtableResult::Miss,
     }
   }
 
-  pub fn delete(&'a self, key: &[u8]) {
+  pub fn delete(&self, key: &[u8]) {
+    let seq = self.next_seq();
+    let size = Entry::encoded_deletion_size(seq, key);
     let mut table = self.table.write().unwrap();
-    table.insert(Entry::new_deletion(&self.arena, self.next_seq(), key));
+    table.alloc_and_insert(size, |buf| Entry::write_deletion_to(buf, seq, key));
   }
 
   fn next_seq(&self) -> u64 {
@@ -90,7 +100,7 @@ impl<'a> Memtable<'a> {
   }
 }
 
-impl Default for Memtable<'_> {
+impl Default for Memtable {
   fn default() -> Self {
     Self::new()
   }

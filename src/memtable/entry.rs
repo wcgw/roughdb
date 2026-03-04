@@ -12,6 +12,7 @@
 //    See the License for the specific language governing permissions and
 //    limitations under the License.
 
+#[cfg(test)]
 use crate::memtable::arena::Arena;
 use std::cmp::Eq;
 use std::cmp::Ord;
@@ -44,77 +45,114 @@ pub struct Entry<'a> {
 }
 
 impl<'a> Entry<'a> {
+  // ── Arena-allocating constructors (used by tests) ───────────────────────────
+
+  #[cfg(test)]
   pub fn new_value(arena: &'a Arena, seq: u64, key: &[u8], value: &[u8]) -> Self {
-    let key_length = key.len();
-    let value_length = value.len();
-
-    let mut key_data = [0; 10];
-    let key_size = write_varu64(&mut key_data, key_length as u64);
-
-    let mut seq_data = [0; 10];
-    let seq_size = write_varu64(&mut seq_data, seq);
-
-    let mut val_data = [0; 10];
-    let val_size = write_varu64(&mut val_data, value_length as u64);
-
-    let entry_size = key_size + key_length + 1 + seq_size + val_size + value_length;
-    let buffer = arena.allocate(entry_size).expect("Allocation failed");
-    let mut pos = 0;
-    buffer[pos..pos + key_size].clone_from_slice(&key_data[..key_size]);
-    pos += key_size;
-    buffer[pos..pos + key_length].clone_from_slice(key);
-    pos += key_length;
-    buffer[pos..pos + seq_size].clone_from_slice(&seq_data[..seq_size]);
-    pos += seq_size;
-    buffer[pos] = ValueType::Value as u8;
-    pos += 1;
-    buffer[pos..pos + val_size].clone_from_slice(&val_data[..val_size]);
-    pos += val_size;
-    buffer[pos..pos + value_length].clone_from_slice(value);
+    let size = Self::encoded_value_size(seq, key, value);
+    let buffer = arena.allocate(size).expect("Allocation failed");
+    Self::write_value_to(buffer, seq, key, value);
     Entry { data: buffer }
   }
 
+  #[cfg(test)]
   pub fn new_deletion(arena: &'a Arena, seq: u64, key: &[u8]) -> Self {
-    let key_length = key.len();
-
-    let mut key_data = [0; 10];
-    let key_size = write_varu64(&mut key_data, key_length as u64);
-
-    let mut seq_data = [0; 10];
-    let seq_size = write_varu64(&mut seq_data, seq);
-
-    let entry_size = key_size + key_length + 1 + seq_size;
-    let buffer = arena.allocate(entry_size).expect("Allocation failed!");
-    let mut pos = 0;
-    buffer[pos..pos + key_size].clone_from_slice(&key_data[..key_size]);
-    pos += key_size;
-    buffer[pos..pos + key_length].clone_from_slice(key);
-    pos += key_length;
-    buffer[pos..pos + seq_size].clone_from_slice(&seq_data[..seq_size]);
-    pos += seq_size;
-    buffer[pos] = ValueType::Deletion as u8;
+    let size = Self::encoded_deletion_size(seq, key);
+    let buffer = arena.allocate(size).expect("Allocation failed");
+    Self::write_deletion_to(buffer, seq, key);
     Entry { data: buffer }
   }
 
-  pub(crate) fn new_lookup_key(buffer: &'a mut [u8], key: &[u8]) -> Self {
-    let seq = u64::MAX;
-    let key_length = key.len();
+  // ── Allocation-free encoding helpers (used by the SkipList path) ────────────
 
-    let mut key_data = [0; 10];
-    let key_size = write_varu64(&mut key_data, key_length as u64);
+  /// Create an [`Entry`] view over an already-encoded byte slice.
+  /// The caller must ensure the slice contains a valid encoding.
+  pub(crate) fn from_slice(data: &[u8]) -> Entry<'_> {
+    Entry { data }
+  }
 
-    let mut seq_data = [0; 10];
-    let seq_size = write_varu64(&mut seq_data, seq);
+  /// Byte count of the encoded form of a value entry.
+  pub(crate) fn encoded_value_size(seq: u64, key: &[u8], value: &[u8]) -> usize {
+    let mut tmp = [0u8; 10];
+    let ksize = write_varu64(&mut tmp, key.len() as u64);
+    let ssize = write_varu64(&mut tmp, seq);
+    let vsize = write_varu64(&mut tmp, value.len() as u64);
+    ksize + key.len() + ssize + 1 + vsize + value.len()
+  }
 
-    let entry_size = key_size + key_length + 1 + seq_size;
-    assert!(buffer.len() >= entry_size);
+  /// Encode a value entry into `buf` (which must be exactly
+  /// [`encoded_value_size`] bytes long).
+  pub(crate) fn write_value_to(buf: &mut [u8], seq: u64, key: &[u8], value: &[u8]) {
+    let mut kd = [0u8; 10];
+    let ks = write_varu64(&mut kd, key.len() as u64);
+    let mut sd = [0u8; 10];
+    let ss = write_varu64(&mut sd, seq);
+    let mut vd = [0u8; 10];
+    let vs = write_varu64(&mut vd, value.len() as u64);
+
     let mut pos = 0;
-    buffer[pos..pos + key_size].clone_from_slice(&key_data[..key_size]);
-    pos += key_size;
-    buffer[pos..pos + key_length].clone_from_slice(key);
-    pos += key_length;
-    buffer[pos..pos + seq_size].clone_from_slice(&seq_data[..seq_size]);
-    Entry { data: buffer }
+    buf[pos..pos + ks].copy_from_slice(&kd[..ks]);
+    pos += ks;
+    buf[pos..pos + key.len()].copy_from_slice(key);
+    pos += key.len();
+    buf[pos..pos + ss].copy_from_slice(&sd[..ss]);
+    pos += ss;
+    buf[pos] = ValueType::Value as u8;
+    pos += 1;
+    buf[pos..pos + vs].copy_from_slice(&vd[..vs]);
+    pos += vs;
+    buf[pos..pos + value.len()].copy_from_slice(value);
+  }
+
+  /// Byte count of the encoded form of a deletion tombstone.
+  pub(crate) fn encoded_deletion_size(seq: u64, key: &[u8]) -> usize {
+    let mut tmp = [0u8; 10];
+    let ksize = write_varu64(&mut tmp, key.len() as u64);
+    let ssize = write_varu64(&mut tmp, seq);
+    ksize + key.len() + ssize + 1
+  }
+
+  /// Encode a deletion tombstone into `buf` (which must be exactly
+  /// [`encoded_deletion_size`] bytes long).
+  pub(crate) fn write_deletion_to(buf: &mut [u8], seq: u64, key: &[u8]) {
+    let mut kd = [0u8; 10];
+    let ks = write_varu64(&mut kd, key.len() as u64);
+    let mut sd = [0u8; 10];
+    let ss = write_varu64(&mut sd, seq);
+
+    let mut pos = 0;
+    buf[pos..pos + ks].copy_from_slice(&kd[..ks]);
+    pos += ks;
+    buf[pos..pos + key.len()].copy_from_slice(key);
+    pos += key.len();
+    buf[pos..pos + ss].copy_from_slice(&sd[..ss]);
+    pos += ss;
+    buf[pos] = ValueType::Deletion as u8;
+  }
+
+  /// Byte count of a lookup key for `key` (seq = [`u64::MAX`], no value).
+  pub(crate) fn lookup_size(key: &[u8]) -> usize {
+    let mut tmp = [0u8; 10];
+    let ksize = write_varu64(&mut tmp, key.len() as u64);
+    let ssize = write_varu64(&mut tmp, u64::MAX);
+    ksize + key.len() + ssize
+  }
+
+  /// Encode a lookup key into `buf` (which must be at least
+  /// [`lookup_size`] bytes long).  A lookup key encodes only
+  /// `[klen | key | seq=MAX]`; it has no value-type or value bytes.
+  pub(crate) fn write_lookup_to(buf: &mut [u8], key: &[u8]) {
+    let mut kd = [0u8; 10];
+    let ks = write_varu64(&mut kd, key.len() as u64);
+    let mut sd = [0u8; 10];
+    let ss = write_varu64(&mut sd, u64::MAX);
+
+    let mut pos = 0;
+    buf[pos..pos + ks].copy_from_slice(&kd[..ks]);
+    pos += ks;
+    buf[pos..pos + key.len()].copy_from_slice(key);
+    pos += key.len();
+    buf[pos..pos + ss].copy_from_slice(&sd[..ss]);
   }
 
   #[cfg(test)]

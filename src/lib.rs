@@ -17,14 +17,14 @@ use crate::memtable::{Memtable, MemtableResult};
 pub(crate) mod memtable;
 
 #[derive(Default)]
-pub struct Db<'a> {
-  mem: Memtable<'a>,
-  imm: Option<Memtable<'a>>,
+pub struct Db {
+  mem: Memtable,
+  imm: Option<Memtable>,
   // disk: ,
 }
 
-impl<'a> Db<'a> {
-  pub fn get<K>(&'a self, key: K) -> Option<Vec<u8>>
+impl Db {
+  pub fn get<K>(&self, key: K) -> Option<Vec<u8>>
   where
     K: AsRef<[u8]>,
   {
@@ -47,7 +47,7 @@ impl<'a> Db<'a> {
     }
   }
 
-  pub fn put<K, V>(&'a self, key: K, value: V)
+  pub fn put<K, V>(&self, key: K, value: V)
   where
     K: AsRef<[u8]>,
     V: AsRef<[u8]>,
@@ -57,7 +57,7 @@ impl<'a> Db<'a> {
     self.mem.add(key, val);
   }
 
-  pub fn delete<K>(&'a self, key: K)
+  pub fn delete<K>(&self, key: K)
   where
     K: AsRef<[u8]>,
   {
