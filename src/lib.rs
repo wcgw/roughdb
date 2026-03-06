@@ -15,6 +15,8 @@ use std::sync::Mutex;
 
 pub mod error;
 pub use error::Error;
+pub mod options;
+pub use options::{CompressionType, Options, ReadOptions, Snapshot, WriteOptions};
 pub(crate) mod coding;
 pub(crate) mod memtable;
 pub mod write_batch;
