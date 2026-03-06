@@ -11,6 +11,7 @@
 //    limitations under the License.
 
 use crate::memtable::{Memtable, MemtableResult};
+use std::sync::Mutex;
 
 pub mod error;
 pub use error::Error;
@@ -21,6 +22,7 @@ pub use write_batch::{Handler, WriteBatch};
 
 #[derive(Default)]
 pub struct Db {
+  write_lock: Mutex<()>,
   mem: Memtable,
   imm: Option<Memtable>,
   // disk: ,
@@ -56,19 +58,18 @@ impl Db {
     K: AsRef<[u8]>,
     V: AsRef<[u8]>,
   {
-    let key = key.as_ref();
-    let val = value.as_ref();
-    self.mem.add(key, val);
-    Ok(())
+    let mut batch = WriteBatch::new();
+    batch.put(key.as_ref(), value.as_ref());
+    self.write(&batch)
   }
 
   pub fn delete<K>(&self, key: K) -> Result<(), Error>
   where
     K: AsRef<[u8]>,
   {
-    let key = key.as_ref();
-    self.mem.delete(key);
-    Ok(())
+    let mut batch = WriteBatch::new();
+    batch.delete(key.as_ref());
+    self.write(&batch)
   }
 
   pub fn write(&self, batch: &WriteBatch) -> Result<(), Error> {
@@ -83,6 +84,7 @@ impl Db {
         Ok(())
       }
     }
+    let _guard = self.write_lock.lock().unwrap();
     batch.iterate(&mut Inserter(&self.mem))
   }
 }

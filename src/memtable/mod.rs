@@ -17,8 +17,8 @@ mod skiplist;
 use arena::Arena;
 use entry::Entry;
 use skiplist::SkipList;
+use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::RwLock;
 
 #[derive(Debug, PartialEq)]
 pub enum MemtableResult<T> {
@@ -43,14 +43,18 @@ impl<T> MemtableResult<T> {
 }
 
 pub struct Memtable {
-  table: RwLock<SkipList>,
+  table: UnsafeCell<SkipList>,
   sequence: AtomicU64,
 }
+
+// SAFETY: all mutations are serialised by the DB-level write mutex in `Db`;
+// reads are lock-free via the skip-list's acquire/release atomics.
+unsafe impl Sync for Memtable {}
 
 impl Memtable {
   pub fn new() -> Self {
     Self {
-      table: RwLock::new(SkipList::new(Arena::default())),
+      table: UnsafeCell::new(SkipList::new(Arena::default())),
       sequence: AtomicU64::default(),
     }
   }
@@ -60,7 +64,8 @@ impl Memtable {
     let value = value.as_ref();
     let seq = self.next_seq();
     let size = Entry::encoded_value_size(seq, key, value);
-    let mut table = self.table.write().unwrap();
+    // SAFETY: caller holds the DB write mutex, serialising all mutations.
+    let table = unsafe { &mut *self.table.get() };
     table.alloc_and_insert(size, |buf| Entry::write_value_to(buf, seq, key, value));
   }
 
@@ -69,7 +74,8 @@ impl Memtable {
     let lsize = Entry::lookup_size(key);
     let mut lbuf = vec![0u8; lsize];
     Entry::write_lookup_to(&mut lbuf, key);
-    let table = self.table.read().unwrap();
+    // SAFETY: SkipList reads are lock-free via acquire/release atomics.
+    let table = unsafe { &*self.table.get() };
     match table.find_first_at_or_after(&lbuf) {
       Some(payload) => {
         let e = Entry::from_slice(payload);
@@ -89,7 +95,8 @@ impl Memtable {
   pub fn delete(&self, key: &[u8]) {
     let seq = self.next_seq();
     let size = Entry::encoded_deletion_size(seq, key);
-    let mut table = self.table.write().unwrap();
+    // SAFETY: caller holds the DB write mutex, serialising all mutations.
+    let table = unsafe { &mut *self.table.get() };
     table.alloc_and_insert(size, |buf| Entry::write_deletion_to(buf, seq, key));
   }
 
@@ -112,7 +119,7 @@ mod tests {
   #[test]
   fn creates_memtable() {
     let table = Memtable::new();
-    assert_eq!(0, table.table.read().unwrap().len());
+    assert_eq!(0, unsafe { &*table.table.get() }.len());
   }
 
   #[test]
@@ -168,6 +175,6 @@ mod tests {
     let value = table.get(b"foo").unwrap_value();
     assert_eq!("💖", from_utf8(value.as_ref()).unwrap());
     table.delete(b"foo");
-    assert_eq!(3, table.table.read().unwrap().len());
+    assert_eq!(3, unsafe { &*table.table.get() }.len());
   }
 }

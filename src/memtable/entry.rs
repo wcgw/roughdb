@@ -169,7 +169,6 @@ impl<'a> Entry<'a> {
   }
 }
 
-
 impl Ord for Entry<'_> {
   fn cmp(&self, other: &Self) -> Ordering {
     let ordering = self.key().cmp(other.key());

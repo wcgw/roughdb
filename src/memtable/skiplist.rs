@@ -34,9 +34,10 @@
 //!
 //! # Thread safety
 //!
-//! Writes must be serialised by the caller (the `RwLock` in `Memtable`).
+//! Writes must be serialised by the caller — the DB-level write mutex
+//! owned by `Db` is the sole serialisation point, matching LevelDB's model.
 //! Reads are lock-free: node links are published with release stores and
-//! consumed with acquire loads, matching LevelDB's model.
+//! consumed with acquire loads; no lock is required for reads.
 
 use super::arena::Arena;
 use super::entry::Entry;
@@ -102,12 +103,12 @@ impl Node {
     unsafe { (*self.slot(level)).store(ptr, Ordering::Release) }
   }
 
-  /// Relaxed load — only safe when the caller holds the write lock.
+  /// Relaxed load — only safe when the caller holds the DB write mutex.
   #[inline]
   pub fn relaxed_next(&self, level: usize) -> *mut Node {
     // SAFETY: same precondition as `load_next` — `level < height_of_node`.
     // Relaxed ordering is acceptable here only when no concurrent writer can
-    // be racing; the `RwLock` write guard in `Memtable` provides that.
+    // be racing; the DB write mutex in `Db` provides that guarantee.
     unsafe { (*self.slot(level)).load(Ordering::Relaxed) }
   }
 
@@ -190,7 +191,7 @@ struct Splice {
 
 // SAFETY: `Splice` contains raw node pointers, so the compiler does not
 // derive `Send`/`Sync` automatically.  It is safe to share because `Splice`
-// is only ever accessed while the `Memtable` write lock is held, preventing
+// is only ever accessed while the DB write mutex in `Db` is held, preventing
 // concurrent access from other threads.
 unsafe impl Send for Splice {}
 unsafe impl Sync for Splice {}
@@ -245,7 +246,7 @@ impl Rng {
 ///
 /// # Thread safety
 ///
-/// Writes must be serialised externally (the `Memtable`'s `RwLock` provides
+/// Writes must be serialised externally (the DB write mutex in `Db` provides
 /// this guarantee).  Reads are lock-free.
 pub(crate) struct SkipList {
   arena: Arena,
@@ -264,8 +265,8 @@ pub(crate) struct SkipList {
 //   • All pointer-following reads use Acquire loads, which synchronise with
 //     the Release stores used when nodes are linked; this makes the payload
 //     bytes visible to any reader that reaches a node through its links.
-//   • Writes (`alloc_and_insert`) are serialised by the `RwLock` write guard
-//     in `Memtable`, so no two writers race on the mutable fields.
+//   • Writes (`alloc_and_insert`) are serialised by the DB write mutex in
+//     `Db`, so no two writers race on the mutable fields.
 //   • Nodes are never freed until the `Arena` is dropped (with the
 //     `SkipList`), so pointers remain valid for the lifetime of `self`.
 unsafe impl Send for SkipList {}
@@ -431,7 +432,7 @@ impl SkipList {
         // SAFETY: `pn` is `self.splice.prev[h]`, which is either `self.head`
         // or a node that was previously linked into the list at level `h`.
         // Both remain valid for the arena's lifetime.  The caller holds the
-        // write lock, so the Relaxed ordering is safe.
+        // DB write mutex, so the Relaxed ordering is safe.
         let tight = unsafe { (*pn).relaxed_next(h) == nn };
         if !tight {
           h += 1;

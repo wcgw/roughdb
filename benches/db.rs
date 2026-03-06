@@ -112,7 +112,7 @@ fn read_benchmarks(c: &mut Criterion) {
   group.bench_function("sequential", |b| {
     b.iter(|| {
       for i in 0..N {
-        black_box(db.get(make_key(i)).unwrap());
+        black_box(db.get(make_key(i))).unwrap();
       }
     });
   });
@@ -121,7 +121,7 @@ fn read_benchmarks(c: &mut Criterion) {
   group.bench_function("random", |b| {
     b.iter(|| {
       for &i in &order {
-        black_box(db.get(make_key(i)).unwrap());
+        let _ = black_box(db.get(make_key(i)));
       }
     });
   });
@@ -130,7 +130,7 @@ fn read_benchmarks(c: &mut Criterion) {
   group.bench_function("missing", |b| {
     b.iter(|| {
       for i in N..2 * N {
-        black_box(db.get(make_key(i)).unwrap());
+        black_box(db.get(make_key(i))).unwrap_err().is_not_found();
       }
     });
   });

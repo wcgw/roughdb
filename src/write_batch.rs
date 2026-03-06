@@ -10,7 +10,9 @@
 //    See the License for the specific language governing permissions and
 //    limitations under the License.
 
-use crate::coding::{read_u32_le, read_u64_le, read_varu64, write_u32_le, write_u64_le, write_varu64};
+use crate::coding::{
+  read_u32_le, read_u64_le, read_varu64, write_u32_le, write_u64_le, write_varu64,
+};
 use crate::Error;
 
 const HEADER_SIZE: usize = 12;
@@ -22,13 +24,16 @@ pub trait Handler {
   fn delete(&mut self, key: &[u8]) -> Result<(), Error>;
 }
 
+#[derive(Clone)]
 pub struct WriteBatch {
   rep: Vec<u8>,
 }
 
 impl WriteBatch {
   pub fn new() -> Self {
-    WriteBatch { rep: vec![0u8; HEADER_SIZE] }
+    WriteBatch {
+      rep: vec![0u8; HEADER_SIZE],
+    }
   }
 
   pub fn put(&mut self, key: &[u8], value: &[u8]) {
@@ -57,7 +62,7 @@ impl WriteBatch {
     self.rep.resize(HEADER_SIZE, 0);
   }
 
-  pub fn byte_size(&self) -> usize {
+  pub fn approximate_size(&self) -> usize {
     self.rep.len()
   }
 
@@ -75,7 +80,9 @@ impl WriteBatch {
         TAG_VALUE => {
           let (klen, ksize) = read_varu64(&self.rep[pos..]);
           if ksize == 0 {
-            return Err(Error::Corruption("bad varint in WriteBatch key length".to_string()));
+            return Err(Error::Corruption(
+              "bad varint in WriteBatch key length".to_string(),
+            ));
           }
           pos += ksize;
           let kend = pos + klen as usize;
@@ -86,7 +93,9 @@ impl WriteBatch {
           pos = kend;
           let (vlen, vsize) = read_varu64(&self.rep[pos..]);
           if vsize == 0 {
-            return Err(Error::Corruption("bad varint in WriteBatch value length".to_string()));
+            return Err(Error::Corruption(
+              "bad varint in WriteBatch value length".to_string(),
+            ));
           }
           pos += vsize;
           let vend = pos + vlen as usize;
@@ -100,7 +109,9 @@ impl WriteBatch {
         TAG_DELETE => {
           let (klen, ksize) = read_varu64(&self.rep[pos..]);
           if ksize == 0 {
-            return Err(Error::Corruption("bad varint in WriteBatch key length".to_string()));
+            return Err(Error::Corruption(
+              "bad varint in WriteBatch key length".to_string(),
+            ));
           }
           pos += ksize;
           let kend = pos + klen as usize;
@@ -189,7 +200,7 @@ mod tests {
   #[test]
   fn empty_batch() {
     let b = WriteBatch::new();
-    assert_eq!(b.byte_size(), 12);
+    assert_eq!(b.approximate_size(), 12);
     assert_eq!(b.count(), 0);
     let mut r = Recording { ops: vec![] };
     assert!(b.iterate(&mut r).is_ok());
@@ -233,13 +244,13 @@ mod tests {
   }
 
   #[test]
-  fn byte_size_grows() {
+  fn approximate_size_grows() {
     let mut b = WriteBatch::new();
-    let s0 = b.byte_size();
+    let s0 = b.approximate_size();
     b.put(b"k", b"v");
-    let s1 = b.byte_size();
+    let s1 = b.approximate_size();
     b.delete(b"k");
-    let s2 = b.byte_size();
+    let s2 = b.approximate_size();
     assert!(s1 > s0);
     assert!(s2 > s1);
   }
@@ -249,7 +260,7 @@ mod tests {
     let mut b = WriteBatch::new();
     b.put(b"x", b"y");
     b.clear();
-    assert_eq!(b.byte_size(), 12);
+    assert_eq!(b.approximate_size(), 12);
     assert_eq!(b.count(), 0);
     let mut r = Recording { ops: vec![] };
     b.iterate(&mut r).unwrap();
