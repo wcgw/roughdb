@@ -16,7 +16,10 @@ use crate::memtable::{Memtable, MemtableResult};
 
 pub mod error;
 pub use error::Error;
+pub(crate) mod coding;
 pub(crate) mod memtable;
+pub mod write_batch;
+pub use write_batch::{Handler, WriteBatch};
 
 #[derive(Default)]
 pub struct Db {
@@ -68,6 +71,21 @@ impl Db {
     let key = key.as_ref();
     self.mem.delete(key);
     Ok(())
+  }
+
+  pub fn write(&self, batch: &WriteBatch) -> Result<(), Error> {
+    struct Inserter<'a>(&'a Memtable);
+    impl Handler for Inserter<'_> {
+      fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), Error> {
+        self.0.add(key, value);
+        Ok(())
+      }
+      fn delete(&mut self, key: &[u8]) -> Result<(), Error> {
+        self.0.delete(key);
+        Ok(())
+      }
+    }
+    batch.iterate(&mut Inserter(&self.mem))
   }
 }
 

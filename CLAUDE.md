@@ -62,7 +62,7 @@ Features are listed in dependency order. Each phase must be complete before the 
 *Prerequisite for everything.*
 
 - [x] **`Error`** (`src/error.rs`): `Result`-based error type with variants `NotFound`, `Corruption`, `InvalidArgument`, `NotSupported`, `IoError`. `Db::get/put/delete` now return `Result<_, Error>`. See `include/leveldb/status.h`.
-- [ ] **`WriteBatch`**: Serialises a sequence of Put/Delete operations into a byte buffer. Batch format: `[seq: u64][count: u32][records…]` where each record is `[vtype: u8][klen: varint][key][vlen: varint][value]`. Exposes `put`, `delete`, `iterate(Handler)`, `byte_size`. See `include/leveldb/write_batch.h` and `db/write_batch.cc`.
+- [x] **`WriteBatch`**: Serialises a sequence of Put/Delete operations into a byte buffer. Batch format: `[seq: u64][count: u32][records…]` where each record is `[vtype: u8][klen: varint][key][vlen: varint][value]`. Exposes `put`, `delete`, `iterate(Handler)`, `byte_size`. See `include/leveldb/write_batch.h` and `db/write_batch.cc`.
 - [ ] **`Options` / `ReadOptions` / `WriteOptions`**: Configuration structs. `Options` carries the write-buffer size, block size, compression type, filter policy, block cache handle. `WriteOptions` adds a sync flag. `ReadOptions` adds a snapshot handle and checksum-verify flag. See `include/leveldb/options.h`.
 
 ### Phase 2 — Write-Ahead Log
