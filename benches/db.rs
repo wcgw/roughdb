@@ -59,7 +59,7 @@ fn write_benchmarks(c: &mut Criterion) {
     b.iter(|| {
       let db = Db::default();
       for i in 0..N {
-        db.put(make_key(i), VALUE);
+        db.put(make_key(i), VALUE).unwrap();
       }
       black_box(&db);
     });
@@ -70,7 +70,7 @@ fn write_benchmarks(c: &mut Criterion) {
     b.iter(|| {
       let db = Db::default();
       for &i in &order {
-        db.put(make_key(i), VALUE);
+        db.put(make_key(i), VALUE).unwrap();
       }
       black_box(&db);
     });
@@ -83,10 +83,10 @@ fn write_benchmarks(c: &mut Criterion) {
     b.iter(|| {
       let db = Db::default();
       for i in 0..N {
-        db.put(make_key(i), VALUE);
+        db.put(make_key(i), VALUE).unwrap();
       }
       for i in 0..N {
-        db.put(make_key(i), VALUE);
+        db.put(make_key(i), VALUE).unwrap();
       }
       black_box(&db);
     });
@@ -107,7 +107,7 @@ fn read_benchmarks(c: &mut Criterion) {
 
   let db = Db::default();
   for i in 0..N {
-    db.put(make_key(i), VALUE);
+    db.put(make_key(i), VALUE).unwrap();
   }
 
   // readseq: N gets of existing keys, sequential order.
@@ -156,10 +156,10 @@ fn delete_benchmarks(c: &mut Criterion) {
     b.iter(|| {
       let db = Db::default();
       for i in 0..N {
-        db.put(make_key(i), VALUE);
+        db.put(make_key(i), VALUE).unwrap();
       }
       for i in 0..N {
-        db.delete(make_key(i));
+        db.delete(make_key(i)).unwrap();
       }
       black_box(&db);
     });
@@ -170,10 +170,10 @@ fn delete_benchmarks(c: &mut Criterion) {
     b.iter(|| {
       let db = Db::default();
       for i in 0..N {
-        db.put(make_key(i), VALUE);
+        db.put(make_key(i), VALUE).unwrap();
       }
       for &i in &order {
-        db.delete(make_key(i));
+        db.delete(make_key(i)).unwrap();
       }
       black_box(&db);
     });

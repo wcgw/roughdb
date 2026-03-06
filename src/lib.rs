@@ -14,6 +14,8 @@
 
 use crate::memtable::{Memtable, MemtableResult};
 
+pub mod error;
+pub use error::Error;
 pub(crate) mod memtable;
 
 #[derive(Default)]
@@ -24,30 +26,31 @@ pub struct Db {
 }
 
 impl Db {
-  pub fn get<K>(&self, key: K) -> Option<Vec<u8>>
+  pub fn get<K>(&self, key: K) -> Result<Vec<u8>, Error>
   where
     K: AsRef<[u8]>,
   {
     let key = key.as_ref();
 
     match self.mem.get(key) {
-      MemtableResult::Hit(hit) => Some(hit),
-      MemtableResult::Deleted => None,
-      MemtableResult::Miss => {
-        if let Some(imm) = self.imm.as_ref() {
-          if let MemtableResult::Hit(hit) = imm.get(key) {
-            return Some(hit);
-          } else if let MemtableResult::Deleted = imm.get(key) {
-            return None;
-          }
-        }
-        // return self.disk
-        None
+      MemtableResult::Hit(hit) => return Ok(hit),
+      MemtableResult::Deleted => return Err(Error::NotFound),
+      MemtableResult::Miss => {}
+    }
+
+    if let Some(imm) = self.imm.as_ref() {
+      match imm.get(key) {
+        MemtableResult::Hit(hit) => return Ok(hit),
+        MemtableResult::Deleted => return Err(Error::NotFound),
+        MemtableResult::Miss => {}
       }
     }
+
+    // return self.disk
+    Err(Error::NotFound)
   }
 
-  pub fn put<K, V>(&self, key: K, value: V)
+  pub fn put<K, V>(&self, key: K, value: V) -> Result<(), Error>
   where
     K: AsRef<[u8]>,
     V: AsRef<[u8]>,
@@ -55,14 +58,16 @@ impl Db {
     let key = key.as_ref();
     let val = value.as_ref();
     self.mem.add(key, val);
+    Ok(())
   }
 
-  pub fn delete<K>(&self, key: K)
+  pub fn delete<K>(&self, key: K) -> Result<(), Error>
   where
     K: AsRef<[u8]>,
   {
     let key = key.as_ref();
     self.mem.delete(key);
+    Ok(())
   }
 }
 
@@ -73,10 +78,10 @@ mod tests {
   #[test]
   fn it_works() {
     let db = Db::default();
-    assert_eq!(db.get(b"42"), None);
-    db.put(b"42", b"An answer to some question");
-    assert_eq!(db.get(b"42"), Some(b"An answer to some question".to_vec()));
-    db.delete(b"42");
-    assert_eq!(db.get(b"42"), None);
+    assert!(db.get(b"42").unwrap_err().is_not_found());
+    db.put(b"42", b"An answer to some question").unwrap();
+    assert_eq!(db.get(b"42").unwrap(), b"An answer to some question");
+    db.delete(b"42").unwrap();
+    assert!(db.get(b"42").unwrap_err().is_not_found());
   }
 }
