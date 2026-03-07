@@ -53,8 +53,16 @@ The read path checks `mem` → `imm` → each level of SSTables (newest to oldes
 - Allocation-free helpers (`write_value_to`, `write_lookup_to`, etc.) encode directly into arena memory.
 
 **Arena** (`src/memtable/arena/bump.rs`)
-- Thin wrapper around `bumpalo::Bump`, default 10 MB capacity.
-- `allocate_aligned` panics on OOM (matching LevelDB: memtable OOM is unrecoverable).
+- Thin wrapper around `bumpalo::Bump`; `allocate_aligned(size, align)` panics on OOM (matching LevelDB: memtable OOM
+  is unrecoverable).
+- Unlike LevelDB/RocksDB, which manage explicit 4 KB slabs and bypass them for large allocations (> slab/4), we
+  delegate slab management entirely to bumpalo. The large-allocation bypass is bumpalo's internal policy rather than
+  ours, but the outcome is equivalent.
+- **No `memory_usage()`**: LevelDB exposes `MemoryUsage()` (an `atomic<size_t>`) and RocksDB exposes
+  `ApproximateMemoryUsage()` so the DB can compare arena usage against `write_buffer_size` to decide when to flush.
+  We have no equivalent yet; `bumpalo::Bump::allocated_bytes()` can serve this role. Needed before Phase 9.
+- **Hardcoded 10 MB cap**: LevelDB is unlimited; RocksDB uses a configurable block size. Our fixed cap should become
+  `Options::write_buffer_size` in Phase 9, and the response to hitting it should trigger a flush rather than panic.
 
 ---
 
@@ -204,7 +212,8 @@ Features are listed in dependency order. Each phase must be complete before the 
 - [ ] **`Db::Write`** (batch-grouped): Multiple concurrent writers are grouped; only the leader writes to the WAL and
   inserts into the memtable. See `db/db_impl.cc: DBImpl::Write`.
 - [ ] **Memtable flush**: When `mem` exceeds `write_buffer_size` (default 4 MB), it is sealed as `imm` and a background
-  task writes it to a new L0 SSTable via `TableBuilder`.
+  task writes it to a new L0 SSTable via `TableBuilder`. Prerequisite: wire `Arena::memory_usage()` (via
+  `bumpalo::Bump::allocated_bytes()`) and replace the hardcoded 10 MB arena cap with `Options::write_buffer_size`.
 - [ ] **Background compaction**: Triggered when L0 file count ≥ 4 (slow writes at 8, stop at 12). Selects input files,
   runs a `MergingIterator` over them, drops shadowed versions and obsolete tombstones, and writes output files to L+1.
   Managed in `db/db_impl.cc: BackgroundCompaction`.
@@ -226,3 +235,5 @@ Features are listed in dependency order. Each phase must be complete before the 
 - Methods or functions only used in tests are gated with `#[cfg(test)]`.
 - Prefer encoding directly into arena/pre-allocated memory (see `Entry` helpers) over intermediate `Vec` allocations on
   hot paths.
+- Run `cargo fmt` on changesets
+- Have text and other files hardwrap at 120 character lines
