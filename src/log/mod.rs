@@ -10,6 +10,6 @@
 //    See the License for the specific language governing permissions and
 //    limitations under the License.
 
-mod bump;
-
-pub(crate) use bump::Arena;
+pub(crate) mod format;
+pub(crate) mod reader;
+pub(crate) mod writer;
