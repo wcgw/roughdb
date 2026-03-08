@@ -154,15 +154,17 @@ disk on in-memory misses. Mirrors the approach taken in Phase 2, where the WAL w
 
 **Memtable iteration** *(pulled forward from Phase 6 — required for flush)*
 
-- [ ] **`SkipList::iter()`**: Forward-only iteration over the skip list (backward deferred to Phase 6). Yields entries
-  in internal-key order (user key ASC, sequence DESC), which is the order `TableBuilder` requires.
-- [ ] **`MemTableIterator`**: Thin forward iterator over `SkipList::iter()`, decoding each entry via `Entry::from_slice`
-  to expose `(internal_key, value)` pairs to the flusher.
+- [x] **`SkipList::iter()`**: Forward-only iteration over the skip list (backward deferred to Phase 6). Yields entries
+  in internal-key order (user key ASC, sequence DESC) via `SkipListIter<'a>` (walks level-0 links with Acquire loads).
+- [x] **`MemTableIterator`**: Thin forward iterator over `SkipList::iter()`, decoding each entry via `Entry::from_slice`
+  to expose `ikey()` (SSTable internal key: `user_key || tag`) and `value()` to the flusher. `Entry::key()`/`value()`
+  lifetimes refined to `&'a [u8]` so values borrow from the arena, not from the short-lived `Entry` view.
 
 **L0 flush + disk read wiring**
 
-- [ ] **`Arena::memory_usage()`**: Expose `bumpalo::Bump::allocated_bytes()` so `Db` can compare memtable size against
-  `Options::write_buffer_size`. Replace the current hardcoded 10 MB panic with a flush trigger.
+- [x] **`Arena::memory_usage()`**: Tracks bytes via an explicit `AtomicUsize` counter (bumpalo's `allocated_bytes()`
+  returns chunk *capacity*, not used bytes). `Memtable::approximate_memory_usage()` delegates to this counter so `Db`
+  can compare against `Options::write_buffer_size`.
 - [ ] **`Db::open` takes `Options`**: Pass `write_buffer_size` (and future options) through to the database.
 - [ ] **L0 flush** (`Db`): When `mem` exceeds `write_buffer_size` after a write, seal it as `imm`, iterate it via
   `MemTableIterator`, write a new SSTable via `TableBuilder` (file `<path>/<number>.ldb`, number starting at 2), then

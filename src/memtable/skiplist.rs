@@ -41,6 +41,7 @@
 
 use super::arena::Arena;
 use super::entry::Entry;
+use std::marker::PhantomData;
 use std::mem;
 use std::ptr;
 use std::slice;
@@ -293,6 +294,22 @@ impl SkipList {
   #[cfg(test)]
   pub fn len(&self) -> usize {
     self.len
+  }
+
+  /// Bytes allocated from the underlying arena.
+  pub(crate) fn arena_memory_usage(&self) -> usize {
+    self.arena.memory_usage()
+  }
+
+  /// Return a forward iterator that yields every node's payload in order.
+  ///
+  /// The iterator is lock-free (Acquire loads); it may be called concurrently
+  /// with readers.  Mutation must not occur during iteration — the caller is
+  /// responsible for holding the DB write mutex if needed.
+  pub(crate) fn iter(&self) -> SkipListIter<'_> {
+    // SAFETY: `self.head` is always valid for the lifetime of `self`.
+    let first = unsafe { (*self.head).load_next(0) };
+    SkipListIter { current: first, _marker: PhantomData }
   }
 
   // ── Internal helpers ─────────────────────────────────────────────────────
@@ -557,6 +574,53 @@ unsafe fn alloc_node_raw(arena: &Arena, data_size: usize, height: usize) -> *mut
   ptr::write(Node::data_len_ptr(node), data_size as u32);
 
   node
+}
+
+// ─── SkipListIter ────────────────────────────────────────────────────────────
+
+/// Forward-only iterator over a [`SkipList`].
+///
+/// Yields raw payload bytes (varint-encoded [`Entry`]) in internal-key order
+/// (user key ASC, sequence DESC).  Lock-free reads via Acquire loads.
+pub(crate) struct SkipListIter<'a> {
+  current: *const Node,
+  _marker: PhantomData<&'a SkipList>,
+}
+
+// SAFETY: `SkipListIter` contains a raw pointer that was derived from an
+// `&'a SkipList` and is valid for `'a`.  Sending it across threads is safe for
+// the same reason the arena-allocated nodes are safe to read from any thread.
+unsafe impl Send for SkipListIter<'_> {}
+unsafe impl Sync for SkipListIter<'_> {}
+
+impl<'a> SkipListIter<'a> {
+  pub(crate) fn valid(&self) -> bool {
+    !self.current.is_null()
+  }
+
+  /// Raw payload bytes of the current node.
+  ///
+  /// # Panics
+  /// Panics (debug) if `valid()` is false.
+  pub(crate) fn payload(&self) -> &'a [u8] {
+    debug_assert!(self.valid(), "payload() called on exhausted iterator");
+    // SAFETY: `current` is non-null (checked by `valid()`), is a node
+    // produced by `alloc_node_raw`, and was published with a Release store
+    // before this Acquire load could observe it.  The lifetime `'a` is
+    // correct because nodes live for the duration of the `SkipList` (arena).
+    unsafe { Node::payload(self.current) }
+  }
+
+  /// Advance to the next node.
+  ///
+  /// # Panics
+  /// Panics (debug) if `valid()` is false.
+  pub(crate) fn advance(&mut self) {
+    debug_assert!(self.valid(), "advance() called on exhausted iterator");
+    // SAFETY: `current` is a valid node (checked by `valid()`).  The
+    // level-0 link was initialised to null or another valid node pointer.
+    self.current = unsafe { (*self.current).load_next(0) };
+  }
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────

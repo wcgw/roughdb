@@ -141,12 +141,12 @@ impl<'a> Entry<'a> {
     seq
   }
 
-  pub fn key(&self) -> &[u8] {
+  pub fn key(&self) -> &'a [u8] {
     let (len, pos) = read_varu64(self.data);
     &self.data[pos..pos + len as usize]
   }
 
-  pub fn value(&self) -> Option<&[u8]> {
+  pub fn value(&self) -> Option<&'a [u8]> {
     let (klen, ksize) = read_varu64(self.data);
     let mut pos = ksize + klen as usize;
     let (_seq, seq_size) = read_varu64(&self.data[pos..]);
