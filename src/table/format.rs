@@ -104,11 +104,15 @@ impl BlockHandle {
   pub(crate) fn decode_from(data: &[u8]) -> Result<(Self, usize), Error> {
     let (offset, n1) = read_varu64(data);
     if n1 == 0 {
-      return Err(Error::Corruption("bad varint in BlockHandle offset".to_owned()));
+      return Err(Error::Corruption(
+        "bad varint in BlockHandle offset".to_owned(),
+      ));
     }
     let (size, n2) = read_varu64(&data[n1..]);
     if n2 == 0 {
-      return Err(Error::Corruption("bad varint in BlockHandle size".to_owned()));
+      return Err(Error::Corruption(
+        "bad varint in BlockHandle size".to_owned(),
+      ));
     }
     Ok((BlockHandle { offset, size }, n1 + n2))
   }
@@ -142,11 +146,16 @@ impl Footer {
     let magic_start = FOOTER_ENCODED_LENGTH - 8;
     let magic = u64::from_le_bytes(data[magic_start..].try_into().unwrap());
     if magic != TABLE_MAGIC_NUMBER {
-      return Err(Error::Corruption(format!("SSTable magic mismatch: {magic:#018x}")));
+      return Err(Error::Corruption(format!(
+        "SSTable magic mismatch: {magic:#018x}"
+      )));
     }
     let (metaindex_handle, n1) = BlockHandle::decode_from(data)?;
     let (index_handle, _) = BlockHandle::decode_from(&data[n1..])?;
-    Ok(Footer { metaindex_handle, index_handle })
+    Ok(Footer {
+      metaindex_handle,
+      index_handle,
+    })
   }
 }
 
@@ -196,14 +205,21 @@ pub(crate) fn read_block(
 /// Write a block to `dest` (appends data + trailer), returning the `BlockHandle`.
 ///
 /// The trailer is `[type: u8 = 0x00][masked_crc: u32 LE]`.
-pub(crate) fn write_raw_block(dest: &mut impl std::io::Write, data: &[u8], offset: u64) -> Result<BlockHandle, Error> {
+pub(crate) fn write_raw_block(
+  dest: &mut impl std::io::Write,
+  data: &[u8],
+  offset: u64,
+) -> Result<BlockHandle, Error> {
   let crc = mask_crc(crc32c_extend(crc32c(data), &[0x00u8]));
   let mut trailer = [0u8; BLOCK_TRAILER_SIZE];
   trailer[0] = 0x00; // NoCompression
   trailer[1..].copy_from_slice(&crc.to_le_bytes());
   dest.write_all(data)?;
   dest.write_all(&trailer)?;
-  Ok(BlockHandle { offset, size: data.len() as u64 })
+  Ok(BlockHandle {
+    offset,
+    size: data.len() as u64,
+  })
 }
 
 #[cfg(test)]
@@ -239,7 +255,10 @@ mod tests {
 
   #[test]
   fn block_handle_encode_decode() {
-    let h = BlockHandle { offset: 12345, size: 678 };
+    let h = BlockHandle {
+      offset: 12345,
+      size: 678,
+    };
     let mut buf = [0u8; 20];
     let n = h.encode_to(&mut buf);
     let (decoded, consumed) = BlockHandle::decode_from(&buf[..n]).unwrap();
@@ -252,7 +271,10 @@ mod tests {
   fn footer_encode_decode() {
     let f = Footer {
       metaindex_handle: BlockHandle { offset: 0, size: 0 },
-      index_handle: BlockHandle { offset: 1024, size: 200 },
+      index_handle: BlockHandle {
+        offset: 1024,
+        size: 200,
+      },
     };
     let encoded = f.encode();
     assert_eq!(encoded.len(), FOOTER_ENCODED_LENGTH);

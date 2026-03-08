@@ -172,7 +172,10 @@ mod tests {
   #[test]
   fn restart_interval_creates_restart_points() {
     let pairs: Vec<(Vec<u8>, Vec<u8>)> = (0u8..6).map(|i| (vec![i], vec![i + 10])).collect();
-    let pairs_ref: Vec<(&[u8], &[u8])> = pairs.iter().map(|(k, v)| (k.as_slice(), v.as_slice())).collect();
+    let pairs_ref: Vec<(&[u8], &[u8])> = pairs
+      .iter()
+      .map(|(k, v)| (k.as_slice(), v.as_slice()))
+      .collect();
     let data = build_block(&pairs_ref, 3);
     let block = Block::new(data.clone());
     // Verify all 6 entries readable in order.
@@ -188,8 +191,13 @@ mod tests {
 
   #[test]
   fn seek_finds_entry() {
-    let pairs: Vec<(&[u8], &[u8])> =
-      vec![(b"a", b"1"), (b"b", b"2"), (b"c", b"3"), (b"d", b"4"), (b"e", b"5")];
+    let pairs: Vec<(&[u8], &[u8])> = vec![
+      (b"a", b"1"),
+      (b"b", b"2"),
+      (b"c", b"3"),
+      (b"d", b"4"),
+      (b"e", b"5"),
+    ];
     let data = build_block(&pairs, 2);
     let block = Block::new(data);
     let mut it = block.iter();

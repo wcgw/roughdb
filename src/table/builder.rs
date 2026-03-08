@@ -116,7 +116,10 @@ impl TableBuilder {
     self.offset += index_handle.size + 5;
 
     // Write footer.
-    let footer = Footer { metaindex_handle, index_handle };
+    let footer = Footer {
+      metaindex_handle,
+      index_handle,
+    };
     let footer_bytes = footer.encode();
     self.dest.write_all(&footer_bytes)?;
     self.offset += FOOTER_ENCODED_LENGTH as u64;
@@ -163,7 +166,7 @@ impl TableBuilder {
 mod tests {
   use super::*;
   use crate::table::format::make_internal_key;
-  use crate::table::reader::Table;
+  use crate::table::reader::{LookupResult as L, Table};
 
   /// Build a table from (user_key, value) pairs using internal keys with ascending sequence numbers.
   fn build_table(pairs: &[(&[u8], &[u8])]) -> (tempfile::NamedTempFile, u64) {
@@ -193,27 +196,35 @@ mod tests {
     let (tmp, size) = build_table(&[(b"hello", b"world")]);
     let file = tmp.reopen().unwrap();
     let table = Table::open(file, size).unwrap();
-    assert_eq!(table.get(b"hello", false).unwrap(), Some(b"world".to_vec()));
-    assert!(table.get(b"missing", false).unwrap().is_none());
+    assert!(matches!(table.get(b"hello", false).unwrap(), L::Value(v) if v == b"world"));
+    assert!(matches!(
+      table.get(b"missing", false).unwrap(),
+      L::NotInTable
+    ));
   }
 
   #[test]
   fn multiple_entries_round_trip() {
-    let pairs: Vec<(&[u8], &[u8])> =
-      vec![(b"a", b"1"), (b"b", b"2"), (b"c", b"3"), (b"d", b"4")];
+    let pairs: Vec<(&[u8], &[u8])> = vec![(b"a", b"1"), (b"b", b"2"), (b"c", b"3"), (b"d", b"4")];
     let (tmp, size) = build_table(&pairs);
     let file = tmp.reopen().unwrap();
     let table = Table::open(file, size).unwrap();
     for (k, v) in &pairs {
-      assert_eq!(table.get(k, false).unwrap().as_deref(), Some(*v));
+      assert!(matches!(table.get(k, false).unwrap(), L::Value(ref val) if val == v));
     }
   }
 
   #[test]
   fn many_entries_spanning_blocks() {
     // Use tiny block_size to force multiple data blocks.
-    let pairs: Vec<(Vec<u8>, Vec<u8>)> =
-      (0u32..200).map(|i| (format!("key{i:05}").into_bytes(), format!("val{i:05}").into_bytes())).collect();
+    let pairs: Vec<(Vec<u8>, Vec<u8>)> = (0u32..200)
+      .map(|i| {
+        (
+          format!("key{i:05}").into_bytes(),
+          format!("val{i:05}").into_bytes(),
+        )
+      })
+      .collect();
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let file = tmp.reopen().unwrap();
     let mut builder = TableBuilder::new(file, 64, 4);
@@ -225,7 +236,7 @@ mod tests {
     let file = tmp.reopen().unwrap();
     let table = Table::open(file, size).unwrap();
     for (k, v) in &pairs {
-      assert_eq!(table.get(k, false).unwrap().as_deref(), Some(v.as_slice()));
+      assert!(matches!(table.get(k, false).unwrap(), L::Value(ref val) if val == v));
     }
   }
 }

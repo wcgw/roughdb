@@ -32,8 +32,7 @@ impl Block {
   /// Panics if `data` is too short to hold a valid restart count.
   pub(crate) fn new(data: Vec<u8>) -> Self {
     assert!(data.len() >= 4, "block too short: {} bytes", data.len());
-    let num_restarts =
-      u32::from_le_bytes(data[data.len() - 4..].try_into().unwrap()) as usize;
+    let num_restarts = u32::from_le_bytes(data[data.len() - 4..].try_into().unwrap()) as usize;
     let restarts_size = num_restarts * 4 + 4; // offsets + count field
     assert!(
       data.len() >= restarts_size,
@@ -41,7 +40,11 @@ impl Block {
       data.len()
     );
     let restarts_offset = data.len() - restarts_size;
-    Block { data, restarts_offset, num_restarts }
+    Block {
+      data,
+      restarts_offset,
+      num_restarts,
+    }
   }
 
   /// Return a forward iterator over this block's entries.
@@ -263,9 +266,11 @@ mod tests {
   #[test]
   fn seek_across_restart_boundaries() {
     // 9 entries, restart every 3 — forces binary search across multiple restart points.
-    let pairs: Vec<(Vec<u8>, Vec<u8>)> =
-      (b'a'..=b'i').map(|c| (vec![c], vec![c + 1])).collect();
-    let pairs_ref: Vec<(&[u8], &[u8])> = pairs.iter().map(|(k, v)| (k.as_slice(), v.as_slice())).collect();
+    let pairs: Vec<(Vec<u8>, Vec<u8>)> = (b'a'..=b'i').map(|c| (vec![c], vec![c + 1])).collect();
+    let pairs_ref: Vec<(&[u8], &[u8])> = pairs
+      .iter()
+      .map(|(k, v)| (k.as_slice(), v.as_slice()))
+      .collect();
     let block = make_block(&pairs_ref, 3);
     let mut it = block.iter();
     it.seek(b"f");

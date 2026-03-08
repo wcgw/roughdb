@@ -58,11 +58,11 @@ The read path checks `mem` → `imm` → each level of SSTables (newest to oldes
 - Unlike LevelDB/RocksDB, which manage explicit 4 KB slabs and bypass them for large allocations (> slab/4), we
   delegate slab management entirely to bumpalo. The large-allocation bypass is bumpalo's internal policy rather than
   ours, but the outcome is equivalent.
-- **No `memory_usage()`**: LevelDB exposes `MemoryUsage()` (an `atomic<size_t>`) and RocksDB exposes
-  `ApproximateMemoryUsage()` so the DB can compare arena usage against `write_buffer_size` to decide when to flush.
-  We have no equivalent yet; `bumpalo::Bump::allocated_bytes()` can serve this role. Needed before Phase 9.
-- **Hardcoded 10 MB cap**: LevelDB is unlimited; RocksDB uses a configurable block size. Our fixed cap should become
-  `Options::write_buffer_size` in Phase 9, and the response to hitting it should trigger a flush rather than panic.
+- **`memory_usage()`**: `Arena` tracks exact bytes used via an explicit `AtomicUsize` counter (bumpalo's
+  `allocated_bytes()` returns chunk *capacity* not bytes used). `Memtable::approximate_memory_usage()` delegates to
+  this; `Db::write` compares against `options.write_buffer_size` to trigger L0 flush.
+- **Hardcoded 10 MB cap**: The `Arena::default()` cap of 10 MB is a safety ceiling only; the actual flush threshold
+  is `Options::write_buffer_size` (default 4 MB). The cap should be removed or raised in Phase 9.
 
 ---
 
@@ -165,12 +165,14 @@ disk on in-memory misses. Mirrors the approach taken in Phase 2, where the WAL w
 - [x] **`Arena::memory_usage()`**: Tracks bytes via an explicit `AtomicUsize` counter (bumpalo's `allocated_bytes()`
   returns chunk *capacity*, not used bytes). `Memtable::approximate_memory_usage()` delegates to this counter so `Db`
   can compare against `Options::write_buffer_size`.
-- [ ] **`Db::open` takes `Options`**: Pass `write_buffer_size` (and future options) through to the database.
-- [ ] **L0 flush** (`Db`): When `mem` exceeds `write_buffer_size` after a write, seal it as `imm`, iterate it via
-  `MemTableIterator`, write a new SSTable via `TableBuilder` (file `<path>/<number>.ldb`, number starting at 2), then
-  clear `imm`. Track flushed files in a `Mutex<Vec<Table>>` (newest first) — no `VersionSet` yet.
-- [ ] **`Db::get` disk fallback**: On miss in `mem` and `imm`, scan the L0 file list newest-first, calling
-  `Table::get` on each. First hit (value or tombstone) wins. No multi-level routing yet — deferred to Phase 9.
+- [x] **`Db::open` takes `Options`**: Pass `write_buffer_size` (and future options) through to the database.
+- [x] **L0 flush** (`Db`): When `mem` exceeds `write_buffer_size` after a write, `std::mem::replace` swaps in a fresh
+  `Memtable`, the old one is iterated via `MemTableIterator` and flushed to `<path>/<number>.ldb` via `TableBuilder`,
+  then the opened `Table` is prepended to `l0_files: Vec<(u64, Table)>`. `scan_next_file_number` prevents file-number
+  collisions across sessions. All mutable state lives in `Mutex<DbState>`.
+- [x] **`Db::get` disk fallback**: On miss in `mem`, scan `l0_files` newest-first, calling `Table::get` on each.
+  `LookupResult::{Value, Deleted, NotInTable}` lets tombstones stop the search without continuing to older files.
+  No multi-level routing yet — deferred to Phase 9.
 
 ### Phase 4 — Bloom filters
 
