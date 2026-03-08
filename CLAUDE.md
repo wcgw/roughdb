@@ -127,11 +127,6 @@ Features are listed in dependency order. Each phase must be complete before the 
   all records restore `last_sequence` to the highest sequence seen. Incomplete trailing records (torn write on crash)
   are silently ignored.
 
-> **RocksDB improvement worth adopting (Phase 9 or later)**: WAL file recycling — reuse old log files from a pool rather
-> than deleting and recreating them, avoiding inode churn on slow filesystems. Uses a 12-byte header (standard 7 bytes +
-> `log_number: u32`) so the reader can distinguish recycled files from freshly created ones. See `db/log_writer.cc` in
-> RocksDB.
-
 ### Phase 3 — SSTable format
 
 *The on-disk immutable file format. Required by flush and compaction.*
@@ -157,9 +152,6 @@ Features are listed in dependency order. Each phase must be complete before the 
   hash functions; one filter per ~2 KB of data blocks stored in the SSTable filter block. See `util/bloom.cc` and
   `include/leveldb/filter_policy.h`.
 - [ ] **`FilterPolicy` trait**: Abstract interface so users can supply custom filters.
-
-> **RocksDB improvement (optional, later)**: Ribbon filters offer the same false-positive rate in ~30% fewer bits. See
-> `util/ribbon_impl.h` in RocksDB.
 
 ### Phase 5 — Block cache
 
@@ -224,6 +216,25 @@ Features are listed in dependency order. Each phase must be complete before the 
 - [ ] **`Db::GetSnapshot` / `ReleaseSnapshot`**: Snapshots are sequence numbers stored in a doubly-linked list; they
   prevent compaction from dropping key versions still visible to a snapshot.
 - [ ] **`Db::CompactRange`**: Manual compaction of a user-specified key range.
+
+---
+
+### Post-parity improvements
+
+*Optional enhancements to consider once RoughDB is fully on par with LevelDB's feature set. None are prerequisites for
+the phases above.*
+
+- **`Db::flush_wal(sync: bool)` / `Db::sync_wal()`**: RocksDB-style explicit WAL flush. `flush_wal` pushes buffered
+  data from the `BufWriter` to the OS page cache; passing `sync = true` also `fsync`s. `sync_wal` `fsync`s without
+  flushing (assumes the caller already flushed). Useful for amortising `fsync` cost over many `sync=false` writes —
+  write a batch with `sync=false` then call `flush_wal(true)` once to make the whole group durable. Matches
+  `DB::FlushWAL` / `DB::SyncWAL` in `include/rocksdb/db.h`. Currently `Db::drop` relies on `BufWriter`'s implicit
+  flush-on-drop, which silences I/O errors; an explicit `flush_wal` would give callers a chance to handle them.
+- **WAL file recycling** (RocksDB): Reuse old log files from a pool rather than deleting and recreating them, avoiding
+  inode churn on slow filesystems. Uses a 12-byte header (standard 7 bytes + `log_number: u32`) so the reader can
+  distinguish recycled files from freshly created ones. See `db/log_writer.cc` in RocksDB.
+- **Ribbon filters** (RocksDB): Drop-in replacement for Bloom filters offering the same false-positive rate in ~30%
+  fewer bits. See `util/ribbon_impl.h` in RocksDB.
 
 ---
 
