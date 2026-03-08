@@ -134,20 +134,23 @@ disk on in-memory misses. Mirrors the approach taken in Phase 2, where the WAL w
 
 **SSTable primitives**
 
-- [ ] **`Block`** (`src/table/block.rs`): Delta-encoded key-value pairs with restart points every N keys (default 16).
+- [x] **`Block`** (`src/table/block.rs`): Delta-encoded key-value pairs with restart points every N keys (default 16).
   Each entry: `[shared_len: varint][unshared_len: varint][value_len: varint][key_suffix][value]`. Restart point array at
   block tail enables binary search. See `table/block.h/cc`.
-- [ ] **`BlockIterator`** (`src/table/block.rs`): Decodes delta-encoded entries on the fly; jumps to restart points for
-  seeks. Needed by `Table::get` to decode data blocks — pulled forward from Phase 6. See `table/block.cc`.
-- [ ] **`BlockBuilder`** (`src/table/block_builder.rs`): Accumulates entries into a `Block`, tracking the last key for
+- [x] **`BlockIterator`** (`src/table/block.rs`): Decodes delta-encoded entries on the fly; jumps to restart points for
+  seeks using `cmp_internal_keys` (user_key ASC, seq DESC). Needed by `Table::get` to decode data blocks — pulled
+  forward from Phase 6. See `table/block.cc`.
+- [x] **`BlockBuilder`** (`src/table/block_builder.rs`): Accumulates entries into a `Block`, tracking the last key for
   delta encoding. See `table/block_builder.h/cc`.
-- [ ] **`BlockHandle` / `Footer`** (`src/table/format.rs`): `BlockHandle` is an (offset, size) pair encoded as two
-  varints. Footer is 48 bytes: metaindex handle + index handle + 8-byte magic (`0xdb4775248b80fb57`). See
-  `table/format.h`.
-- [ ] **`TableBuilder`** (`src/table/builder.rs`): Sequentially appends sorted key-value pairs; writes data blocks,
-  index block, optional filter block, and footer. See `include/leveldb/table_builder.h` and `table/table_builder.cc`.
-- [ ] **`Table`** (`src/table/reader.rs`): Random-access reader; uses the index block to locate data blocks, optionally
-  the filter block to skip misses. See `table/table.cc`.
+- [x] **`BlockHandle` / `Footer`** (`src/table/format.rs`): `BlockHandle` is an (offset, size) pair encoded as two
+  varints. Footer is 48 bytes: metaindex handle + index handle + 8-byte magic (`0xdb4775248b80fb57`). Also contains
+  `make_internal_key`, `parse_internal_key`, `cmp_internal_keys`. See `table/format.h`.
+- [x] **`TableBuilder`** (`src/table/builder.rs`): Sequentially appends sorted key-value pairs; writes data blocks,
+  index block, empty metaindex block, and footer. NoCompression only (Phase 3). No filter blocks. Index block uses
+  `restart_interval=1`. See `include/leveldb/table_builder.h` and `table/table_builder.cc`.
+- [x] **`Table`** (`src/table/reader.rs`): Random-access reader; reads footer + index block on `open`; `get(user_key)`
+  searches index block, reads data block via `pread` (`FileExt::read_at`), returns value/tombstone/None.
+  See `table/table.cc`.
 
 **Memtable iteration** *(pulled forward from Phase 6 — required for flush)*
 

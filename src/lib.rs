@@ -22,6 +22,7 @@ pub use options::{CompressionType, Options, ReadOptions, Snapshot, WriteOptions}
 pub(crate) mod coding;
 pub(crate) mod log;
 pub(crate) mod memtable;
+pub(crate) mod table;
 pub mod write_batch;
 pub use write_batch::{Handler, WriteBatch};
 
