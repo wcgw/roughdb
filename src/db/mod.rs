@@ -10,4 +10,5 @@
 //    See the License for the specific language governing permissions and
 //    limitations under the License.
 
+pub(crate) mod db_iter;
 pub(crate) mod merge_iter;

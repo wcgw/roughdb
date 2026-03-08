@@ -187,7 +187,7 @@ deferred to post-parity as it is not needed for compaction or the core read path
   interface used by `TwoLevelIterator`, `MergingIterator`, and `DbIterator`. See `table/two_level_iterator.h/cc`.
 - [x] **`MergingIterator`** (`src/db/merge_iter.rs`): N-way merge of sorted iterators using a heap or linear scan
   (LevelDB uses linear for small N). See `table/merger.h/cc`.
-- [ ] **`DbIterator`** (`src/db/db_iter.rs`): Wraps `MergingIterator`; applies snapshot sequence-number filtering,
+- [x] **`DbIterator`** (`src/db/db_iter.rs`): Wraps `MergingIterator`; applies snapshot sequence-number filtering,
   merges value versions, skips tombstones for the user. Forward-only for now. See `db/db_iter.h/cc`.
 
 ### Phase 5 — Version management
