@@ -12,6 +12,7 @@ crc32c = "0.6.8"
 
 [dev-dependencies]
 criterion = "0.5"
+tempfile = "3"
 
 [[bench]]
 name = "db"
