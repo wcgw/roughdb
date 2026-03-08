@@ -55,3 +55,32 @@ pub(crate) fn write_u32_le(buf: &mut [u8; 4], n: u32) {
 pub(crate) fn read_u32_le(buf: &[u8; 4]) -> u32 {
   u32::from_le_bytes(*buf)
 }
+
+// ── CRC32c helpers ───────────────────────────────────────────────────────────
+//
+// LevelDB masks stored CRCs to guard against the possibility of a CRC value
+// being misinterpreted as a length or type field if data is shifted.  The
+// mask rotates the bits and adds a constant, making the transformation
+// reversible but distinct from the identity.  See `util/crc32c.h`.
+
+const CRC_MASK_DELTA: u32 = 0xa282_ead8;
+
+/// Compute CRC32c over `data`, extending an initial value of 0.
+pub(crate) fn crc32c(data: &[u8]) -> u32 {
+  crc32c::crc32c(data)
+}
+
+/// Extend an existing CRC32c value with additional `data`.
+pub(crate) fn crc32c_extend(crc: u32, data: &[u8]) -> u32 {
+  crc32c::crc32c_append(crc, data)
+}
+
+/// Apply LevelDB's CRC mask before storing a checksum on disk.
+pub(crate) fn mask_crc(crc: u32) -> u32 {
+  (crc.rotate_right(15)).wrapping_add(CRC_MASK_DELTA)
+}
+
+/// Reverse [`mask_crc`] when verifying a stored checksum.
+pub(crate) fn unmask_crc(masked: u32) -> u32 {
+  masked.wrapping_sub(CRC_MASK_DELTA).rotate_left(15)
+}

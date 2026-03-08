@@ -90,7 +90,7 @@ Features are listed in dependency order. Each phase must be complete before the 
 
 **Step 1 — Prerequisites**
 
-- [ ] **`crc32c` crate**: Add `crc32c = "..."` to `Cargo.toml`. Used for record header checksums.
+- [x] **`crc32c` crate**: Add `crc32c = "..."` to `Cargo.toml`. Used for record header checksums.
 - [ ] **Sequence number ownership**: Move `last_sequence` from `Memtable` to `Db` as an `AtomicU64`.
   `Memtable::add`/`delete` gain an explicit `seq: u64` parameter (internal `next_seq` counter removed). `Db::write`
   stamps each batch: `set_sequence(last_sequence + 1)`, then advances `last_sequence += batch.count()` *before* calling

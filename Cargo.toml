@@ -8,6 +8,7 @@ authors = ["Alex Snaps <alex@wcgw.dev>"]
 
 [dependencies]
 bumpalo = "3.12.1"
+crc32c = "0.6.8"
 
 [dev-dependencies]
 criterion = "0.5"
