@@ -78,16 +78,33 @@ struct DbState {
   version_set: Option<VersionSet>,
 }
 
-// ── FlushResult ───────────────────────────────────────────────────────────────
+// ── FlushPrep / FlushResult ───────────────────────────────────────────────────
+
+/// Produced by `begin_flush` (under the write lock): everything needed to run
+/// `write_flush` and `finish_flush` without holding the lock.
+struct FlushPrep {
+  sst_number: u64,
+  sst_path: std::path::PathBuf,
+  old_mem: Memtable,
+  /// File number of the new WAL created under the write lock.
+  new_log_number: u64,
+  /// Open writer for the new WAL (empty at this point).
+  new_log: LogWriter,
+  /// Path of the old WAL to delete after `log_and_apply` succeeds.
+  old_log_path: std::path::PathBuf,
+}
 
 /// Return value of `write_flush`: everything `finish_flush` needs to install
-/// the new SSTable into the `VersionSet`.
+/// the new SSTable into the `VersionSet` and complete WAL rotation.
 struct FlushResult {
   file_number: u64,
   file_size: u64,
   smallest: Vec<u8>,
   largest: Vec<u8>,
   table: Arc<Table>,
+  new_log_number: u64,
+  new_log: LogWriter,
+  old_log_path: std::path::PathBuf,
 }
 
 // ── Db ───────────────────────────────────────────────────────────────────────
@@ -138,7 +155,6 @@ impl Db {
     std::fs::create_dir_all(path)?;
 
     let current_path = path.join("CURRENT");
-    let log_path = path.join("000001.log");
 
     let (version_set, mem, last_sequence) = if current_path.exists() {
       // ── Existing database: MANIFEST-driven recovery ──────────────────────
@@ -147,6 +163,8 @@ impl Db {
       let mem = Memtable::default();
 
       // Replay WAL records newer than what is already in the SSTables.
+      // Use the log number recorded in the MANIFEST (set by WAL rotation).
+      let log_path = path.join(format!("{:06}.log", vs.log_number()));
       let actual_last_seq = if log_path.exists() {
         let file = std::fs::File::open(&log_path)?;
         let file_len = file.metadata()?.len();
@@ -167,11 +185,14 @@ impl Db {
     } else {
       // ── New database: create MANIFEST and WAL ────────────────────────────
       let vs = VersionSet::create(path)?;
-      std::fs::File::create(&log_path)?;
+      // Initial WAL is always 000001.log (log_number = 1 from VersionSet::create).
+      std::fs::File::create(path.join("000001.log"))?;
       (Some(vs), Memtable::default(), 0)
     };
 
-    // Open (or reopen) the WAL for subsequent writes.
+    // Open (or reopen) the current WAL for subsequent writes.
+    let log_number = version_set.as_ref().map_or(1, |vs| vs.log_number());
+    let log_path = path.join(format!("{log_number:06}.log"));
     let log_file = OpenOptions::new()
       .read(true)
       .append(true)
@@ -306,13 +327,13 @@ impl Db {
     // Only applies to persistent databases (path.is_some()).
     if let Some(path) = self.path.as_deref() {
       if state.mem.approximate_memory_usage() >= self.options.write_buffer_size {
-        // Phase 1: rotate mem → imm under the write lock, then release it.
-        let (file_number, file_path, old_mem) = begin_flush(path, &mut state);
+        // Phase 1: rotate mem → imm, allocate new WAL file (write lock held).
+        let prep = begin_flush(path, &mut state)?;
         // Release the write lock before doing any I/O.
         drop(state);
         // Phase 2: write the SSTable (no lock held — reads proceed freely).
-        let result = write_flush(file_path, file_number, old_mem, &self.options)?;
-        // Phase 3: install the new Version and clear imm under a fresh write lock.
+        let result = write_flush(prep, &self.options)?;
+        // Phase 3: install the new Version, swap WAL, clear imm (write lock).
         let mut state = self.state.write().unwrap();
         finish_flush(&mut state, result)?;
       }
@@ -331,34 +352,50 @@ impl Db {
 //   finish_flush — under write lock: install new Version in VersionSet, clear imm
 
 /// Phase 1 (under write lock): seal `mem` as `imm`, install a fresh memtable,
-/// and return the sealed memtable together with its destination path.
-fn begin_flush(path: &std::path::Path, state: &mut DbState) -> (u64, std::path::PathBuf, Memtable) {
-  use std::mem;
-  let file_number = state
+/// allocate the next SSTable file number, and create the new WAL file.
+///
+/// The new WAL is created here — under the lock — so that any writes between
+/// now and `finish_flush` still go to the *old* WAL (via `state.log`).  The
+/// new WAL becomes active only once `finish_flush` swaps `state.log`.
+fn begin_flush(path: &std::path::Path, state: &mut DbState) -> Result<FlushPrep, Error> {
+  let vs = state
     .version_set
     .as_mut()
-    .expect("begin_flush: no VersionSet")
-    .next_file_number();
-  let old_mem = mem::replace(&mut state.mem, Memtable::default());
+    .expect("begin_flush: no VersionSet");
+  let old_log_number = vs.log_number();
+  let sst_number = vs.next_file_number();
+  let new_log_number = vs.next_file_number();
+  let new_log_file = std::fs::File::create(path.join(format!("{new_log_number:06}.log")))?;
+  let new_log = LogWriter::new(new_log_file, 0);
+  let old_mem = std::mem::take(&mut state.mem);
   state.imm = None; // should already be None; be explicit
-  let file_path = path.join(format!("{file_number:06}.ldb"));
-  (file_number, file_path, old_mem)
+  Ok(FlushPrep {
+    sst_number,
+    sst_path: path.join(format!("{sst_number:06}.ldb")),
+    old_mem,
+    new_log_number,
+    new_log,
+    old_log_path: path.join(format!("{old_log_number:06}.log")),
+  })
 }
 
-/// Phase 2 (no lock held): iterate `old_mem`, write an SSTable, return a
-/// `FlushResult` ready for `finish_flush`.  On error `old_mem` is dropped;
-/// data remains safe in the WAL.
-fn write_flush(
-  file_path: std::path::PathBuf,
-  file_number: u64,
-  old_mem: Memtable,
-  opts: &Options,
-) -> Result<FlushResult, Error> {
+/// Phase 2 (no lock held): iterate `old_mem`, write an SSTable, and pass WAL
+/// rotation state through to `finish_flush`.  On error `old_mem` is dropped;
+/// data remains safe in the old WAL (not yet rotated away).
+fn write_flush(prep: FlushPrep, opts: &Options) -> Result<FlushResult, Error> {
   use std::fs::OpenOptions;
+  let FlushPrep {
+    sst_number,
+    sst_path,
+    old_mem,
+    new_log_number,
+    new_log,
+    old_log_path,
+  } = prep;
   let file = OpenOptions::new()
     .write(true)
     .create_new(true)
-    .open(&file_path)?;
+    .open(&sst_path)?;
   let mut builder = TableBuilder::new(file, opts.block_size, opts.block_restart_interval);
   let mut smallest = Vec::new();
   let mut largest = Vec::new();
@@ -379,19 +416,26 @@ fn write_flush(
   }
   let file_size = builder.finish()?;
   drop(old_mem);
-  let read_file = std::fs::File::open(&file_path)?;
+  let read_file = std::fs::File::open(&sst_path)?;
   let table = Arc::new(Table::open(read_file, file_size)?);
   Ok(FlushResult {
-    file_number,
+    file_number: sst_number,
     file_size,
     smallest,
     largest,
     table,
+    new_log_number,
+    new_log,
+    old_log_path,
   })
 }
 
-/// Phase 3 (under write lock): update the `VersionSet` with the new file and
-/// clear `imm` so readers stop consulting the now-flushed memtable.
+/// Phase 3 (under write lock): atomically record the new SST *and* new log
+/// number in the MANIFEST (`log_and_apply`), swap `state.log` to the new WAL,
+/// clear `imm`, and delete the old WAL.
+///
+/// `set_log_number` is called *before* `log_and_apply` so the MANIFEST record
+/// carries the correct log number — matching LevelDB's `MakeRoomForWrite`.
 fn finish_flush(state: &mut DbState, result: FlushResult) -> Result<(), Error> {
   let meta = FileMetaData::with_table(
     result.file_number,
@@ -407,8 +451,13 @@ fn finish_flush(state: &mut DbState, result: FlushResult) -> Result<(), Error> {
     .as_mut()
     .expect("finish_flush: no VersionSet");
   vs.set_last_sequence(state.last_sequence);
+  vs.set_log_number(result.new_log_number);
   vs.log_and_apply(&mut edit)?;
+  // Switch to the new WAL; the MANIFEST now points past the old one.
+  state.log = Some(result.new_log);
   state.imm = None;
+  // Best-effort delete — ignore errors (e.g. the path never existed on new DB).
+  let _ = std::fs::remove_file(&result.old_log_path);
   Ok(())
 }
 
@@ -609,6 +658,48 @@ mod tests {
       second_ldb_count >= first_ldb_count,
       "second session wrote fewer .ldb files ({second_ldb_count}) than first ({first_ldb_count})"
     );
+  }
+
+  #[test]
+  fn wal_rotation_after_flush() {
+    // After a flush, the old WAL (000001.log) must be deleted and a new one
+    // must exist under the log number recorded in the MANIFEST.
+    let dir = tempfile::tempdir().unwrap();
+    {
+      let db = Db::open(dir.path(), small_options()).unwrap();
+      // Trigger at least one flush.
+      for i in 0u32..20 {
+        db.put(format!("k{i:04}").as_bytes(), b"v").unwrap();
+      }
+    }
+
+    // The original WAL (000001.log) should have been deleted.
+    assert!(
+      !dir.path().join("000001.log").exists(),
+      "000001.log should be deleted after WAL rotation"
+    );
+
+    // A new .log file with a higher number must exist.
+    let log_count = std::fs::read_dir(dir.path())
+      .unwrap()
+      .filter(|e| {
+        e.as_ref()
+          .unwrap()
+          .file_name()
+          .to_string_lossy()
+          .ends_with(".log")
+      })
+      .count();
+    assert!(
+      log_count >= 1,
+      "expected a new .log file after WAL rotation"
+    );
+
+    // Reopen must succeed and all keys must be readable.
+    let db = Db::open(dir.path(), Options::default()).unwrap();
+    for i in 0u32..20 {
+      assert_eq!(db.get(format!("k{i:04}").as_bytes()).unwrap(), b"v");
+    }
   }
 
   #[test]

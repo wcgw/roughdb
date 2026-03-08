@@ -194,6 +194,14 @@ impl VersionSet {
     self.last_sequence = seq;
   }
 
+  pub(crate) fn log_number(&self) -> u64 {
+    self.log_number
+  }
+
+  pub(crate) fn set_log_number(&mut self, n: u64) {
+    self.log_number = n;
+  }
+
   pub(crate) fn current(&self) -> Arc<Version> {
     Arc::clone(&self.current)
   }

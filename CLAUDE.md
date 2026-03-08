@@ -219,9 +219,10 @@ what remains is compaction, the full Iterator/Snapshot API, and operational hygi
 
 **Operational correctness**
 
-- [ ] **WAL rotation after flush**: After `finish_flush`, allocate a new WAL file number, create the new log,
-  record `log_number = new` in the MANIFEST via `log_and_apply`, then delete the old WAL. Prevents unbounded WAL
-  growth. See `db/db_impl.cc: DBImpl::MakeRoomForWrite` and `DBImpl::RemoveObsoleteFiles`.
+- [x] **WAL rotation after flush**: `begin_flush` allocates a new WAL file number and creates the new log file
+  under the write lock; `finish_flush` calls `vs.set_log_number(new)` before `log_and_apply` so the MANIFEST
+  atomically records the new SST and the new log number; then swaps `state.log` and deletes the old WAL.
+  Prevents unbounded WAL growth. See `db/db_impl.cc: DBImpl::MakeRoomForWrite`.
 - [ ] **`DeleteObsoleteFiles`**: After every `log_and_apply` (flush or compaction), compute the union of files
   referenced by all live `Version`s, diff against directory contents, and delete any `.ldb` / `.log` files not in
   the union. See `db/db_impl.cc: DBImpl::RemoveObsoleteFiles`.
