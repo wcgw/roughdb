@@ -108,7 +108,7 @@ Features are listed in dependency order. Each phase must be complete before the 
   Phase 9). `add_record(&[u8])` fragments the payload across block boundaries; pads trailing fewer-than-7-byte remnants
   with zeros; pre-computes per-type CRCs on construction. Constructor: `new(file: File, dest_length: u64)` where
   `dest_length` allows resuming an existing file. See `db/log_writer.h/cc`.
-- [ ] **`log::Reader`** (`src/log/reader.rs`): Wraps `File`. `read_record() -> Option<Vec<u8>>` reassembles
+- [x] **`log::Reader`** (`src/log/reader.rs`): Wraps `File`. `read_record() -> Option<Vec<u8>>` reassembles
   multi-fragment records into a scratch buffer. Optional CRC verification (`checksum: bool`). Reports corruption via a
   `Reporter` trait (one method: `corruption(bytes: u64, reason: &str)`). Resynchronisation: when `initial_offset > 0`,
   skips `Middle`/`Last` fragments until a `Full` or `First` is found. See `db/log_reader.h/cc`.

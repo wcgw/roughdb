@@ -11,4 +11,5 @@
 //    limitations under the License.
 
 pub(crate) mod format;
+pub(crate) mod reader;
 pub(crate) mod writer;
