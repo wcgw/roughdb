@@ -171,6 +171,7 @@ impl<'a> MemTableIterator<'a> {
   }
 
   /// SSTable internal key for the current entry (owned).
+  #[cfg(test)]
   pub(crate) fn ikey(&self) -> Vec<u8> {
     self.cached_key.clone()
   }

@@ -50,7 +50,7 @@ impl BlockBuilder {
     debug_assert!(!self.finished, "add called after finish");
 
     // Compute shared prefix length with the last key.
-    let shared = if self.counter % self.restart_interval == 0 {
+    let shared = if self.counter.is_multiple_of(self.restart_interval) {
       // Restart point: no sharing.
       self.restarts.push(self.buf.len() as u32);
       0

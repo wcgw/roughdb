@@ -76,7 +76,7 @@ impl TwoLevelIterator {
   /// such as a failed block open leaving `data_iter` as `None`).
   fn skip_empty_data_blocks_forward(&mut self) {
     loop {
-      if self.data_iter.as_ref().map_or(false, |it| it.valid()) {
+      if self.data_iter.as_ref().is_some_and(|it| it.valid()) {
         break;
       }
       if !self.index_iter.valid() {
@@ -94,7 +94,7 @@ impl TwoLevelIterator {
 
 impl InternalIterator for TwoLevelIterator {
   fn valid(&self) -> bool {
-    self.data_iter.as_ref().map_or(false, |it| it.valid())
+    self.data_iter.as_ref().is_some_and(|it| it.valid())
   }
 
   fn seek_to_first(&mut self) {

@@ -87,6 +87,7 @@ impl Reader {
 
   /// File offset of the last record returned by `read_record`.
   /// Undefined before the first successful call.
+  #[cfg(test)]
   pub(crate) fn last_record_offset(&self) -> u64 {
     self.last_record_offset
   }
