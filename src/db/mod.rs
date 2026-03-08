@@ -12,3 +12,6 @@
 
 pub(crate) mod db_iter;
 pub(crate) mod merge_iter;
+pub(crate) mod version;
+pub(crate) mod version_edit;
+pub(crate) mod version_set;

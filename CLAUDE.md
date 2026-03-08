@@ -196,14 +196,20 @@ deferred to post-parity as it is not needed for compaction or the core read path
 `Table` handles are stored as `Arc<Table>` directly in `FileMetaData` — no LRU table cache needed for correctness;
 that is a post-parity optimisation.*
 
-- [ ] **`FileMetaData`**: File number, size, smallest/largest `InternalKey`, `Arc<Table>` for the open reader.
-  See `db/version_edit.h`.
-- [ ] **`VersionEdit`** (`src/db/version_edit.rs`): Atomic delta — files added/removed per level, log number, next
-  sequence, compact pointers. Serialised to the MANIFEST. See `db/version_edit.h/cc`.
-- [ ] **`Version`** (`src/db/version.rs`): Snapshot of the LSM structure — per-level `Vec<Arc<FileMetaData>>`.
-  Reference-counted; lives until all iterators opened on it are dropped. See `db/version_set.h/cc`.
-- [ ] **`VersionSet`** (`src/db/version_set.rs`): Maintains the linked list of `Version`s, the current version, the
-  MANIFEST log, and compact-pointer state. Applies `VersionEdit`s atomically. See `db/version_set.h/cc`.
+- [x] **`FileMetaData`** (`src/db/version_edit.rs`): File number, size, smallest/largest internal key bytes,
+  `Option<Arc<Table>>` for the open reader (`Some` for all files in a live `Version`; `None` only during MANIFEST
+  replay). `FileMetaData::with_table` is the canonical constructor. See `db/version_edit.h`.
+- [x] **`VersionEdit`** (`src/db/version_edit.rs`): Atomic delta — files added/removed per level, log number, next
+  file number, last sequence. LevelDB-compatible tag-based binary encoding; `table` field is in-memory only and not
+  encoded. `encode`/`decode` with forward-compatible unknown-tag handling. See `db/version_edit.h/cc`.
+- [x] **`Version`** (`src/db/version.rs`): Snapshot of the LSM structure — `[Vec<Arc<FileMetaData>>; 7]`.
+  L0 newest-first; L1–L6 sorted by smallest key. `get(user_key, seq)` scans L0 then L1–L6 linearly (binary
+  search deferred to Phase 6). Reference-counted via `Arc<Version>`. See `db/version_set.h/cc`.
+- [x] **`VersionSet`** (`src/db/version_set.rs`): Maintains current `Arc<Version>`, MANIFEST log, and
+  file-number/sequence state. `create` writes `MANIFEST-000002` + `CURRENT`; `recover` replays MANIFEST via a
+  `Builder` that opens Tables for all live files; `log_and_apply` appends to MANIFEST and installs a new `Version`.
+  `DbState` replaces `l0_files`/`next_file_number` with `version_set: Option<VersionSet>`; `Db::open` uses
+  MANIFEST-driven recovery with WAL replay filtered to `seq > manifest_last_sequence`. See `db/version_set.h/cc`.
 
 ### Phase 6 — Full database
 

@@ -10,13 +10,15 @@
 //    See the License for the specific language governing permissions and
 //    limitations under the License.
 
+use crate::db::version_edit::{FileMetaData, VersionEdit};
+use crate::db::version_set::VersionSet;
 use crate::log::reader::Reader as LogReader;
 use crate::log::writer::Writer as LogWriter;
 use crate::memtable::{Memtable, MemtableResult};
 use crate::table::builder::TableBuilder;
 use crate::table::reader::{LookupResult, Table};
 use std::path::PathBuf;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 pub mod error;
 pub use error::Error;
@@ -31,7 +33,7 @@ pub(crate) mod table;
 pub mod write_batch;
 pub use write_batch::{Handler, WriteBatch};
 
-// ── Shared inserter used by both Db::write and Db::recover ───────────────────
+// ── Shared inserter used by both Db::write and Db::recover_wal ───────────────
 
 struct Inserter<'a> {
   mem: &'a Memtable,
@@ -54,25 +56,38 @@ impl Handler for Inserter<'_> {
 
 // ── DbState: lives inside an RwLock ──────────────────────────────────────────
 //
-// Reads take a shared read lock; they check `mem`, then `imm`, then `l0_files`
-// without blocking each other.  Writes take an exclusive write lock briefly
-// (WAL + memtable insert), then release before doing flush I/O.  Flush I/O
-// itself holds no lock: it rotates mem→imm under a write lock, does the I/O
-// lock-free, then briefly re-acquires a write lock to install the new Table
-// and clear `imm`.
+// Reads take a shared read lock; they check `mem`, then `imm`, then the
+// current `Version` (via `version_set`) without blocking each other.
+// Writes take an exclusive write lock briefly (WAL + memtable insert), then
+// release before doing flush I/O.  Flush I/O holds no lock: it rotates
+// mem→imm under a write lock, does the I/O lock-free, then briefly
+// re-acquires a write lock to install the new version and clear `imm`.
 
 struct DbState {
+  /// Sequence number of the last committed write.
   last_sequence: u64,
   /// `None` for in-memory / test databases (no WAL).
   log: Option<LogWriter>,
   mem: Memtable,
   /// Sealed memtable currently being flushed to disk.  Reads must check this
-  /// after `mem` and before `l0_files`.  `None` when no flush is in progress.
+  /// after `mem` and before the current `Version`.  `None` when no flush is
+  /// in progress.
   imm: Option<Memtable>,
-  /// L0 SSTable files open for reading, newest first.
-  l0_files: Vec<(u64, Table)>,
-  /// Next file number for `.ldb` files (1 is the WAL; L0 starts at 2).
-  next_file_number: u64,
+  /// Tracks the set of live SSTable files and the MANIFEST.
+  /// `None` for in-memory databases (`Db::default()`).
+  version_set: Option<VersionSet>,
+}
+
+// ── FlushResult ───────────────────────────────────────────────────────────────
+
+/// Return value of `write_flush`: everything `finish_flush` needs to install
+/// the new SSTable into the `VersionSet`.
+struct FlushResult {
+  file_number: u64,
+  file_size: u64,
+  smallest: Vec<u8>,
+  largest: Vec<u8>,
+  table: Arc<Table>,
 }
 
 // ── Db ───────────────────────────────────────────────────────────────────────
@@ -94,8 +109,7 @@ impl Default for Db {
         log: None,
         mem: Memtable::default(),
         imm: None,
-        l0_files: Vec::new(),
-        next_file_number: 2,
+        version_set: None,
       }),
       options: Options::default(),
       path: None,
@@ -106,15 +120,15 @@ impl Default for Db {
 impl Db {
   /// Open (or create) a persistent database at `path`.
   ///
-  /// - Creates the directory if it does not exist.
-  /// - Scans for existing `.ldb` files to determine the next file number.
-  /// - If a WAL (`000001.log`) exists, replays it into the memtable.
-  /// - Opens (or creates) the WAL for subsequent writes.
+  /// ## New database (no `CURRENT` file)
+  /// - Creates a `MANIFEST-000002` with the initial `VersionEdit`.
+  /// - Creates `CURRENT` pointing to the MANIFEST.
+  /// - Creates `000001.log` as the WAL.
   ///
-  /// After a flush, new writes keep appending to the WAL; WAL rotation
-  /// (truncation after flush) is deferred to Phase 9.  All WAL data is
-  /// therefore always available for recovery, making it unnecessary to
-  /// load existing `.ldb` files on reopen for correctness.
+  /// ## Existing database (`CURRENT` file present)
+  /// - Recovers the `VersionSet` from the MANIFEST (loads live SSTable files).
+  /// - Replays WAL records whose sequence number exceeds the last sequence
+  ///   already reflected in the MANIFEST (avoids double-inserting flushed data).
   ///
   /// `Db::default()` is retained for in-memory / test use (no WAL, no flush).
   pub fn open<P: AsRef<std::path::Path>>(path: P, options: Options) -> Result<Self, Error> {
@@ -123,28 +137,47 @@ impl Db {
     let path = path.as_ref();
     std::fs::create_dir_all(path)?;
 
-    // Determine the next file number from any existing .ldb files so new
-    // flushes do not overwrite data from a previous session.
-    let next_file_number = scan_next_file_number(path)?;
-
+    let current_path = path.join("CURRENT");
     let log_path = path.join("000001.log");
-    let mem = Memtable::default();
 
-    // Open the log file (creating it if absent) with read + append access so
-    // the same handle can serve recovery reads and subsequent WAL writes.
+    let (version_set, mem, last_sequence) = if current_path.exists() {
+      // ── Existing database: MANIFEST-driven recovery ──────────────────────
+      let mut vs = VersionSet::recover(path)?;
+      let manifest_last_seq = vs.last_sequence();
+      let mem = Memtable::default();
+
+      // Replay WAL records newer than what is already in the SSTables.
+      let actual_last_seq = if log_path.exists() {
+        let file = std::fs::File::open(&log_path)?;
+        let file_len = file.metadata()?.len();
+        if file_len > 0 {
+          Self::recover_wal(file, &mem, manifest_last_seq)?
+        } else {
+          manifest_last_seq
+        }
+      } else {
+        manifest_last_seq
+      };
+
+      if actual_last_seq > manifest_last_seq {
+        vs.set_last_sequence(actual_last_seq);
+      }
+      let last_seq = vs.last_sequence();
+      (Some(vs), mem, last_seq)
+    } else {
+      // ── New database: create MANIFEST and WAL ────────────────────────────
+      let vs = VersionSet::create(path)?;
+      std::fs::File::create(&log_path)?;
+      (Some(vs), Memtable::default(), 0)
+    };
+
+    // Open (or reopen) the WAL for subsequent writes.
     let log_file = OpenOptions::new()
       .read(true)
       .append(true)
       .create(true)
       .open(&log_path)?;
     let file_len = log_file.metadata()?.len();
-
-    let last_sequence = if file_len > 0 {
-      Self::recover(log_file.try_clone()?, &mem)?
-    } else {
-      0
-    };
-
     let log_writer = LogWriter::new(log_file, file_len);
 
     Ok(Self {
@@ -153,24 +186,32 @@ impl Db {
         log: Some(log_writer),
         mem,
         imm: None,
-        l0_files: Vec::new(),
-        next_file_number,
+        version_set,
       }),
       options,
       path: Some(path.to_path_buf()),
     })
   }
 
-  /// Replay all records from a WAL file into `mem`, returning the highest
-  /// sequence number seen.  Incomplete trailing records (torn writes) are
-  /// silently ignored, matching LevelDB's crash-recovery behaviour.
-  fn recover(file: std::fs::File, mem: &Memtable) -> Result<u64, Error> {
+  /// Replay WAL records from `file` into `mem`, skipping any whose sequence
+  /// number is entirely covered by `min_sequence` (already in an SSTable).
+  ///
+  /// Returns the highest sequence number replayed (or `min_sequence` if
+  /// nothing was replayed).
+  fn recover_wal(file: std::fs::File, mem: &Memtable, min_sequence: u64) -> Result<u64, Error> {
     let mut reader = LogReader::new(file, None, true, 0);
-    let mut max_sequence: u64 = 0;
+    let mut max_sequence: u64 = min_sequence;
 
     while let Some(record) = reader.read_record() {
       let batch = WriteBatch::from_contents(record)?;
       let start_seq = batch.sequence();
+      // Skip batches fully covered by data already in SSTables.
+      if batch.count() > 0 {
+        let end_seq = start_seq + batch.count() as u64 - 1;
+        if end_seq <= min_sequence {
+          continue;
+        }
+      }
       batch.iterate(&mut Inserter {
         mem,
         seq: start_seq,
@@ -191,8 +232,7 @@ impl Db {
     K: AsRef<[u8]>,
   {
     let key = key.as_ref();
-    // A shared read lock allows multiple concurrent readers; writers and flush
-    // I/O do not block here.
+    // A shared read lock allows multiple concurrent readers.
     let state = self.state.read().unwrap();
 
     match state.mem.get(key) {
@@ -210,10 +250,9 @@ impl Db {
       }
     }
 
-    // Scan L0 files newest-first.  A `Deleted` result stops the search
-    // immediately — the key was deleted and no older file should be consulted.
-    for (_, table) in &state.l0_files {
-      match table.get(key, false)? {
+    // Search the current Version for the key across all levels.
+    if let Some(vs) = &state.version_set {
+      match vs.current().get(key, state.last_sequence)? {
         LookupResult::Value(v) => return Ok(v),
         LookupResult::Deleted => return Err(Error::NotFound),
         LookupResult::NotInTable => {}
@@ -272,10 +311,10 @@ impl Db {
         // Release the write lock before doing any I/O.
         drop(state);
         // Phase 2: write the SSTable (no lock held — reads proceed freely).
-        let table = write_flush(file_path, file_number, old_mem, &self.options)?;
-        // Phase 3: install the new Table and clear imm under a fresh write lock.
+        let result = write_flush(file_path, file_number, old_mem, &self.options)?;
+        // Phase 3: install the new Version and clear imm under a fresh write lock.
         let mut state = self.state.write().unwrap();
-        finish_flush(&mut state, file_number, table);
+        finish_flush(&mut state, result)?;
       }
     }
 
@@ -289,39 +328,51 @@ impl Db {
 //
 //   begin_flush  — under write lock: rotate mem→imm, return sealed memtable
 //   write_flush  — no lock: write SSTable to disk, open it for reading
-//   finish_flush — under write lock: install Table in l0_files, clear imm
+//   finish_flush — under write lock: install new Version in VersionSet, clear imm
 
 /// Phase 1 (under write lock): seal `mem` as `imm`, install a fresh memtable,
 /// and return the sealed memtable together with its destination path.
 fn begin_flush(path: &std::path::Path, state: &mut DbState) -> (u64, std::path::PathBuf, Memtable) {
   use std::mem;
-  let file_number = state.next_file_number;
-  state.next_file_number += 1;
+  let file_number = state
+    .version_set
+    .as_mut()
+    .expect("begin_flush: no VersionSet")
+    .next_file_number();
   let old_mem = mem::replace(&mut state.mem, Memtable::default());
   state.imm = None; // should already be None; be explicit
   let file_path = path.join(format!("{file_number:06}.ldb"));
   (file_number, file_path, old_mem)
 }
 
-/// Phase 2 (no lock held): iterate `old_mem`, write an SSTable, return the
-/// open `Table` ready for reading.  On error `old_mem` is dropped; data is
-/// safe in the WAL.
+/// Phase 2 (no lock held): iterate `old_mem`, write an SSTable, return a
+/// `FlushResult` ready for `finish_flush`.  On error `old_mem` is dropped;
+/// data remains safe in the WAL.
 fn write_flush(
   file_path: std::path::PathBuf,
-  _file_number: u64,
+  file_number: u64,
   old_mem: Memtable,
   opts: &Options,
-) -> Result<Table, Error> {
+) -> Result<FlushResult, Error> {
   use std::fs::OpenOptions;
   let file = OpenOptions::new()
     .write(true)
     .create_new(true)
     .open(&file_path)?;
   let mut builder = TableBuilder::new(file, opts.block_size, opts.block_restart_interval);
+  let mut smallest = Vec::new();
+  let mut largest = Vec::new();
   {
     let mut it = old_mem.iter();
     it.seek_to_first();
+    let mut first = true;
     while it.valid() {
+      let ikey = it.key().to_vec(); // SSTable internal key (user_key || tag)
+      if first {
+        smallest = ikey.clone();
+        first = false;
+      }
+      largest = ikey;
       builder.add(it.key(), it.value())?;
       it.advance();
     }
@@ -329,36 +380,36 @@ fn write_flush(
   let file_size = builder.finish()?;
   drop(old_mem);
   let read_file = std::fs::File::open(&file_path)?;
-  Table::open(read_file, file_size)
+  let table = Arc::new(Table::open(read_file, file_size)?);
+  Ok(FlushResult {
+    file_number,
+    file_size,
+    smallest,
+    largest,
+    table,
+  })
 }
 
-/// Phase 3 (under write lock): prepend the new Table to `l0_files` and clear
-/// `imm` so readers stop consulting the now-flushed memtable.
-fn finish_flush(state: &mut DbState, file_number: u64, table: Table) {
-  state.l0_files.insert(0, (file_number, table));
+/// Phase 3 (under write lock): update the `VersionSet` with the new file and
+/// clear `imm` so readers stop consulting the now-flushed memtable.
+fn finish_flush(state: &mut DbState, result: FlushResult) -> Result<(), Error> {
+  let meta = FileMetaData::with_table(
+    result.file_number,
+    result.file_size,
+    result.smallest,
+    result.largest,
+    result.table,
+  );
+  let mut edit = VersionEdit::new();
+  edit.new_files.push((0, meta));
+  let vs = state
+    .version_set
+    .as_mut()
+    .expect("finish_flush: no VersionSet");
+  vs.set_last_sequence(state.last_sequence);
+  vs.log_and_apply(&mut edit)?;
   state.imm = None;
-}
-
-// ── scan_next_file_number ─────────────────────────────────────────────────────
-
-/// Scan `path` for `*.ldb` files and return the next available file number.
-///
-/// File 1 is reserved for the WAL; L0 files start at 2.
-fn scan_next_file_number(path: &std::path::Path) -> Result<u64, Error> {
-  let mut max = 1u64;
-  for entry in std::fs::read_dir(path)? {
-    let entry = entry?;
-    let name = entry.file_name();
-    let name = name.to_string_lossy();
-    if let Some(stem) = name.strip_suffix(".ldb") {
-      if let Ok(n) = stem.parse::<u64>() {
-        if n > max {
-          max = n;
-        }
-      }
-    }
-  }
-  Ok(max + 1)
+  Ok(())
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -558,5 +609,42 @@ mod tests {
       second_ldb_count >= first_ldb_count,
       "second session wrote fewer .ldb files ({second_ldb_count}) than first ({first_ldb_count})"
     );
+  }
+
+  #[test]
+  fn open_reopen_reads_l0() {
+    // Data that was flushed to an SSTable must be readable after a reopen that
+    // uses MANIFEST-driven recovery (not WAL replay).
+    let dir = tempfile::tempdir().unwrap();
+    {
+      let db = Db::open(dir.path(), small_options()).unwrap();
+      for i in 0u32..20 {
+        db.put(format!("k{i:04}").as_bytes(), format!("v{i:04}").as_bytes())
+          .unwrap();
+      }
+      // Ensure at least one flush happened.
+      let ldb_count = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter(|e| {
+          e.as_ref()
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".ldb")
+        })
+        .count();
+      assert!(ldb_count >= 1, "expected a flush to have occurred");
+    }
+    // Reopen: flushed keys come from the SSTable via VersionSet::recover;
+    // unflushed keys come from WAL replay.
+    let db = Db::open(dir.path(), Options::default()).unwrap();
+    for i in 0u32..20 {
+      let expected = format!("v{i:04}");
+      assert_eq!(
+        db.get(format!("k{i:04}").as_bytes()).unwrap(),
+        expected.as_bytes(),
+        "key k{i:04} not found after reopen"
+      );
+    }
   }
 }
