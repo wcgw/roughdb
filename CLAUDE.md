@@ -91,13 +91,12 @@ Features are listed in dependency order. Each phase must be complete before the 
 **Step 1 — Prerequisites**
 
 - [x] **`crc32c` crate**: Add `crc32c = "..."` to `Cargo.toml`. Used for record header checksums.
-- [x] **Sequence number ownership**: Move `last_sequence` from `Memtable` to `Db`. Implemented as the `u64` payload
-  of `write_lock: Mutex<u64>` — the type system enforces that the sequence is inaccessible without holding the write
-  lock, matching LevelDB's plain `uint64_t` under `mutex_`. `Memtable::add`/`delete` gain an explicit `seq: u64`
-  parameter (internal `next_seq` counter removed). `Db::write` reads `start_seq = *last_seq + 1`, iterates the batch
-  passing incrementing sequence numbers per record, then advances `*last_seq += batch.count()` after all inserts.
-  Note: Step 3 must call `batch.set_sequence(start_seq)` *before* `log_writer.add_record(batch.contents())` so the
-  embedded sequence in the WAL record is correct for recovery replay.
+- [x] **Sequence number ownership**: Move `last_sequence` from `Memtable` to `Db`. Carried as part of `WriteState`
+  (alongside the optional `LogWriter`) inside `write_lock: Mutex<WriteState>` — the type system enforces that both
+  are inaccessible without holding the write lock, matching LevelDB's plain `uint64_t` under `mutex_`.
+  `Memtable::add`/`delete` gain an explicit `seq: u64` parameter (internal `next_seq` counter removed). `Db::write`
+  reads `start_seq = state.last_sequence + 1`, clones and stamps the batch, writes to WAL, iterates passing
+  incrementing sequence numbers per record, then advances `state.last_sequence += batch.count()` after all inserts.
 
 **Step 2 — Log primitives**
 
@@ -115,15 +114,15 @@ Features are listed in dependency order. Each phase must be complete before the 
 
 **Step 3 — Integration**
 
-- [ ] **`Db::open(path)`** (`src/lib.rs` or `src/db/mod.rs`): Creates the directory if absent; opens or creates
+- [x] **`Db::open(path)`** (`src/lib.rs` or `src/db/mod.rs`): Creates the directory if absent; opens or creates
   `<path>/000001.log`; constructs `Db` with a live `log::Writer`. Returns `Result<Db, Error>`. `Db::default()` retained
   for in-memory/test use (no WAL). Full MANIFEST-driven log-number tracking deferred to Phase 9.
-- [ ] **`Db::write` wired to WAL**: Change signature to `fn write(&self, opts: &WriteOptions, batch: &WriteBatch) ->
+- [x] **`Db::write` wired to WAL**: Change signature to `fn write(&self, opts: &WriteOptions, batch: &WriteBatch) ->
   Result<(), Error>`. Under the write lock: read `start_seq`, call `batch.set_sequence(start_seq)`, call
   `log_writer.add_record(batch.contents())`, sync if `opts.sync`, iterate into memtable, advance `last_sequence`.
   The stamp must precede the log write so WAL records carry the correct embedded sequence for recovery replay.
   `Db::put`/`delete` updated to forward a default `WriteOptions`.
-- [ ] **Recovery** (`Db::open` calls this when WAL exists): Construct a `log::Reader` from offset 0; for each record
+- [x] **Recovery** (`Db::open` calls this when WAL exists): Construct a `log::Reader` from offset 0; for each record
   decode it as a `WriteBatch` and replay via `batch.iterate(&mut inserter)` using the batch's embedded sequence; after
   all records restore `last_sequence` to the highest sequence seen. Incomplete trailing records (torn write on crash)
   are silently ignored.

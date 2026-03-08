@@ -160,6 +160,14 @@ impl WriteBatch {
     &self.rep
   }
 
+  /// Wrap raw bytes (as read from the WAL) into a `WriteBatch` for replay.
+  pub(crate) fn from_contents(data: Vec<u8>) -> Result<Self, Error> {
+    if data.len() < HEADER_SIZE {
+      return Err(Error::Corruption("write batch record too small".to_owned()));
+    }
+    Ok(Self { rep: data })
+  }
+
   fn set_count(&mut self, n: u32) {
     write_u32_le((&mut self.rep[8..12]).try_into().unwrap(), n);
   }
@@ -174,7 +182,7 @@ impl Default for WriteBatch {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::Db;
+  use crate::{Db, WriteOptions};
 
   struct Recording {
     ops: Vec<Op>,
@@ -315,7 +323,7 @@ mod tests {
     batch.put(b"foo", b"bar");
     batch.put(b"baz", b"qux");
     batch.delete(b"foo");
-    db.write(&batch).unwrap();
+    db.write(&WriteOptions::default(), &batch).unwrap();
     assert!(db.get(b"foo").unwrap_err().is_not_found());
     assert_eq!(db.get(b"baz").unwrap(), b"qux");
   }

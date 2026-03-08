@@ -86,6 +86,13 @@ impl Writer {
     }
   }
 
+  /// Flush OS buffers and fsync the underlying file.  Called when
+  /// `WriteOptions::sync` is set.
+  pub(crate) fn sync(&mut self) -> Result<(), Error> {
+    self.dest.flush()?;
+    self.dest.get_ref().sync_all().map_err(Error::from)
+  }
+
   /// Write one physical record (header + payload) to the underlying file and
   /// flush the `BufWriter`.  Advances `block_offset` by `HEADER_SIZE + length`.
   fn emit_physical_record(&mut self, record_type: RecordType, data: &[u8]) -> Result<(), Error> {
