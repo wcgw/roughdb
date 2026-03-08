@@ -51,7 +51,9 @@ unsafe impl Sync for Memtable {}
 
 impl Memtable {
   pub fn new() -> Self {
-    Self { table: UnsafeCell::new(SkipList::new(Arena::default())) }
+    Self {
+      table: UnsafeCell::new(SkipList::new(Arena::default())),
+    }
   }
 
   pub fn add(&self, seq: u64, key: &[u8], value: &[u8]) {
@@ -99,7 +101,9 @@ impl Memtable {
   pub(crate) fn iter(&self) -> MemTableIterator<'_> {
     // SAFETY: SkipList reads are lock-free via acquire/release atomics.
     let table = unsafe { &*self.table.get() };
-    MemTableIterator { inner: table.iter() }
+    MemTableIterator {
+      inner: table.iter(),
+    }
   }
 
   /// Approximate number of bytes used by this memtable (arena allocations).
@@ -149,7 +153,9 @@ impl<'a> MemTableIterator<'a> {
 
   /// Value bytes for the current entry; empty slice for tombstones.
   pub(crate) fn value(&self) -> &'a [u8] {
-    Entry::from_slice(self.inner.payload()).value().unwrap_or(&[])
+    Entry::from_slice(self.inner.payload())
+      .value()
+      .unwrap_or(&[])
   }
 
   /// Advance to the next entry.

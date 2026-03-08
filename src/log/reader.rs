@@ -210,8 +210,16 @@ impl Reader {
   /// and payload length.  `PhysKind::Bad` is used for records to skip
   /// without terminating iteration; `PhysKind::Eof` terminates it.
   fn read_physical_record(&mut self) -> PhysRecord {
-    let bad = PhysRecord { kind: PhysKind::Bad, data_start: 0, data_len: 0 };
-    let eof = PhysRecord { kind: PhysKind::Eof, data_start: 0, data_len: 0 };
+    let bad = PhysRecord {
+      kind: PhysKind::Bad,
+      data_start: 0,
+      data_len: 0,
+    };
+    let eof = PhysRecord {
+      kind: PhysKind::Eof,
+      data_start: 0,
+      data_len: 0,
+    };
 
     loop {
       if self.buf_end - self.buf_start < HEADER_SIZE {
@@ -300,7 +308,13 @@ impl Reader {
       }
 
       match RecordType::try_from(rtype_byte) {
-        Ok(rtype) => return PhysRecord { kind: PhysKind::Rec(rtype), data_start, data_len: length },
+        Ok(rtype) => {
+          return PhysRecord {
+            kind: PhysKind::Rec(rtype),
+            data_start,
+            data_len: length,
+          }
+        }
         Err(_) => {
           self.report_corruption(
             (HEADER_SIZE + length) as u64,
@@ -315,7 +329,10 @@ impl Reader {
   fn report_corruption(&mut self, bytes: u64, reason: &str) {
     // Mirror LevelDB: only report if the drop starts at or after initial_offset.
     let buf_remaining = (self.buf_end - self.buf_start) as u64;
-    let drop_start = self.end_of_buffer_offset.saturating_sub(buf_remaining).saturating_sub(bytes);
+    let drop_start = self
+      .end_of_buffer_offset
+      .saturating_sub(buf_remaining)
+      .saturating_sub(bytes);
     if drop_start >= self.initial_offset {
       if let Some(r) = self.reporter.as_mut() {
         r.corruption(bytes, reason);

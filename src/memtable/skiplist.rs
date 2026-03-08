@@ -309,7 +309,10 @@ impl SkipList {
   pub(crate) fn iter(&self) -> SkipListIter<'_> {
     // SAFETY: `self.head` is always valid for the lifetime of `self`.
     let first = unsafe { (*self.head).load_next(0) };
-    SkipListIter { current: first, _marker: PhantomData }
+    SkipListIter {
+      current: first,
+      _marker: PhantomData,
+    }
   }
 
   // ── Internal helpers ─────────────────────────────────────────────────────

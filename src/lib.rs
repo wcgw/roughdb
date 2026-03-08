@@ -130,7 +130,11 @@ impl Db {
 
     // Open the log file (creating it if absent) with read + append access so
     // the same handle can serve recovery reads and subsequent WAL writes.
-    let log_file = OpenOptions::new().read(true).append(true).create(true).open(&log_path)?;
+    let log_file = OpenOptions::new()
+      .read(true)
+      .append(true)
+      .create(true)
+      .open(&log_path)?;
     let file_len = log_file.metadata()?.len();
 
     let last_sequence = if file_len > 0 {
@@ -165,7 +169,10 @@ impl Db {
     while let Some(record) = reader.read_record() {
       let batch = WriteBatch::from_contents(record)?;
       let start_seq = batch.sequence();
-      batch.iterate(&mut Inserter { mem, seq: start_seq })?;
+      batch.iterate(&mut Inserter {
+        mem,
+        seq: start_seq,
+      })?;
       if batch.count() > 0 {
         let end_seq = start_seq + batch.count() as u64 - 1;
         if end_seq > max_sequence {
@@ -248,7 +255,10 @@ impl Db {
       }
     }
 
-    stamped.iterate(&mut Inserter { mem: &state.mem, seq: start_seq })?;
+    stamped.iterate(&mut Inserter {
+      mem: &state.mem,
+      seq: start_seq,
+    })?;
     state.last_sequence += batch.count() as u64;
 
     // Trigger an L0 flush when the memtable exceeds the size limit.
@@ -281,10 +291,7 @@ impl Db {
 
 /// Phase 1 (under write lock): seal `mem` as `imm`, install a fresh memtable,
 /// and return the sealed memtable together with its destination path.
-fn begin_flush(
-  path: &std::path::Path,
-  state: &mut DbState,
-) -> (u64, std::path::PathBuf, Memtable) {
+fn begin_flush(path: &std::path::Path, state: &mut DbState) -> (u64, std::path::PathBuf, Memtable) {
   use std::mem;
   let file_number = state.next_file_number;
   state.next_file_number += 1;
@@ -304,7 +311,10 @@ fn write_flush(
   opts: &Options,
 ) -> Result<Table, Error> {
   use std::fs::OpenOptions;
-  let file = OpenOptions::new().write(true).create_new(true).open(&file_path)?;
+  let file = OpenOptions::new()
+    .write(true)
+    .create_new(true)
+    .open(&file_path)?;
   let mut builder = TableBuilder::new(file, opts.block_size, opts.block_restart_interval);
   {
     let mut it = old_mem.iter();
@@ -423,7 +433,10 @@ mod tests {
 
   fn small_options() -> Options {
     // write_buffer_size small enough to flush after a handful of entries.
-    Options { write_buffer_size: 512, ..Options::default() }
+    Options {
+      write_buffer_size: 512,
+      ..Options::default()
+    }
   }
 
   #[test]
@@ -433,15 +446,28 @@ mod tests {
 
     // Write enough data to exceed 512 bytes and trigger a flush.
     for i in 0u32..20 {
-      db.put(format!("key{i:04}").as_bytes(), format!("value{i:04}").as_bytes()).unwrap();
+      db.put(
+        format!("key{i:04}").as_bytes(),
+        format!("value{i:04}").as_bytes(),
+      )
+      .unwrap();
     }
 
     // At least one .ldb file must exist.
     let ldb_count = std::fs::read_dir(dir.path())
       .unwrap()
-      .filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().ends_with(".ldb"))
+      .filter(|e| {
+        e.as_ref()
+          .unwrap()
+          .file_name()
+          .to_string_lossy()
+          .ends_with(".ldb")
+      })
       .count();
-    assert!(ldb_count >= 1, "expected at least one .ldb file, found {ldb_count}");
+    assert!(
+      ldb_count >= 1,
+      "expected at least one .ldb file, found {ldb_count}"
+    );
   }
 
   #[test]
@@ -451,14 +477,21 @@ mod tests {
 
     // Write enough to trigger one or more flushes.
     for i in 0u32..20 {
-      db.put(format!("key{i:04}").as_bytes(), format!("val{i:04}").as_bytes()).unwrap();
+      db.put(
+        format!("key{i:04}").as_bytes(),
+        format!("val{i:04}").as_bytes(),
+      )
+      .unwrap();
     }
 
     // All keys must be readable regardless of whether they ended up in the
     // memtable or in an L0 file.
     for i in 0u32..20 {
       let expected = format!("val{i:04}");
-      assert_eq!(db.get(format!("key{i:04}").as_bytes()).unwrap(), expected.as_bytes());
+      assert_eq!(
+        db.get(format!("key{i:04}").as_bytes()).unwrap(),
+        expected.as_bytes()
+      );
     }
   }
 
@@ -492,7 +525,13 @@ mod tests {
     }
     let first_ldb_count = std::fs::read_dir(dir.path())
       .unwrap()
-      .filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().ends_with(".ldb"))
+      .filter(|e| {
+        e.as_ref()
+          .unwrap()
+          .file_name()
+          .to_string_lossy()
+          .ends_with(".ldb")
+      })
       .count();
 
     // Second session: flush more data — must not overwrite the first session's files.
@@ -504,7 +543,13 @@ mod tests {
     }
     let second_ldb_count = std::fs::read_dir(dir.path())
       .unwrap()
-      .filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().ends_with(".ldb"))
+      .filter(|e| {
+        e.as_ref()
+          .unwrap()
+          .file_name()
+          .to_string_lossy()
+          .ends_with(".ldb")
+      })
       .count();
     assert!(
       second_ldb_count >= first_ldb_count,

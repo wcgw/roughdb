@@ -28,7 +28,10 @@ impl Arena {
   pub fn new(capacity: usize) -> Self {
     let bump = Bump::new();
     bump.set_allocation_limit(Some(capacity));
-    Arena { arena: bump, bytes_used: AtomicUsize::new(0) }
+    Arena {
+      arena: bump,
+      bytes_used: AtomicUsize::new(0),
+    }
   }
 
   /// Bytes of memory allocated from the arena so far (exact, not an estimate).
