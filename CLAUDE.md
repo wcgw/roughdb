@@ -213,21 +213,63 @@ that is a post-parity optimisation.*
 
 ### Phase 6 — Full database
 
-*Ties all prior phases into a working, persistent, crash-safe database with multi-level compaction.*
+*Completes the user-facing API to match LevelDB's `include/leveldb/db.h` and wires all prior phases into a
+crash-safe database with multi-level compaction. MANIFEST-driven recovery and level routing are done (Phase 5);
+what remains is compaction, the full Iterator/Snapshot API, and operational hygiene (WAL rotation, file GC).*
 
-- [ ] **`Db::Open`** (full): MANIFEST-driven recovery; replays the WAL from the sequence in the MANIFEST, rebuilds
-  `VersionSet`, re-opens all live SSTable files. Replaces the Phase 3 flat `Vec<Table>` with proper level routing.
-  Rotates the WAL after each memtable flush (truncates old log). See `db/db_impl.cc: DBImpl::Recover`.
-- [ ] **`Db::Write`** (batch-grouped): Multiple concurrent writers are grouped; only the leader writes to the WAL and
-  inserts into the memtable. See `db/db_impl.cc: DBImpl::Write`.
-- [ ] **Background compaction**: Triggered when L0 file count ≥ 4 (slow writes at 8, stop at 12). Selects input
-  files, runs a `MergingIterator`, drops shadowed versions and obsolete tombstones, writes output files to L+1.
-  Managed in `db/db_impl.cc: BackgroundCompaction`.
-- [ ] **`Db::NewIterator`**: Returns a `DbIterator` over a merged view of mem + imm + all version files, pinned to
-  the current sequence number.
-- [ ] **`Db::GetSnapshot` / `ReleaseSnapshot`**: Snapshots are sequence numbers in a doubly-linked list; they
-  prevent compaction from dropping versions still visible to a live snapshot.
-- [ ] **`Db::CompactRange`**: Manual compaction of a user-specified key range.
+**Operational correctness**
+
+- [ ] **WAL rotation after flush**: After `finish_flush`, allocate a new WAL file number, create the new log,
+  record `log_number = new` in the MANIFEST via `log_and_apply`, then delete the old WAL. Prevents unbounded WAL
+  growth. See `db/db_impl.cc: DBImpl::MakeRoomForWrite` and `DBImpl::RemoveObsoleteFiles`.
+- [ ] **`DeleteObsoleteFiles`**: After every `log_and_apply` (flush or compaction), compute the union of files
+  referenced by all live `Version`s, diff against directory contents, and delete any `.ldb` / `.log` files not in
+  the union. See `db/db_impl.cc: DBImpl::RemoveObsoleteFiles`.
+
+**Compaction**
+
+- [ ] **Background compaction**: Triggered when L0 file count ≥ 4. Selects input files using `compact_pointer`
+  per level (round-robin across the key space), runs a `MergingIterator` over all inputs, drops entries shadowed
+  by newer versions or obsolete tombstones, writes output files to L+1, updates `VersionSet` via `log_and_apply`.
+  Slow-write throttle at L0 ≥ 8; write-stop at L0 ≥ 12. See `db/db_impl.cc: DBImpl::BackgroundCompaction`.
+- [ ] **Write stall / write stop**: In `Db::write`, after a flush, check L0 file count. Sleep briefly per write
+  when count ≥ 8 (to let compaction catch up); block entirely when count ≥ 12. Resume when compaction drains L0
+  below the threshold. See `db/db_impl.cc: DBImpl::MakeRoomForWrite`.
+- [ ] **`Db::CompactRange(begin, end)`**: Manual compaction of a user key range across all levels. Overlapping
+  files are compacted into the deepest level that contains them. See `db/db_impl.cc: DBImpl::CompactRange`.
+
+**Iterator and snapshot API** *(all required by `include/leveldb/db.h`)*
+
+- [ ] **Backward iteration**: `SkipListIter::prev()`, `MemTableIterator::prev()` / `seek_to_last()`,
+  `BlockIter::prev()`, `TwoLevelIterator::prev()`, `MergingIterator::prev()`, `DbIterator::prev()`. Required for
+  the public `Iterator::Prev()` and `Iterator::SeekToLast()` methods. See `table/iterator.h`.
+- [ ] **`Db::NewIterator(read_opts)`**: Returns a public `Iterator` over a consistent snapshot of mem + imm + all
+  files in the current `Version`. Pins `Arc<Version>` + memtable(s) for the iterator's lifetime; creates a
+  `MergingIterator` from their iterators, wraps in `DbIterator`. Exposes the full interface: `Valid`,
+  `SeekToFirst`, `SeekToLast`, `Seek`, `Next`, `Prev`, `key`, `value`, `status`. See `db/db_impl.cc`.
+- [ ] **`Db::GetSnapshot` / `ReleaseSnapshot`**: A snapshot is a pinned sequence number. `GetSnapshot` returns
+  the current `last_sequence` wrapped in a `Snapshot` handle and records it in a list so compaction won't drop
+  entries still visible to it. `ReleaseSnapshot` removes it from the list. See `db/snapshot.h`.
+- [ ] **`Db::get` snapshot support**: `ReadOptions::snapshot` is currently ignored. Wire it up: if a snapshot is
+  provided, use its sequence number as the visibility cutoff in `Memtable::get` and `Version::get`; otherwise use
+  `last_sequence` as today. See `db/db_impl.cc: DBImpl::Get`.
+
+**Remaining user-facing API surface** *(in `include/leveldb/db.h`)*
+
+- [ ] **`Db::GetProperty(property)`**: Returns stats strings for well-known property names:
+  `"leveldb.num-files-at-level<N>"`, `"leveldb.stats"` (per-level compaction stats table),
+  `"leveldb.sstables"` (one line per SSTable), `"leveldb.approximate-memory-usage"`. Returns `None` for unknown
+  properties. See `db/db_impl.cc: DBImpl::GetProperty`.
+- [ ] **`Db::GetApproximateSizes(ranges)`**: Given a slice of `(start_key, end_key)` ranges, return approximate
+  on-disk byte count for each range by walking the index blocks of overlapping SSTables. Used by tools to estimate
+  data distribution. See `db/db_impl.cc: DBImpl::GetApproximateSizes`.
+- [ ] **`DestroyDB(path, options)`**: Free function. Locks the database, then deletes all known database files
+  (MANIFEST, WAL, SSTables, CURRENT, LOCK) and the directory. See `db/db_impl.cc`.
+
+**`LOCK` file** *(prerequisite for the above free functions and safe multi-process use)*
+
+- [ ] **`LOCK` file**: On `Db::open`, acquire an exclusive `flock` on `<path>/LOCK` to prevent two processes from
+  opening the same database simultaneously. Release on `Db::drop`. See `util/env_posix.cc: LockFile`.
 
 ---
 
@@ -236,6 +278,9 @@ that is a post-parity optimisation.*
 *Optimisations and secondary features to add once RoughDB has a fully functional database. None are prerequisites for
 the phases above.*
 
+- **Batch-grouped writes**: Multiple concurrent `Db::write` callers are grouped by a leader that writes a single
+  combined WAL record and memtable batch, amortising `fsync` cost over many writers. Transparent to callers; the
+  current single-writer-at-a-time path is correct. See `db/db_impl.cc: DBImpl::Write`.
 - **Bloom filters**: Kirsch-Mitzenmacher double-hashing; `k = round(0.69 * bits_per_key)` hash functions; one filter
   per ~2 KB of data blocks stored in the SSTable filter block. Avoids unnecessary block reads for missing keys.
   See `util/bloom.cc` and `include/leveldb/filter_policy.h`. A `FilterPolicy` trait allows custom filters.
@@ -243,8 +288,11 @@ the phases above.*
   capacity-based eviction. Default 8 MB. Required by `Table` reader to cache hot blocks. See `util/cache.cc`.
 - **Table cache**: LRU of `(file_number → Table)` entries replacing the `Arc<Table>` in `FileMetaData`. Bounds open
   file descriptors and avoids repeated footer parses. See `db/table_cache.h/cc`.
-- **Backward iteration**: `SkipList::iter()` reverse, `MemTableIterator` backward, `DbIterator` backward seek/prev.
-  Required for `Db::NewIterator` to support full bidirectional scans.
+- **Custom comparator**: Wire `Options::comparator` through to all key-comparison sites (skip list, block seek,
+  compaction). Currently hardcoded bytewise. Needed to use RoughDB as a sorted map on non-lexicographic keys.
+  See `include/leveldb/comparator.h`.
+- **`RepairDB(path, options)`**: Scans the database directory, recovers as many SSTables as possible from a corrupt
+  or partial MANIFEST, and rebuilds a valid MANIFEST. See `db/repair.cc`.
 - **`Db::flush_wal(sync: bool)` / `Db::sync_wal()`**: RocksDB-style explicit WAL flush. `flush_wal` pushes buffered
   data from the `BufWriter` to the OS page cache; `sync = true` also `fsync`s. Useful for amortising `fsync` cost
   over many `sync=false` writes. Currently `Db::drop` relies on `BufWriter`'s implicit flush-on-drop, which silences
