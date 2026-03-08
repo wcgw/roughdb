@@ -118,6 +118,7 @@ fn shared_prefix_len(a: &[u8], b: &[u8]) -> usize {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::iter::InternalIterator;
   use crate::table::block::Block;
 
   fn build_block(pairs: &[(&[u8], &[u8])], interval: usize) -> Vec<u8> {

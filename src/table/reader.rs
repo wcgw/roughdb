@@ -11,8 +11,10 @@
 //    limitations under the License.
 
 use crate::error::Error;
+use crate::iter::InternalIterator;
 use crate::table::block::Block;
 use crate::table::format::{read_block, BlockHandle, Footer, FOOTER_ENCODED_LENGTH};
+use crate::table::two_level_iterator::TwoLevelIterator;
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 
@@ -111,6 +113,22 @@ impl Table {
       }
     }
     Ok(LookupResult::NotInTable)
+  }
+
+  /// Return a `TwoLevelIterator` over all entries in this table.
+  ///
+  /// The iterator clones the file handle (cheap `dup(2)`) so it can read data
+  /// blocks on demand without holding a reference to `self`.
+  pub(crate) fn new_iterator(&self) -> Result<TwoLevelIterator, Error> {
+    use crate::table::two_level_iterator::BlockFn;
+    let file = self.file.try_clone()?;
+    let index_iter: Box<dyn InternalIterator> = Box::new(self.index_block.iter());
+    let block_fn: BlockFn = Box::new(move |handle_value: &[u8]| {
+      let (handle, _) = BlockHandle::decode_from(handle_value)?;
+      let contents = read_block(&file, &handle, false)?;
+      Ok(Box::new(Block::new(contents.data).iter()) as Box<dyn InternalIterator>)
+    });
+    Ok(TwoLevelIterator::new(index_iter, block_fn))
   }
 
   /// Iterate over the entire table, calling `f(internal_key, value)` for each entry.

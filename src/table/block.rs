@@ -11,15 +11,19 @@
 //    limitations under the License.
 
 use crate::coding::read_varu64;
+use crate::error::Error;
+use crate::iter::InternalIterator;
 use crate::table::format::cmp_internal_keys;
+use std::sync::Arc;
 
 /// An immutable, decoded SSTable block.
 ///
 /// The raw `data` slice holds the serialised entries followed by the restart
-/// point array and a 4-byte count.  `Block::iter()` returns a forward-only
-/// `BlockIterator` that decodes entries on the fly.  See `table/block.h/cc`.
+/// point array and a 4-byte count.  `Block::iter()` returns a `BlockIter`
+/// that decodes entries on the fly.  See `table/block.h/cc`.
 pub(crate) struct Block {
-  data: Vec<u8>,
+  /// Block data shared with iterators via `Arc` (zero-copy `iter()`).
+  data: Arc<Vec<u8>>,
   /// Byte offset of the first restart-point u32 within `data`.
   restarts_offset: usize,
   /// Number of restart points.
@@ -41,116 +45,63 @@ impl Block {
     );
     let restarts_offset = data.len() - restarts_size;
     Block {
-      data,
+      data: Arc::new(data),
       restarts_offset,
       num_restarts,
     }
   }
 
-  /// Return a forward iterator over this block's entries.
-  pub(crate) fn iter(&self) -> BlockIterator<'_> {
-    BlockIterator::new(self)
-  }
-
-  fn restart_point(&self, index: usize) -> usize {
-    let off = self.restarts_offset + index * 4;
-    u32::from_le_bytes(self.data[off..off + 4].try_into().unwrap()) as usize
-  }
-}
-
-// ── BlockIterator ─────────────────────────────────────────────────────────────
-
-/// Forward-only iterator over a `Block`.
-///
-/// Advances entry by entry, reconstructing the full key from the delta-encoded
-/// (shared_len, unshared_len) pair.  Supports `seek` via binary search over the
-/// restart point array.  See `table/block.cc`.
-pub(crate) struct BlockIterator<'a> {
-  block: &'a Block,
-  /// Current position in `block.data` (points at the next entry's shared_len varint,
-  /// or `>= restarts_offset` when invalid).
-  current: usize,
-  /// Fully reconstructed key at `current`.
-  key: Vec<u8>,
-  /// Value slice start within `block.data`.
-  value_start: usize,
-  /// Value slice length.
-  value_len: usize,
-}
-
-impl<'a> BlockIterator<'a> {
-  fn new(block: &'a Block) -> Self {
-    BlockIterator {
-      block,
-      current: block.restarts_offset, // starts invalid
+  /// Return an iterator over this block's entries.
+  ///
+  /// The iterator clones the `Arc` — no data is copied.
+  pub(crate) fn iter(&self) -> BlockIter {
+    BlockIter {
+      data: Arc::clone(&self.data),
+      restarts_offset: self.restarts_offset,
+      num_restarts: self.num_restarts,
+      current: self.restarts_offset, // starts invalid
       key: Vec::new(),
       value_start: 0,
       value_len: 0,
     }
   }
+}
 
-  pub(crate) fn valid(&self) -> bool {
-    self.current < self.block.restarts_offset
+// ── BlockIter ─────────────────────────────────────────────────────────────────
+
+/// Forward iterator over a `Block`.
+///
+/// Owns an `Arc` reference to the block data, so it can be stored anywhere
+/// without a lifetime parameter.  Reconstructs full keys from delta-encoded
+/// (shared_len, unshared_len) pairs and supports `seek` via binary search
+/// over restart points.  See `table/block.cc`.
+pub(crate) struct BlockIter {
+  data: Arc<Vec<u8>>,
+  restarts_offset: usize,
+  num_restarts: usize,
+  /// Current position in `data` (points at next entry's shared_len varint,
+  /// or `>= restarts_offset` when invalid).
+  current: usize,
+  /// Fully reconstructed key at `current`.
+  key: Vec<u8>,
+  /// Value slice start within `data`.
+  value_start: usize,
+  /// Value slice length.
+  value_len: usize,
+}
+
+impl BlockIter {
+  fn restart_point(&self, index: usize) -> usize {
+    let off = self.restarts_offset + index * 4;
+    u32::from_le_bytes(self.data[off..off + 4].try_into().unwrap()) as usize
   }
 
-  pub(crate) fn key(&self) -> &[u8] {
-    debug_assert!(self.valid());
-    &self.key
-  }
-
-  pub(crate) fn value(&self) -> &[u8] {
-    debug_assert!(self.valid());
-    &self.block.data[self.value_start..self.value_start + self.value_len]
-  }
-
-  pub(crate) fn seek_to_first(&mut self) {
-    if self.block.restarts_offset == 0 {
-      return; // empty block
-    }
-    self.current = 0;
-    self.key.clear();
-    self.decode_entry();
-  }
-
-  /// Position at the first entry with `key >= target`.
-  ///
-  /// Uses binary search over restart points, then linear scan within the
-  /// selected region.  After the call, `valid()` is true iff such an entry exists.
-  pub(crate) fn seek(&mut self, target: &[u8]) {
-    // Binary search restart points for the largest restart whose key <= target.
-    let mut lo = 0usize;
-    let mut hi = self.block.num_restarts; // exclusive
-    while lo + 1 < hi {
-      let mid = lo + (hi - lo) / 2;
-      let restart_key = self.key_at_restart(mid);
-      match cmp_internal_keys(restart_key.as_slice(), target) {
-        std::cmp::Ordering::Less | std::cmp::Ordering::Equal => lo = mid,
-        std::cmp::Ordering::Greater => hi = mid,
-      }
-    }
-    // Linear scan from restart point `lo`.
-    self.current = self.block.restart_point(lo);
-    self.key.clear();
-    self.decode_entry();
-    while self.valid() && cmp_internal_keys(self.key(), target) == std::cmp::Ordering::Less {
-      self.next();
-    }
-  }
-
-  pub(crate) fn next(&mut self) {
-    debug_assert!(self.valid());
-    self.current = self.value_start + self.value_len;
-    if self.current < self.block.restarts_offset {
-      self.decode_entry();
-    }
-  }
-
-  /// Decode the entry at `self.current`, updating `self.key`, `value_start`, `value_len`.
+  /// Decode the entry at `self.current`, updating `key`, `value_start`, `value_len`.
   ///
   /// Assumes `self.key` already holds the full key from the previous entry
   /// (or is empty at a restart point).
   fn decode_entry(&mut self) {
-    let data = &self.block.data;
+    let data = &*self.data;
     let mut pos = self.current;
 
     let (shared, n) = read_varu64(&data[pos..]);
@@ -164,7 +115,6 @@ impl<'a> BlockIterator<'a> {
     let unshared = unshared as usize;
     let vlen = vlen as usize;
 
-    // Reconstruct key: keep shared prefix, append unshared suffix.
     self.key.truncate(shared);
     self.key.extend_from_slice(&data[pos..pos + unshared]);
     pos += unshared;
@@ -175,8 +125,8 @@ impl<'a> BlockIterator<'a> {
 
   /// Return the key stored at restart point `index` without modifying `self`.
   fn key_at_restart(&self, index: usize) -> Vec<u8> {
-    let data = &self.block.data;
-    let mut pos = self.block.restart_point(index);
+    let data = &*self.data;
+    let mut pos = self.restart_point(index);
     // At a restart point shared_len is always 0.
     let (_shared, n) = read_varu64(&data[pos..]);
     pos += n;
@@ -185,6 +135,66 @@ impl<'a> BlockIterator<'a> {
     let (_vlen, n) = read_varu64(&data[pos..]);
     pos += n;
     data[pos..pos + unshared as usize].to_vec()
+  }
+}
+
+impl InternalIterator for BlockIter {
+  fn valid(&self) -> bool {
+    self.current < self.restarts_offset
+  }
+
+  fn seek_to_first(&mut self) {
+    if self.restarts_offset == 0 {
+      return; // empty block
+    }
+    self.current = 0;
+    self.key.clear();
+    self.decode_entry();
+  }
+
+  /// Position at the first entry with `key >= target`.
+  ///
+  /// Uses binary search over restart points, then linear scan within the
+  /// selected region.
+  fn seek(&mut self, target: &[u8]) {
+    let mut lo = 0usize;
+    let mut hi = self.num_restarts; // exclusive
+    while lo + 1 < hi {
+      let mid = lo + (hi - lo) / 2;
+      let restart_key = self.key_at_restart(mid);
+      match cmp_internal_keys(restart_key.as_slice(), target) {
+        std::cmp::Ordering::Less | std::cmp::Ordering::Equal => lo = mid,
+        std::cmp::Ordering::Greater => hi = mid,
+      }
+    }
+    self.current = self.restart_point(lo);
+    self.key.clear();
+    self.decode_entry();
+    while self.valid() && cmp_internal_keys(self.key(), target) == std::cmp::Ordering::Less {
+      self.next();
+    }
+  }
+
+  fn next(&mut self) {
+    debug_assert!(self.valid());
+    self.current = self.value_start + self.value_len;
+    if self.current < self.restarts_offset {
+      self.decode_entry();
+    }
+  }
+
+  fn key(&self) -> &[u8] {
+    debug_assert!(self.valid());
+    &self.key
+  }
+
+  fn value(&self) -> &[u8] {
+    debug_assert!(self.valid());
+    &self.data[self.value_start..self.value_start + self.value_len]
+  }
+
+  fn status(&self) -> Option<&Error> {
+    None // BlockIter is pure memory; no I/O errors possible.
   }
 }
 
@@ -247,7 +257,6 @@ mod tests {
 
   #[test]
   fn seek_between_keys() {
-    // Target doesn't exist; iterator lands on the next key.
     let block = make_block(&[(b"a", b"1"), (b"c", b"3")], 16);
     let mut it = block.iter();
     it.seek(b"b");
@@ -265,7 +274,6 @@ mod tests {
 
   #[test]
   fn seek_across_restart_boundaries() {
-    // 9 entries, restart every 3 — forces binary search across multiple restart points.
     let pairs: Vec<(Vec<u8>, Vec<u8>)> = (b'a'..=b'i').map(|c| (vec![c], vec![c + 1])).collect();
     let pairs_ref: Vec<(&[u8], &[u8])> = pairs
       .iter()

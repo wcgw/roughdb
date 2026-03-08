@@ -180,8 +180,11 @@ disk on in-memory misses. Mirrors the approach taken in Phase 2, where the WAL w
 `BlockIterator` were pulled into Phase 3; this phase completes the forward iterator stack. Backward iteration is
 deferred to post-parity as it is not needed for compaction or the core read path.*
 
-- [ ] **`TwoLevelIterator`** (`src/table/two_level_iterator.rs`): Composes an index iterator and a block-opener
-  function, yielding a transparent view over all blocks in an SSTable. See `table/two_level_iterator.h/cc`.
+- [x] **`TwoLevelIterator`** (`src/table/two_level_iterator.rs`): Composes an index iterator and a block-opener
+  function, yielding a transparent view over all blocks in an SSTable. `BlockFn` closure captures a cloned `File`
+  handle and opens data blocks on demand. `BlockIter` (renamed from `BlockIterator<'a>`) now owns an `Arc<Vec<u8>>`
+  so it can be stored without a lifetime parameter. `InternalIterator` trait in `src/iter.rs` provides the shared
+  interface used by `TwoLevelIterator`, `MergingIterator`, and `DbIterator`. See `table/two_level_iterator.h/cc`.
 - [ ] **`MergingIterator`** (`src/db/merge_iter.rs`): N-way merge of sorted iterators using a heap or linear scan
   (LevelDB uses linear for small N). See `table/merger.h/cc`.
 - [ ] **`DbIterator`** (`src/db/db_iter.rs`): Wraps `MergingIterator`; applies snapshot sequence-number filtering,
