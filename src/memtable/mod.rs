@@ -18,6 +18,7 @@ use arena::Arena;
 use entry::Entry;
 use skiplist::SkipList;
 use std::cell::UnsafeCell;
+use std::sync::Arc;
 
 #[derive(Debug, PartialEq)]
 pub enum MemtableResult<T> {
@@ -219,6 +220,72 @@ impl crate::iter::InternalIterator for MemTableIterator<'_> {
 
   fn value(&self) -> &[u8] {
     self.value()
+  }
+
+  fn status(&self) -> Option<&crate::error::Error> {
+    None
+  }
+}
+
+// ── ArcMemTableIter ───────────────────────────────────────────────────────────
+
+/// Owned memtable iterator that keeps the `Arc<Memtable>` alive.
+///
+/// `MemTableIterator<'a>` borrows the `Memtable`'s arena via raw pointers; the
+/// `'a` parameter is a `PhantomData` marker that prevents the iterator from
+/// outliving the `Memtable`.  This wrapper stores the `Arc<Memtable>` alongside
+/// the iterator so the iterator is `'static` and can be boxed as
+/// `Box<dyn InternalIterator>`.
+///
+/// # Safety
+///
+/// The transmute from `MemTableIterator<'_>` to `MemTableIterator<'static>` is
+/// sound because `_owner` keeps the `Memtable` (and its arena) alive for the
+/// entire lifetime of this struct.  All slices returned from `key()` and
+/// `value()` through the `InternalIterator` trait are bounded by `&self`'s
+/// lifetime, so they cannot escape beyond the iterator.
+pub(crate) struct ArcMemTableIter {
+  _owner: Arc<Memtable>,
+  iter: MemTableIterator<'static>,
+}
+
+impl ArcMemTableIter {
+  pub(crate) fn new(mem: Arc<Memtable>) -> Self {
+    // SAFETY: `raw` points to the Memtable kept alive by `mem` (stored in
+    // `_owner` below).  `iter()` returns a `MemTableIterator` whose raw
+    // pointers reference the arena inside that Memtable.  We transmute the
+    // `'_` lifetime to `'static`; this is safe because `_owner` guarantees
+    // the arena outlives `self`.
+    let raw: *const Memtable = Arc::as_ptr(&mem);
+    let iter: MemTableIterator<'_> = unsafe { (*raw).iter() };
+    let iter: MemTableIterator<'static> = unsafe { std::mem::transmute(iter) };
+    ArcMemTableIter { _owner: mem, iter }
+  }
+}
+
+impl crate::iter::InternalIterator for ArcMemTableIter {
+  fn valid(&self) -> bool {
+    self.iter.valid()
+  }
+
+  fn seek_to_first(&mut self) {
+    self.iter.seek_to_first();
+  }
+
+  fn seek(&mut self, target: &[u8]) {
+    self.iter.seek(target);
+  }
+
+  fn next(&mut self) {
+    self.iter.advance();
+  }
+
+  fn key(&self) -> &[u8] {
+    self.iter.key()
+  }
+
+  fn value(&self) -> &[u8] {
+    self.iter.value()
   }
 
   fn status(&self) -> Option<&crate::error::Error> {

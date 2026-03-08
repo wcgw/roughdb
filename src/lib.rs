@@ -14,7 +14,7 @@ use crate::db::version_edit::{FileMetaData, VersionEdit};
 use crate::db::version_set::VersionSet;
 use crate::log::reader::Reader as LogReader;
 use crate::log::writer::Writer as LogWriter;
-use crate::memtable::{Memtable, MemtableResult};
+use crate::memtable::{ArcMemTableIter, Memtable, MemtableResult};
 use crate::table::builder::TableBuilder;
 use crate::table::reader::{LookupResult, Table};
 use std::path::PathBuf;
@@ -68,11 +68,13 @@ struct DbState {
   last_sequence: u64,
   /// `None` for in-memory / test databases (no WAL).
   log: Option<LogWriter>,
-  mem: Memtable,
+  /// Active memtable.  `Arc` allows cloning a handle for iterators without
+  /// holding the DB lock.
+  mem: Arc<Memtable>,
   /// Sealed memtable currently being flushed to disk.  Reads must check this
   /// after `mem` and before the current `Version`.  `None` when no flush is
   /// in progress.
-  imm: Option<Memtable>,
+  imm: Option<Arc<Memtable>>,
   /// Tracks the set of live SSTable files and the MANIFEST.
   /// `None` for in-memory databases (`Db::default()`).
   version_set: Option<VersionSet>,
@@ -85,7 +87,7 @@ struct DbState {
 struct FlushPrep {
   sst_number: u64,
   sst_path: std::path::PathBuf,
-  old_mem: Memtable,
+  old_mem: Arc<Memtable>,
   /// File number of the new WAL created under the write lock.
   new_log_number: u64,
   /// Open writer for the new WAL (empty at this point).
@@ -107,6 +109,62 @@ struct FlushResult {
   old_log_path: std::path::PathBuf,
 }
 
+// ── DbIter ────────────────────────────────────────────────────────────────────
+
+/// User-facing forward iterator over a consistent snapshot of the database.
+///
+/// Applies snapshot filtering, tombstone handling, and version merging across
+/// the active memtable, any in-progress flush memtable, and all SSTable files.
+///
+/// Obtain via [`Db::new_iterator`].  The iterator starts **unpositioned**;
+/// call [`seek_to_first`] or [`seek`] before reading keys or values.
+///
+/// [`seek_to_first`]: DbIter::seek_to_first
+/// [`seek`]: DbIter::seek
+pub struct DbIter {
+  inner: db::db_iter::DbIterator,
+}
+
+impl DbIter {
+  /// Returns `true` if the iterator is positioned at a valid entry.
+  pub fn valid(&self) -> bool {
+    self.inner.valid()
+  }
+
+  /// Position at the first user-visible entry.
+  pub fn seek_to_first(&mut self) {
+    self.inner.seek_to_first();
+  }
+
+  /// Position at the first user-visible entry with `key >= target`.
+  pub fn seek(&mut self, key: &[u8]) {
+    self.inner.seek(key);
+  }
+
+  /// Advance to the next user-visible entry.
+  ///
+  /// # Panics
+  /// Panics (debug) if `valid()` is false.
+  pub fn next(&mut self) {
+    self.inner.next();
+  }
+
+  /// Current user key.  Only valid when `valid()` is true.
+  pub fn key(&self) -> &[u8] {
+    self.inner.key()
+  }
+
+  /// Current value.  Only valid when `valid()` is true.
+  pub fn value(&self) -> &[u8] {
+    self.inner.value()
+  }
+
+  /// Returns a sticky error if the iterator encountered corruption.
+  pub fn status(&self) -> Option<&Error> {
+    self.inner.status()
+  }
+}
+
 // ── Db ───────────────────────────────────────────────────────────────────────
 
 pub struct Db {
@@ -124,7 +182,7 @@ impl Default for Db {
       state: RwLock::new(DbState {
         last_sequence: 0,
         log: None,
-        mem: Memtable::default(),
+        mem: Arc::new(Memtable::default()),
         imm: None,
         version_set: None,
       }),
@@ -160,7 +218,7 @@ impl Db {
       // ── Existing database: MANIFEST-driven recovery ──────────────────────
       let mut vs = VersionSet::recover(path)?;
       let manifest_last_seq = vs.last_sequence();
-      let mem = Memtable::default();
+      let mem = Arc::new(Memtable::default());
 
       // Replay WAL records newer than what is already in the SSTables.
       // Use the log number recorded in the MANIFEST (set by WAL rotation).
@@ -187,7 +245,7 @@ impl Db {
       let vs = VersionSet::create(path)?;
       // Initial WAL is always 000001.log (log_number = 1 from VersionSet::create).
       std::fs::File::create(path.join("000001.log"))?;
-      (Some(vs), Memtable::default(), 0)
+      (Some(vs), Arc::new(Memtable::default()), 0)
     };
 
     // Open (or reopen) the current WAL for subsequent writes.
@@ -300,6 +358,48 @@ impl Db {
     let mut batch = WriteBatch::new();
     batch.delete(key.as_ref());
     self.write(&WriteOptions::default(), &batch)
+  }
+
+  /// Create a forward iterator over a consistent snapshot of the database.
+  ///
+  /// If `opts.snapshot` is set, the iterator is pinned to that sequence number;
+  /// otherwise it reads as of the current `last_sequence`.
+  ///
+  /// The memtable(s) and all SSTable file handles are pinned for the lifetime
+  /// of the returned `DbIter`; reads and writes proceed concurrently.
+  pub fn new_iterator(&self, opts: &ReadOptions) -> Result<DbIter, Error> {
+    use crate::db::db_iter::DbIterator;
+    use crate::db::merge_iter::MergingIterator;
+
+    let state = self.state.read().unwrap();
+    let sequence = opts.snapshot.map(|s| s.0).unwrap_or(state.last_sequence);
+
+    let mut children: Vec<Box<dyn crate::iter::InternalIterator>> = Vec::new();
+
+    // Active memtable (newest writes, scanned first).
+    children.push(Box::new(ArcMemTableIter::new(Arc::clone(&state.mem))));
+
+    // Sealed memtable being flushed to disk (if any).
+    if let Some(imm) = &state.imm {
+      children.push(Box::new(ArcMemTableIter::new(Arc::clone(imm))));
+    }
+
+    // SSTable files from the current Version, level by level (L0 first).
+    if let Some(vs) = &state.version_set {
+      let version = vs.current();
+      for level_files in &version.files {
+        for meta in level_files {
+          if let Some(table) = &meta.table {
+            children.push(Box::new(table.new_iterator()?));
+          }
+        }
+      }
+    }
+
+    drop(state);
+
+    let inner = DbIterator::new(Box::new(MergingIterator::new(children)), sequence);
+    Ok(DbIter { inner })
   }
 
   pub fn write(&self, opts: &WriteOptions, batch: &WriteBatch) -> Result<(), Error> {
@@ -737,5 +837,122 @@ mod tests {
         "key k{i:04} not found after reopen"
       );
     }
+  }
+
+  // ── new_iterator tests ─────────────────────────────────────────────────────
+
+  #[test]
+  fn iterator_in_memory_db() {
+    use crate::ReadOptions;
+    let db = Db::default();
+    db.put(b"b", b"B").unwrap();
+    db.put(b"a", b"A").unwrap();
+    db.put(b"c", b"C").unwrap();
+
+    let mut it = db.new_iterator(&ReadOptions::default()).unwrap();
+    it.seek_to_first();
+    let mut pairs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    while it.valid() {
+      pairs.push((it.key().to_vec(), it.value().to_vec()));
+      it.next();
+    }
+    assert_eq!(
+      pairs,
+      vec![
+        (b"a".to_vec(), b"A".to_vec()),
+        (b"b".to_vec(), b"B".to_vec()),
+        (b"c".to_vec(), b"C".to_vec()),
+      ]
+    );
+    assert!(it.status().is_none());
+  }
+
+  #[test]
+  fn iterator_seek() {
+    use crate::ReadOptions;
+    let db = Db::default();
+    db.put(b"aa", b"1").unwrap();
+    db.put(b"bb", b"2").unwrap();
+    db.put(b"cc", b"3").unwrap();
+
+    let mut it = db.new_iterator(&ReadOptions::default()).unwrap();
+    it.seek(b"bb");
+    assert!(it.valid());
+    assert_eq!(it.key(), b"bb");
+    assert_eq!(it.value(), b"2");
+    it.next();
+    assert_eq!(it.key(), b"cc");
+    it.next();
+    assert!(!it.valid());
+  }
+
+  #[test]
+  fn iterator_skips_tombstones() {
+    use crate::ReadOptions;
+    let db = Db::default();
+    db.put(b"a", b"1").unwrap();
+    db.put(b"b", b"2").unwrap();
+    db.delete(b"a").unwrap();
+
+    let mut it = db.new_iterator(&ReadOptions::default()).unwrap();
+    it.seek_to_first();
+    assert!(it.valid());
+    assert_eq!(it.key(), b"b");
+    it.next();
+    assert!(!it.valid());
+  }
+
+  #[test]
+  fn iterator_spans_memtable_and_l0() {
+    // Keys flushed to L0 and keys in the memtable must appear together in order.
+    use crate::ReadOptions;
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path(), small_options()).unwrap();
+
+    // Write enough to trigger one flush (keys go to L0).
+    for i in 0u32..20 {
+      db.put(format!("k{i:02}").as_bytes(), format!("v{i:02}").as_bytes())
+        .unwrap();
+    }
+
+    // Collect all keys via the iterator.
+    let mut it = db.new_iterator(&ReadOptions::default()).unwrap();
+    it.seek_to_first();
+    let mut keys: Vec<Vec<u8>> = Vec::new();
+    while it.valid() {
+      keys.push(it.key().to_vec());
+      it.next();
+    }
+
+    // All 20 keys must appear exactly once, in sorted order.
+    assert_eq!(keys.len(), 20);
+    for i in 0u32..20 {
+      assert_eq!(keys[i as usize], format!("k{i:02}").as_bytes());
+    }
+  }
+
+  #[test]
+  fn iterator_after_reopen_reads_l0_and_mem() {
+    // After a reopen: flushed keys come from L0 (MANIFEST recovery),
+    // unflushed keys come from WAL replay into the memtable. The iterator
+    // must see both.
+    use crate::ReadOptions;
+    let dir = tempfile::tempdir().unwrap();
+    {
+      let db = Db::open(dir.path(), small_options()).unwrap();
+      for i in 0u32..20 {
+        db.put(format!("k{i:02}").as_bytes(), format!("v{i:02}").as_bytes())
+          .unwrap();
+      }
+    }
+    let db = Db::open(dir.path(), Options::default()).unwrap();
+    let mut it = db.new_iterator(&ReadOptions::default()).unwrap();
+    it.seek_to_first();
+    let mut keys: Vec<Vec<u8>> = Vec::new();
+    while it.valid() {
+      keys.push(it.key().to_vec());
+      it.next();
+    }
+    assert_eq!(keys.len(), 20);
   }
 }
