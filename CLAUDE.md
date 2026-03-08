@@ -127,13 +127,18 @@ Features are listed in dependency order. Each phase must be complete before the 
   all records restore `last_sequence` to the highest sequence seen. Incomplete trailing records (torn write on crash)
   are silently ignored.
 
-### Phase 3 — SSTable format
+### Phase 3 — SSTable format + L0 flush + disk reads
 
-*The on-disk immutable file format. Required by flush and compaction.*
+*The on-disk immutable file format, wired end-to-end: memtable flushes to L0 SSTables and `Db::get` falls through to
+disk on in-memory misses. Mirrors the approach taken in Phase 2, where the WAL was integrated rather than deferred.*
+
+**SSTable primitives**
 
 - [ ] **`Block`** (`src/table/block.rs`): Delta-encoded key-value pairs with restart points every N keys (default 16).
   Each entry: `[shared_len: varint][unshared_len: varint][value_len: varint][key_suffix][value]`. Restart point array at
   block tail enables binary search. See `table/block.h/cc`.
+- [ ] **`BlockIterator`** (`src/table/block.rs`): Decodes delta-encoded entries on the fly; jumps to restart points for
+  seeks. Needed by `Table::get` to decode data blocks — pulled forward from Phase 6. See `table/block.cc`.
 - [ ] **`BlockBuilder`** (`src/table/block_builder.rs`): Accumulates entries into a `Block`, tracking the last key for
   delta encoding. See `table/block_builder.h/cc`.
 - [ ] **`BlockHandle` / `Footer`** (`src/table/format.rs`): `BlockHandle` is an (offset, size) pair encoded as two
@@ -143,6 +148,24 @@ Features are listed in dependency order. Each phase must be complete before the 
   index block, optional filter block, and footer. See `include/leveldb/table_builder.h` and `table/table_builder.cc`.
 - [ ] **`Table`** (`src/table/reader.rs`): Random-access reader; uses the index block to locate data blocks, optionally
   the filter block to skip misses. See `table/table.cc`.
+
+**Memtable iteration** *(pulled forward from Phase 6 — required for flush)*
+
+- [ ] **`SkipList::iter()`**: Forward-only iteration over the skip list (backward deferred to Phase 6). Yields entries
+  in internal-key order (user key ASC, sequence DESC), which is the order `TableBuilder` requires.
+- [ ] **`MemTableIterator`**: Thin forward iterator over `SkipList::iter()`, decoding each entry via `Entry::from_slice`
+  to expose `(internal_key, value)` pairs to the flusher.
+
+**L0 flush + disk read wiring**
+
+- [ ] **`Arena::memory_usage()`**: Expose `bumpalo::Bump::allocated_bytes()` so `Db` can compare memtable size against
+  `Options::write_buffer_size`. Replace the current hardcoded 10 MB panic with a flush trigger.
+- [ ] **`Db::open` takes `Options`**: Pass `write_buffer_size` (and future options) through to the database.
+- [ ] **L0 flush** (`Db`): When `mem` exceeds `write_buffer_size` after a write, seal it as `imm`, iterate it via
+  `MemTableIterator`, write a new SSTable via `TableBuilder` (file `<path>/<number>.ldb`, number starting at 2), then
+  clear `imm`. Track flushed files in a `Mutex<Vec<Table>>` (newest first) — no `VersionSet` yet.
+- [ ] **`Db::get` disk fallback**: On miss in `mem` and `imm`, scan the L0 file list newest-first, calling
+  `Table::get` on each. First hit (value or tombstone) wins. No multi-level routing yet — deferred to Phase 9.
 
 ### Phase 4 — Bloom filters
 
@@ -164,13 +187,11 @@ Features are listed in dependency order. Each phase must be complete before the 
 
 ### Phase 6 — Iterators
 
-*Required by `Db::NewIterator` and internally by compaction.*
+*Required by `Db::NewIterator` and internally by compaction. Forward `SkipList` iteration, `MemTableIterator`, and
+`BlockIterator` were pulled into Phase 3 for the L0 flush; this phase completes the iterator stack.*
 
-- [ ] **`SkipList::iter()`**: Add forward and backward iteration to the existing skip list (currently supports
-  seek/insert only).
-- [ ] **`MemTableIterator`**: Thin wrapper over `SkipList::iter()` exposing the standard `Iterator` trait.
-- [ ] **`BlockIterator`** (`src/table/block.rs`): Decodes delta-encoded entries on the fly, jumps to restart points for
-  seeks. See `table/block.cc`.
+- [ ] **`SkipList::iter()` backward**: Add backward iteration (forward already implemented in Phase 3).
+- [ ] **`MemTableIterator` backward**: Extend the Phase 3 forward iterator with backward seek/prev support.
 - [ ] **`TwoLevelIterator`** (`src/table/two_level_iterator.rs`): Composes an index iterator and a block-opener
   function, yielding a transparent view over all blocks in an SSTable. See `table/two_level_iterator.h/cc`.
 - [ ] **`MergingIterator`** (`src/db/merge_iter.rs`): N-way merge of sorted iterators using a heap or linear scan
@@ -201,13 +222,11 @@ Features are listed in dependency order. Each phase must be complete before the 
 
 *Ties all prior phases into a working, persistent, crash-safe database.*
 
-- [ ] **`Db::Open`**: Create or recover an existing database. Recovery replays the WAL from the sequence number recorded
-  in the MANIFEST to reconstruct the last memtable. See `db/db_impl.cc: DBImpl::Recover`.
+- [ ] **`Db::Open`** (full): Upgrade from the Phase 3 single-log open to full MANIFEST-driven recovery: replays the
+  WAL from the sequence number in the MANIFEST, rebuilds the `VersionSet`, and re-opens all live SSTable files. The
+  Phase 3 flat `Vec<Table>` is replaced by proper level routing through `VersionSet`. See `db/db_impl.cc: DBImpl::Recover`.
 - [ ] **`Db::Write`** (batch-grouped): Multiple concurrent writers are grouped; only the leader writes to the WAL and
   inserts into the memtable. See `db/db_impl.cc: DBImpl::Write`.
-- [ ] **Memtable flush**: When `mem` exceeds `write_buffer_size` (default 4 MB), it is sealed as `imm` and a background
-  task writes it to a new L0 SSTable via `TableBuilder`. Prerequisite: wire `Arena::memory_usage()` (via
-  `bumpalo::Bump::allocated_bytes()`) and replace the hardcoded 10 MB arena cap with `Options::write_buffer_size`.
 - [ ] **Background compaction**: Triggered when L0 file count ≥ 4 (slow writes at 8, stop at 12). Selects input files,
   runs a `MergingIterator` over them, drops shadowed versions and obsolete tombstones, and writes output files to L+1.
   Managed in `db/db_impl.cc: BackgroundCompaction`.
