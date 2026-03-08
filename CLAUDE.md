@@ -185,7 +185,7 @@ deferred to post-parity as it is not needed for compaction or the core read path
   handle and opens data blocks on demand. `BlockIter` (renamed from `BlockIterator<'a>`) now owns an `Arc<Vec<u8>>`
   so it can be stored without a lifetime parameter. `InternalIterator` trait in `src/iter.rs` provides the shared
   interface used by `TwoLevelIterator`, `MergingIterator`, and `DbIterator`. See `table/two_level_iterator.h/cc`.
-- [ ] **`MergingIterator`** (`src/db/merge_iter.rs`): N-way merge of sorted iterators using a heap or linear scan
+- [x] **`MergingIterator`** (`src/db/merge_iter.rs`): N-way merge of sorted iterators using a heap or linear scan
   (LevelDB uses linear for small N). See `table/merger.h/cc`.
 - [ ] **`DbIterator`** (`src/db/db_iter.rs`): Wraps `MergingIterator`; applies snapshot sequence-number filtering,
   merges value versions, skips tombstones for the user. Forward-only for now. See `db/db_iter.h/cc`.

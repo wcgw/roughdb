@@ -301,17 +301,34 @@ impl SkipList {
     self.arena.memory_usage()
   }
 
-  /// Return a forward iterator that yields every node's payload in order.
+  /// Return a forward iterator positioned before the first entry.
   ///
-  /// The iterator is lock-free (Acquire loads); it may be called concurrently
-  /// with readers.  Mutation must not occur during iteration — the caller is
-  /// responsible for holding the DB write mutex if needed.
+  /// The caller must invoke `seek_to_first()` or `seek()` before reading
+  /// `key()`/`value()`.  Lock-free (Acquire loads); safe for concurrent reads.
   pub(crate) fn iter(&self) -> SkipListIter<'_> {
-    // SAFETY: `self.head` is always valid for the lifetime of `self`.
-    let first = unsafe { (*self.head).load_next(0) };
     SkipListIter {
-      current: first,
+      head: self.head,
+      list: self as *const SkipList,
+      current: ptr::null(),
       _marker: PhantomData,
+    }
+  }
+
+  /// Find the first node whose payload sorts ≥ `key_data`, returning a raw
+  /// pointer to it (or null if none exists).  Lock-free (Acquire loads).
+  fn find_first_node_at_or_after(&self, key_data: &[u8]) -> *const Node {
+    let mut x = self.head;
+    let mut level = self.max_height() - 1;
+    loop {
+      // SAFETY: same as `find_first_at_or_after`.
+      let next = unsafe { (*x).load_next(level) };
+      if Self::key_after_node(key_data, next) {
+        x = next;
+      } else if level == 0 {
+        return next; // may be null
+      } else {
+        level -= 1;
+      }
     }
   }
 
@@ -583,22 +600,50 @@ unsafe fn alloc_node_raw(arena: &Arena, data_size: usize, height: usize) -> *mut
 
 /// Forward-only iterator over a [`SkipList`].
 ///
-/// Yields raw payload bytes (varint-encoded [`Entry`]) in internal-key order
-/// (user key ASC, sequence DESC).  Lock-free reads via Acquire loads.
+/// Starts in an invalid (unpositioned) state; the caller must invoke
+/// [`seek_to_first`] or [`seek`] before reading [`payload`].
+/// Lock-free reads via Acquire loads.
+///
+/// [`seek_to_first`]: SkipListIter::seek_to_first
+/// [`seek`]: SkipListIter::seek
+/// [`payload`]: SkipListIter::payload
 pub(crate) struct SkipListIter<'a> {
+  /// Sentinel head node of the owning [`SkipList`]; used by [`seek_to_first`].
+  head: *mut Node,
+  /// Pointer to the owning [`SkipList`]; used by [`seek`].
+  list: *const SkipList,
+  /// Current position (`null` when unpositioned or exhausted).
   current: *const Node,
   _marker: PhantomData<&'a SkipList>,
 }
 
-// SAFETY: `SkipListIter` contains a raw pointer that was derived from an
-// `&'a SkipList` and is valid for `'a`.  Sending it across threads is safe for
-// the same reason the arena-allocated nodes are safe to read from any thread.
+// SAFETY: `SkipListIter` contains raw pointers derived from an `&'a SkipList`
+// (valid for `'a`).  Sending it across threads is safe for the same reason
+// the arena-allocated nodes are safe to read from any thread.
 unsafe impl Send for SkipListIter<'_> {}
 unsafe impl Sync for SkipListIter<'_> {}
 
 impl<'a> SkipListIter<'a> {
   pub(crate) fn valid(&self) -> bool {
     !self.current.is_null()
+  }
+
+  /// Position at the first entry.  No-op (leaves iterator invalid) on an
+  /// empty list.
+  pub(crate) fn seek_to_first(&mut self) {
+    // SAFETY: `head` is the sentinel node of the SkipList that created this
+    // iterator; it is valid for `'a`.  Level-0 is always initialised.
+    self.current = unsafe { (*self.head).load_next(0) };
+  }
+
+  /// Position at the first entry whose payload sorts ≥ `key_data`.
+  ///
+  /// `key_data` must be a valid Entry-encoded key (as produced by
+  /// `Entry::write_lookup_to` or `Entry::write_seek_key_to`).
+  pub(crate) fn seek(&mut self, key_data: &[u8]) {
+    // SAFETY: `list` is the SkipList that created this iterator; it is valid
+    // for `'a`.
+    self.current = unsafe { (*self.list).find_first_node_at_or_after(key_data) };
   }
 
   /// Raw payload bytes of the current node.

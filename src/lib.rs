@@ -23,6 +23,7 @@ pub use error::Error;
 pub mod options;
 pub use options::{CompressionType, Options, ReadOptions, Snapshot, WriteOptions};
 pub(crate) mod coding;
+pub(crate) mod db;
 pub(crate) mod iter;
 pub(crate) mod log;
 pub(crate) mod memtable;
@@ -319,8 +320,9 @@ fn write_flush(
   let mut builder = TableBuilder::new(file, opts.block_size, opts.block_restart_interval);
   {
     let mut it = old_mem.iter();
+    it.seek_to_first();
     while it.valid() {
-      builder.add(&it.ikey(), it.value())?;
+      builder.add(it.key(), it.value())?;
       it.advance();
     }
   }

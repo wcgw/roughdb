@@ -117,6 +117,33 @@ impl<'a> Entry<'a> {
     ksize + key.len() + ssize
   }
 
+  /// Byte count of a seek key for `key` with a specific `seq`.
+  ///
+  /// A seek key has the format `[klen: varint][key][seq: varint]` — no vtype
+  /// or value bytes.  Used by `MemTableIterator::seek` to position the
+  /// skip-list iterator at the first entry with `(key, seq)` ordering.
+  pub(crate) fn seek_key_size(key: &[u8], seq: u64) -> usize {
+    let mut tmp = [0u8; 10];
+    let ksize = write_varu64(&mut tmp, key.len() as u64);
+    let ssize = write_varu64(&mut tmp, seq);
+    ksize + key.len() + ssize
+  }
+
+  /// Encode a seek key into `buf` (which must be exactly [`seek_key_size`]
+  /// bytes long).
+  pub(crate) fn write_seek_key_to(buf: &mut [u8], key: &[u8], seq: u64) {
+    let mut kd = [0u8; 10];
+    let ks = write_varu64(&mut kd, key.len() as u64);
+    let mut sd = [0u8; 10];
+    let ss = write_varu64(&mut sd, seq);
+    let mut pos = 0;
+    buf[pos..pos + ks].copy_from_slice(&kd[..ks]);
+    pos += ks;
+    buf[pos..pos + key.len()].copy_from_slice(key);
+    pos += key.len();
+    buf[pos..pos + ss].copy_from_slice(&sd[..ss]);
+  }
+
   /// Encode a lookup key into `buf` (which must be at least
   /// [`lookup_size`] bytes long).  A lookup key encodes only
   /// `[klen | key | seq=MAX]`; it has no value-type or value bytes.

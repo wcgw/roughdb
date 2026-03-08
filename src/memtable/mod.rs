@@ -95,14 +95,14 @@ impl Memtable {
 
   /// Return a forward iterator over all entries in internal-key order.
   ///
-  /// The returned iterator borrows from `self`; no mutation may occur while
-  /// it is live.  During flush the caller holds the DB write mutex, which
-  /// prevents concurrent mutations.
+  /// The returned iterator starts in an invalid (unpositioned) state; the
+  /// caller must invoke `seek_to_first()` or `seek()` before reading entries.
   pub(crate) fn iter(&self) -> MemTableIterator<'_> {
     // SAFETY: SkipList reads are lock-free via acquire/release atomics.
     let table = unsafe { &*self.table.get() };
     MemTableIterator {
       inner: table.iter(),
+      cached_key: Vec::new(),
     }
   }
 
@@ -127,32 +127,62 @@ impl Default for Memtable {
 /// Forward iterator over a [`Memtable`] that emits entries in SSTable internal-key
 /// order (user key ASC, sequence DESC).
 ///
-/// Each step yields:
-/// - `ikey()` — an owned SSTable internal key: `user_key || (seq << 8 | vtype).to_le_bytes()`
-/// - `value()` — the value bytes, or an empty slice for tombstones.
-///
-/// Intended for use by the L0 flush path; the caller must hold the DB write
-/// mutex to prevent concurrent mutations.
+/// Starts unpositioned; call `seek_to_first()` or `seek()` before reading.
+/// Implements [`InternalIterator`] for use with `MergingIterator`.
 pub(crate) struct MemTableIterator<'a> {
   inner: skiplist::SkipListIter<'a>,
+  /// Cached SSTable internal key for the current position.  Cleared when
+  /// the iterator becomes invalid.
+  cached_key: Vec<u8>,
 }
 
 impl<'a> MemTableIterator<'a> {
+  /// Recompute `cached_key` from the current skip-list position.
+  fn update_cached_key(&mut self) {
+    if self.inner.valid() {
+      let e = Entry::from_slice(self.inner.payload());
+      let vtype: u8 = if e.value().is_some() { 1 } else { 0 };
+      self.cached_key = crate::table::format::make_internal_key(e.key(), e.sequence_id(), vtype);
+    } else {
+      self.cached_key.clear();
+    }
+  }
+
   pub(crate) fn valid(&self) -> bool {
     self.inner.valid()
   }
 
-  /// SSTable internal key for the current entry.
-  ///
-  /// Format: `user_key || tag` where `tag = (seq << 8 | vtype as u64).to_le_bytes()`.
+  /// Position at the first entry.
+  pub(crate) fn seek_to_first(&mut self) {
+    self.inner.seek_to_first();
+    self.update_cached_key();
+  }
+
+  /// Position at the first entry whose SSTable internal key is ≥ `target`.
+  pub(crate) fn seek(&mut self, target: &[u8]) {
+    if let Some((user_key, seq, _)) = crate::table::format::parse_internal_key(target) {
+      let size = Entry::seek_key_size(user_key, seq);
+      let mut buf = vec![0u8; size];
+      Entry::write_seek_key_to(&mut buf, user_key, seq);
+      self.inner.seek(&buf);
+    }
+    self.update_cached_key();
+  }
+
+  /// SSTable internal key for the current entry (owned).
   pub(crate) fn ikey(&self) -> Vec<u8> {
-    let e = Entry::from_slice(self.inner.payload());
-    let vtype: u8 = if e.value().is_some() { 1 } else { 0 };
-    crate::table::format::make_internal_key(e.key(), e.sequence_id(), vtype)
+    self.cached_key.clone()
+  }
+
+  /// Current SSTable internal key as a slice.
+  pub(crate) fn key(&self) -> &[u8] {
+    debug_assert!(self.valid());
+    &self.cached_key
   }
 
   /// Value bytes for the current entry; empty slice for tombstones.
-  pub(crate) fn value(&self) -> &'a [u8] {
+  pub(crate) fn value(&self) -> &[u8] {
+    debug_assert!(self.valid());
     Entry::from_slice(self.inner.payload())
       .value()
       .unwrap_or(&[])
@@ -160,7 +190,39 @@ impl<'a> MemTableIterator<'a> {
 
   /// Advance to the next entry.
   pub(crate) fn advance(&mut self) {
+    debug_assert!(self.valid());
     self.inner.advance();
+    self.update_cached_key();
+  }
+}
+
+impl crate::iter::InternalIterator for MemTableIterator<'_> {
+  fn valid(&self) -> bool {
+    self.inner.valid()
+  }
+
+  fn seek_to_first(&mut self) {
+    self.seek_to_first();
+  }
+
+  fn seek(&mut self, target: &[u8]) {
+    self.seek(target);
+  }
+
+  fn next(&mut self) {
+    self.advance();
+  }
+
+  fn key(&self) -> &[u8] {
+    self.key()
+  }
+
+  fn value(&self) -> &[u8] {
+    self.value()
+  }
+
+  fn status(&self) -> Option<&crate::error::Error> {
+    None
   }
 }
 
@@ -247,6 +309,7 @@ mod tests {
     let mem = Memtable::new();
     mem.add(7, b"key", b"val");
     let mut it = mem.iter();
+    it.seek_to_first();
     assert!(it.valid());
     let ikey = it.ikey();
     let (uk, seq, vtype) = parse_internal_key(&ikey).unwrap();
@@ -263,6 +326,7 @@ mod tests {
     let mem = Memtable::new();
     mem.delete(3, b"gone");
     let mut it = mem.iter();
+    it.seek_to_first();
     assert!(it.valid());
     let ikey = it.ikey();
     let (uk, seq, vtype) = parse_internal_key(&ikey).unwrap();
@@ -284,6 +348,7 @@ mod tests {
     mem.add(4, b"c", b"C4");
 
     let mut it = mem.iter();
+    it.seek_to_first();
     let mut keys: Vec<(Vec<u8>, u64)> = Vec::new();
     while it.valid() {
       let ikey = it.ikey();
