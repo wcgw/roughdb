@@ -174,91 +174,75 @@ disk on in-memory misses. Mirrors the approach taken in Phase 2, where the WAL w
   `LookupResult::{Value, Deleted, NotInTable}` lets tombstones stop the search without continuing to older files.
   No multi-level routing yet — deferred to Phase 9.
 
-### Phase 4 — Bloom filters
-
-*Used by the SSTable filter block to avoid unnecessary block reads. Can be implemented alongside Phase 3.*
-
-- [ ] **`BloomFilter`** (`src/filter/bloom.rs`): Kirsch-Mitzenmacher double-hashing; `k = round(0.69 * bits_per_key)`
-  hash functions; one filter per ~2 KB of data blocks stored in the SSTable filter block. See `util/bloom.cc` and
-  `include/leveldb/filter_policy.h`.
-- [ ] **`FilterPolicy` trait**: Abstract interface so users can supply custom filters.
-
-### Phase 5 — Block cache
-
-*Required by the `Table` reader to cache hot blocks in memory.*
-
-- [ ] **`LruCache`** (`src/cache/lru.rs`): Sharded LRU with two lists per shard (in-use / evictable), custom deleters,
-  capacity-based eviction. Reference-counted handles prevent eviction of live entries. See `util/cache.cc` and
-  `include/leveldb/cache.h`.
-- [ ] Default capacity: 8 MB. Each shard is mutex-protected independently.
-
-### Phase 6 — Iterators
+### Phase 4 — Iterators
 
 *Required by `Db::NewIterator` and internally by compaction. Forward `SkipList` iteration, `MemTableIterator`, and
-`BlockIterator` were pulled into Phase 3 for the L0 flush; this phase completes the iterator stack.*
+`BlockIterator` were pulled into Phase 3; this phase completes the forward iterator stack. Backward iteration is
+deferred to post-parity as it is not needed for compaction or the core read path.*
 
-- [ ] **`SkipList::iter()` backward**: Add backward iteration (forward already implemented in Phase 3).
-- [ ] **`MemTableIterator` backward**: Extend the Phase 3 forward iterator with backward seek/prev support.
 - [ ] **`TwoLevelIterator`** (`src/table/two_level_iterator.rs`): Composes an index iterator and a block-opener
   function, yielding a transparent view over all blocks in an SSTable. See `table/two_level_iterator.h/cc`.
 - [ ] **`MergingIterator`** (`src/db/merge_iter.rs`): N-way merge of sorted iterators using a heap or linear scan
   (LevelDB uses linear for small N). See `table/merger.h/cc`.
 - [ ] **`DbIterator`** (`src/db/db_iter.rs`): Wraps `MergingIterator`; applies snapshot sequence-number filtering,
-  merges value versions, skips tombstones for the user. See `db/db_iter.h/cc`.
+  merges value versions, skips tombstones for the user. Forward-only for now. See `db/db_iter.h/cc`.
 
-### Phase 7 — Version management
+### Phase 5 — Version management
 
-*Tracks the set of live SSTable files and enables safe concurrent reads during compaction.*
+*Tracks the set of live SSTable files across levels, enables MANIFEST-based recovery, and gates compaction. Open
+`Table` handles are stored as `Arc<Table>` directly in `FileMetaData` — no LRU table cache needed for correctness;
+that is a post-parity optimisation.*
 
-- [ ] **`FileMetaData`**: File number, size, smallest/largest `InternalKey`. See `db/version_edit.h`.
-- [ ] **`VersionEdit`** (`src/db/version_edit.rs`): Atomic delta describing a state change — files added/removed per
-  level, log number, next sequence, compact pointers. Serialised to the MANIFEST. See `db/version_edit.h/cc`.
-- [ ] **`Version`** (`src/db/version.rs`): Snapshot of the LSM structure — per-level list of `FileMetaData`.
+- [ ] **`FileMetaData`**: File number, size, smallest/largest `InternalKey`, `Arc<Table>` for the open reader.
+  See `db/version_edit.h`.
+- [ ] **`VersionEdit`** (`src/db/version_edit.rs`): Atomic delta — files added/removed per level, log number, next
+  sequence, compact pointers. Serialised to the MANIFEST. See `db/version_edit.h/cc`.
+- [ ] **`Version`** (`src/db/version.rs`): Snapshot of the LSM structure — per-level `Vec<Arc<FileMetaData>>`.
   Reference-counted; lives until all iterators opened on it are dropped. See `db/version_set.h/cc`.
 - [ ] **`VersionSet`** (`src/db/version_set.rs`): Maintains the linked list of `Version`s, the current version, the
-  MANIFEST log, and compact-pointer state. Applies `VersionEdit`s to produce new versions. See `db/version_set.h/cc`.
+  MANIFEST log, and compact-pointer state. Applies `VersionEdit`s atomically. See `db/version_set.h/cc`.
 
-### Phase 8 — Table cache
+### Phase 6 — Full database
 
-*Caches open `Table` file handles to avoid repeated file opens and footer parses.*
+*Ties all prior phases into a working, persistent, crash-safe database with multi-level compaction.*
 
-- [ ] **`TableCache`** (`src/db/table_cache.rs`): LRU of `(file_number → Table)` entries. Also the entry point for
-  creating SSTable iterators during reads and compaction. See `db/table_cache.h/cc`.
-
-### Phase 9 — Full database
-
-*Ties all prior phases into a working, persistent, crash-safe database.*
-
-- [ ] **`Db::Open`** (full): Upgrade from the Phase 3 single-log open to full MANIFEST-driven recovery: replays the
-  WAL from the sequence number in the MANIFEST, rebuilds the `VersionSet`, and re-opens all live SSTable files. The
-  Phase 3 flat `Vec<Table>` is replaced by proper level routing through `VersionSet`. See `db/db_impl.cc: DBImpl::Recover`.
+- [ ] **`Db::Open`** (full): MANIFEST-driven recovery; replays the WAL from the sequence in the MANIFEST, rebuilds
+  `VersionSet`, re-opens all live SSTable files. Replaces the Phase 3 flat `Vec<Table>` with proper level routing.
+  Rotates the WAL after each memtable flush (truncates old log). See `db/db_impl.cc: DBImpl::Recover`.
 - [ ] **`Db::Write`** (batch-grouped): Multiple concurrent writers are grouped; only the leader writes to the WAL and
   inserts into the memtable. See `db/db_impl.cc: DBImpl::Write`.
-- [ ] **Background compaction**: Triggered when L0 file count ≥ 4 (slow writes at 8, stop at 12). Selects input files,
-  runs a `MergingIterator` over them, drops shadowed versions and obsolete tombstones, and writes output files to L+1.
+- [ ] **Background compaction**: Triggered when L0 file count ≥ 4 (slow writes at 8, stop at 12). Selects input
+  files, runs a `MergingIterator`, drops shadowed versions and obsolete tombstones, writes output files to L+1.
   Managed in `db/db_impl.cc: BackgroundCompaction`.
-- [ ] **`Db::NewIterator`**: Returns a `DbIterator` over a merged view of mem + imm + all version files, pinned to the
-  current sequence.
-- [ ] **`Db::GetSnapshot` / `ReleaseSnapshot`**: Snapshots are sequence numbers stored in a doubly-linked list; they
-  prevent compaction from dropping key versions still visible to a snapshot.
+- [ ] **`Db::NewIterator`**: Returns a `DbIterator` over a merged view of mem + imm + all version files, pinned to
+  the current sequence number.
+- [ ] **`Db::GetSnapshot` / `ReleaseSnapshot`**: Snapshots are sequence numbers in a doubly-linked list; they
+  prevent compaction from dropping versions still visible to a live snapshot.
 - [ ] **`Db::CompactRange`**: Manual compaction of a user-specified key range.
 
 ---
 
 ### Post-parity improvements
 
-*Optional enhancements to consider once RoughDB is fully on par with LevelDB's feature set. None are prerequisites for
+*Optimisations and secondary features to add once RoughDB has a fully functional database. None are prerequisites for
 the phases above.*
 
+- **Bloom filters**: Kirsch-Mitzenmacher double-hashing; `k = round(0.69 * bits_per_key)` hash functions; one filter
+  per ~2 KB of data blocks stored in the SSTable filter block. Avoids unnecessary block reads for missing keys.
+  See `util/bloom.cc` and `include/leveldb/filter_policy.h`. A `FilterPolicy` trait allows custom filters.
+- **Block cache**: Sharded LRU (`src/cache/lru.rs`) with two lists per shard (in-use / evictable), custom deleters,
+  capacity-based eviction. Default 8 MB. Required by `Table` reader to cache hot blocks. See `util/cache.cc`.
+- **Table cache**: LRU of `(file_number → Table)` entries replacing the `Arc<Table>` in `FileMetaData`. Bounds open
+  file descriptors and avoids repeated footer parses. See `db/table_cache.h/cc`.
+- **Backward iteration**: `SkipList::iter()` reverse, `MemTableIterator` backward, `DbIterator` backward seek/prev.
+  Required for `Db::NewIterator` to support full bidirectional scans.
 - **`Db::flush_wal(sync: bool)` / `Db::sync_wal()`**: RocksDB-style explicit WAL flush. `flush_wal` pushes buffered
-  data from the `BufWriter` to the OS page cache; passing `sync = true` also `fsync`s. `sync_wal` `fsync`s without
-  flushing (assumes the caller already flushed). Useful for amortising `fsync` cost over many `sync=false` writes —
-  write a batch with `sync=false` then call `flush_wal(true)` once to make the whole group durable. Matches
-  `DB::FlushWAL` / `DB::SyncWAL` in `include/rocksdb/db.h`. Currently `Db::drop` relies on `BufWriter`'s implicit
-  flush-on-drop, which silences I/O errors; an explicit `flush_wal` would give callers a chance to handle them.
+  data from the `BufWriter` to the OS page cache; `sync = true` also `fsync`s. Useful for amortising `fsync` cost
+  over many `sync=false` writes. Currently `Db::drop` relies on `BufWriter`'s implicit flush-on-drop, which silences
+  I/O errors. See `DB::FlushWAL` / `DB::SyncWAL` in `include/rocksdb/db.h`.
 - **WAL file recycling** (RocksDB): Reuse old log files from a pool rather than deleting and recreating them, avoiding
   inode churn on slow filesystems. Uses a 12-byte header (standard 7 bytes + `log_number: u32`) so the reader can
-  distinguish recycled files from freshly created ones. See `db/log_writer.cc` in RocksDB.
+  distinguish recycled files. See `db/log_writer.cc` in RocksDB.
 - **Ribbon filters** (RocksDB): Drop-in replacement for Bloom filters offering the same false-positive rate in ~30%
   fewer bits. See `util/ribbon_impl.h` in RocksDB.
 
