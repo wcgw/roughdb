@@ -18,7 +18,6 @@ use arena::Arena;
 use entry::Entry;
 use skiplist::SkipList;
 use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug, PartialEq)]
 pub enum MemtableResult<T> {
@@ -44,7 +43,6 @@ impl<T> MemtableResult<T> {
 
 pub struct Memtable {
   table: UnsafeCell<SkipList>,
-  sequence: AtomicU64,
 }
 
 // SAFETY: all mutations are serialised by the DB-level write mutex in `Db`;
@@ -53,16 +51,10 @@ unsafe impl Sync for Memtable {}
 
 impl Memtable {
   pub fn new() -> Self {
-    Self {
-      table: UnsafeCell::new(SkipList::new(Arena::default())),
-      sequence: AtomicU64::default(),
-    }
+    Self { table: UnsafeCell::new(SkipList::new(Arena::default())) }
   }
 
-  pub fn add<K: AsRef<[u8]>, V: AsRef<[u8]>>(&self, key: K, value: V) {
-    let key = key.as_ref();
-    let value = value.as_ref();
-    let seq = self.next_seq();
+  pub fn add(&self, seq: u64, key: &[u8], value: &[u8]) {
     let size = Entry::encoded_value_size(seq, key, value);
     // SAFETY: caller holds the DB write mutex, serialising all mutations.
     let table = unsafe { &mut *self.table.get() };
@@ -92,16 +84,11 @@ impl Memtable {
     }
   }
 
-  pub fn delete(&self, key: &[u8]) {
-    let seq = self.next_seq();
+  pub fn delete(&self, seq: u64, key: &[u8]) {
     let size = Entry::encoded_deletion_size(seq, key);
     // SAFETY: caller holds the DB write mutex, serialising all mutations.
     let table = unsafe { &mut *self.table.get() };
     table.alloc_and_insert(size, |buf| Entry::write_deletion_to(buf, seq, key));
-  }
-
-  fn next_seq(&self) -> u64 {
-    self.sequence.fetch_add(1, Ordering::Relaxed)
   }
 }
 
@@ -125,23 +112,23 @@ mod tests {
   #[test]
   fn insert_get() {
     let table = Memtable::new();
-    table.add(b"foo", b"bar");
+    table.add(0, b"foo", b"bar");
     assert_eq!(b"bar", table.get(b"foo").unwrap_value().as_slice());
   }
 
   #[test]
   fn replace_get() {
     let table = Memtable::new();
-    table.add(b"foo", b"foo");
+    table.add(0, b"foo", b"foo");
     assert_eq!(b"foo", table.get(b"foo").unwrap_value().as_slice());
-    table.add(b"foo", b"bar");
+    table.add(1, b"foo", b"bar");
     assert_eq!(b"bar", table.get(b"foo").unwrap_value().as_slice());
   }
 
   #[test]
   fn miss_get() {
     let table = Memtable::new();
-    table.add(b"foo", b"bar");
+    table.add(0, b"foo", b"bar");
     assert_eq!(table.get(b"bar"), MemtableResult::Miss);
   }
 
@@ -154,8 +141,8 @@ mod tests {
   #[test]
   fn hit_deleted() {
     let table = Memtable::new();
-    table.add(b"foo", b"bar");
-    table.delete(b"foo");
+    table.add(0, b"foo", b"bar");
+    table.delete(1, b"foo");
     assert_eq!(table.get(b"foo"), MemtableResult::Deleted);
   }
 
@@ -164,17 +151,17 @@ mod tests {
     let table = Memtable::new();
     {
       let foo = String::from("foo");
-      table.add(foo.as_bytes(), foo.as_bytes());
+      table.add(0, foo.as_bytes(), foo.as_bytes());
       let value = table.get(b"foo").unwrap_value();
       assert_eq!("foo", from_utf8(value.as_ref()).unwrap());
     }
     {
       let sparkle_heart = String::from("💖");
-      table.add(b"foo", sparkle_heart.as_bytes());
+      table.add(1, b"foo", sparkle_heart.as_bytes());
     }
     let value = table.get(b"foo").unwrap_value();
     assert_eq!("💖", from_utf8(value.as_ref()).unwrap());
-    table.delete(b"foo");
+    table.delete(2, b"foo");
     assert_eq!(3, unsafe { &*table.table.get() }.len());
   }
 }

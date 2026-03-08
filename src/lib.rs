@@ -22,12 +22,18 @@ pub(crate) mod memtable;
 pub mod write_batch;
 pub use write_batch::{Handler, WriteBatch};
 
-#[derive(Default)]
 pub struct Db {
-  write_lock: Mutex<()>,
+  // Mutex payload is `last_sequence`; guards all SkipList mutations.
+  write_lock: Mutex<u64>,
   mem: Memtable,
   imm: Option<Memtable>,
   // disk: ,
+}
+
+impl Default for Db {
+  fn default() -> Self {
+    Self { write_lock: Mutex::new(0), mem: Memtable::default(), imm: None }
+  }
 }
 
 impl Db {
@@ -75,19 +81,27 @@ impl Db {
   }
 
   pub fn write(&self, batch: &WriteBatch) -> Result<(), Error> {
-    struct Inserter<'a>(&'a Memtable);
+    struct Inserter<'a> {
+      mem: &'a Memtable,
+      seq: u64,
+    }
     impl Handler for Inserter<'_> {
       fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), Error> {
-        self.0.add(key, value);
+        self.mem.add(self.seq, key, value);
+        self.seq += 1;
         Ok(())
       }
       fn delete(&mut self, key: &[u8]) -> Result<(), Error> {
-        self.0.delete(key);
+        self.mem.delete(self.seq, key);
+        self.seq += 1;
         Ok(())
       }
     }
-    let _guard = self.write_lock.lock().unwrap();
-    batch.iterate(&mut Inserter(&self.mem))
+    let mut last_seq = self.write_lock.lock().unwrap();
+    let start_seq = *last_seq + 1;
+    batch.iterate(&mut Inserter { mem: &self.mem, seq: start_seq })?;
+    *last_seq += batch.count() as u64;
+    Ok(())
   }
 }
 
