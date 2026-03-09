@@ -37,6 +37,7 @@ impl WriteBatch {
   }
 
   pub fn put(&mut self, key: &[u8], value: &[u8]) {
+    self.rep.reserve(key.len() + value.len() + 21);
     self.rep.push(TAG_VALUE);
     let mut tmp = [0u8; 10];
     let n = write_varu64(&mut tmp, key.len() as u64);
@@ -49,6 +50,7 @@ impl WriteBatch {
   }
 
   pub fn delete(&mut self, key: &[u8]) {
+    self.rep.reserve(key.len() + 11);
     self.rep.push(TAG_DELETE);
     let mut tmp = [0u8; 10];
     let n = write_varu64(&mut tmp, key.len() as u64);
