@@ -293,6 +293,12 @@ what remains is compaction, the full Iterator/Snapshot API, and operational hygi
 
 **Compression**
 
+- [ ] **Bloom filters**: Kirsch-Mitzenmacher double-hashing; `k = round(0.69 * bits_per_key)` hash functions; one filter
+  per ~2 KB of data blocks stored in the SSTable filter block. The filter block is written uncompressed and read at
+  `Table::open`; `Table::get` checks it after the index-block lookup and before reading or decompressing any data
+  block, so a definite-negative skips all I/O and decompression entirely. A `FilterPolicy` trait allows custom
+  filters. `Options::filter_policy` wires the chosen policy into flush and compaction.
+  See `util/bloom.cc` and `include/leveldb/filter_policy.h`.
 - [ ] **Block compression**: Wire `Options::compression` and `Options::zstd_compression_level` through `TableBuilder`
   and `Table`.  Currently all blocks are written with type `0x00` (NoCompression) and the reader rejects any other
   type; both fields are silently ignored.  Required changes:
@@ -335,9 +341,6 @@ the phases above.*
 - **Batch-grouped writes**: Multiple concurrent `Db::write` callers are grouped by a leader that writes a single
   combined WAL record and memtable batch, amortising `fsync` cost over many writers. Transparent to callers; the
   current single-writer-at-a-time path is correct. See `db/db_impl.cc: DBImpl::Write`.
-- **Bloom filters**: Kirsch-Mitzenmacher double-hashing; `k = round(0.69 * bits_per_key)` hash functions; one filter
-  per ~2 KB of data blocks stored in the SSTable filter block. Avoids unnecessary block reads for missing keys.
-  See `util/bloom.cc` and `include/leveldb/filter_policy.h`. A `FilterPolicy` trait allows custom filters.
 - **Block cache**: Sharded LRU (`src/cache/lru.rs`) with two lists per shard (in-use / evictable), custom deleters,
   capacity-based eviction. Default 8 MB. Required by `Table` reader to cache hot blocks. See `util/cache.cc`.
 - **`ReadOptions::fill_cache`**: Currently ignored — no block cache exists. Once the block cache is implemented,
