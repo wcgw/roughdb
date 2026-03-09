@@ -459,11 +459,8 @@ impl Db {
 
     let (version_set, mem, last_sequence) = if db_exists {
       // ── Existing database: MANIFEST-driven recovery ──────────────────────
-      let mut vs = VersionSet::recover(
-        path,
-        options.paranoid_checks,
-        options.filter_policy.as_ref(),
-      )?;
+      let mut vs =
+        VersionSet::recover(path, options.paranoid_checks, options.filter_policy.clone())?;
       let manifest_last_seq = vs.last_sequence();
       let mem = Arc::new(Memtable::default());
 
@@ -957,7 +954,7 @@ fn write_flush(prep: FlushPrep, opts: &Options) -> Result<FlushResult, Error> {
   let table = Arc::new(Table::open(
     read_file,
     file_size,
-    opts.filter_policy.as_ref(),
+    opts.filter_policy.clone(),
   )?);
   Ok(FlushResult {
     file_number: sst_number,
@@ -1103,7 +1100,7 @@ fn finish_compaction_output(
   cur: CompactionOutputFile,
   largest: Vec<u8>,
   outputs: &mut Vec<CompactionOutput>,
-  filter_policy: Option<&Arc<dyn crate::filter::FilterPolicy>>,
+  filter_policy: Option<Arc<dyn crate::filter::FilterPolicy>>,
 ) -> Result<(), Error> {
   let file_size = cur.builder.finish()?;
   let read_file = std::fs::File::open(&cur.path)?;
@@ -1202,7 +1199,7 @@ fn do_compaction(
             finished,
             std::mem::take(&mut current_largest),
             &mut outputs,
-            opts.filter_policy.as_ref(),
+            opts.filter_policy.clone(),
           )?;
         }
       }
@@ -1244,7 +1241,7 @@ fn do_compaction(
       cur,
       current_largest,
       &mut outputs,
-      opts.filter_policy.as_ref(),
+      opts.filter_policy.clone(),
     )?;
   }
 

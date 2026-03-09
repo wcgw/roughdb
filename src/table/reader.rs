@@ -59,7 +59,7 @@ impl Table {
   pub(crate) fn open(
     file: File,
     file_size: u64,
-    filter_policy: Option<&Arc<dyn FilterPolicy>>,
+    filter_policy: Option<Arc<dyn FilterPolicy>>,
   ) -> Result<Self, Error> {
     if file_size < FOOTER_ENCODED_LENGTH as u64 {
       return Err(Error::Corruption("SSTable file too small".to_owned()));
@@ -203,7 +203,7 @@ impl Table {
 fn read_filter_block(
   file: &File,
   metaindex_handle: &BlockHandle,
-  policy: &Arc<dyn FilterPolicy>,
+  policy: Arc<dyn FilterPolicy>,
 ) -> Result<Option<FilterBlockReader>, Error> {
   // Read the metaindex block (always uncompressed; checksums not required here).
   let meta_contents = read_block(file, metaindex_handle, false)?;
@@ -227,10 +227,7 @@ fn read_filter_block(
   let filter_contents = read_block(file, &filter_handle, false)?;
 
   // Parse and return the FilterBlockReader.
-  Ok(FilterBlockReader::new(
-    Arc::clone(policy),
-    filter_contents.data,
-  ))
+  Ok(FilterBlockReader::new(policy, filter_contents.data))
 }
 
 #[cfg(test)]

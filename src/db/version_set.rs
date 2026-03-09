@@ -105,7 +105,7 @@ impl VersionSet {
   pub(crate) fn recover(
     path: &Path,
     paranoid_checks: bool,
-    filter_policy: Option<&Arc<dyn FilterPolicy>>,
+    filter_policy: Option<Arc<dyn FilterPolicy>>,
   ) -> Result<Self, Error> {
     let manifest_name = read_current_file(path)?;
     let manifest_path = path.join(&manifest_name);
@@ -298,7 +298,7 @@ impl Builder {
   fn build(
     self,
     path: &Path,
-    filter_policy: Option<&Arc<dyn FilterPolicy>>,
+    filter_policy: Option<Arc<dyn FilterPolicy>>,
   ) -> Result<Version, Error> {
     let mut files: [Vec<Arc<FileMetaData>>; 7] = std::array::from_fn(|_| Vec::new());
 
@@ -322,7 +322,7 @@ impl Builder {
         let file = File::open(&sst_path).map_err(|e| {
           Error::Corruption(format!("cannot open SSTable {:06}.ldb: {e}", meta.number))
         })?;
-        let table = Arc::new(Table::open(file, meta.file_size, filter_policy)?);
+        let table = Arc::new(Table::open(file, meta.file_size, filter_policy.clone())?);
         files[level].push(FileMetaData::with_table(
           meta.number,
           meta.file_size,
