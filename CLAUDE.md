@@ -242,8 +242,12 @@ what remains is compaction, the full Iterator/Snapshot API, and operational hygi
   throttle: sleeps 1 ms per iteration when L0 ≥ `L0_SLOWDOWN_WRITES_TRIGGER` (8). No background thread — runs
   synchronously on the writing goroutine. `compact_pointer` round-robin not implemented (all L0 files always
   selected). See `db/db_impl.cc: DBImpl::BackgroundCompaction`, `DoCompactionWork`, `MakeRoomForWrite`.
-- [ ] **`Db::CompactRange(begin, end)`**: Manual compaction of a user key range across all levels. Overlapping
-  files are compacted into the deepest level that contains them. See `db/db_impl.cc: DBImpl::CompactRange`.
+- [x] **`Db::compact_range(begin, end)`**: Manual compaction of a user-key range (`Option<&[u8]>` for open bounds).
+  Finds the deepest level with files overlapping `[begin, end]`, then calls `compact_level_range` for each level
+  from 0 to `max_level - 1`.  Each call uses the three-phase lock protocol; newly compacted files are visible to
+  subsequent levels' compactions via a fresh version snapshot.  `pick_range_compaction` selects files at `level`
+  that overlap `[begin, end]` plus next-level files that overlap the union range; reuses `do_compaction` and
+  `install_compaction`.  No-op on in-memory databases.  See `db/db_impl.cc: DBImpl::CompactRange`.
 
 **Iterator and snapshot API** *(all required by `include/leveldb/db.h`)*
 

@@ -417,6 +417,61 @@ impl Db {
     Ok(DbIter { inner })
   }
 
+  /// Compact all SSTable files that overlap `[begin, end]` (user-key range)
+  /// down toward the deepest level, matching LevelDB's `CompactRange`.
+  ///
+  /// Both bounds are inclusive and optional (`None` means "no bound").
+  ///
+  /// The compaction is synchronous and runs level-by-level from L0 to the
+  /// deepest level that currently has overlapping files.  After each level's
+  /// compaction the updated version is used for the next level, so newly
+  /// created files are eligible for further compaction in the same call.
+  ///
+  /// No-op for in-memory databases (`Db::default()`).
+  pub fn compact_range(&self, begin: Option<&[u8]>, end: Option<&[u8]>) -> Result<(), Error> {
+    use crate::db::version::NUM_LEVELS;
+
+    let path = match &self.path {
+      Some(p) => p.clone(),
+      None => return Ok(()),
+    };
+
+    // Find the deepest level that currently has files overlapping [begin, end].
+    let max_level = {
+      let g = self.state.lock().unwrap();
+      let vs = match &g.version_set {
+        Some(vs) => vs,
+        None => return Ok(()),
+      };
+      let version = vs.current();
+      let mut max = 0usize;
+      for level in 0..NUM_LEVELS {
+        let has = version.files[level].iter().any(|m| {
+          file_overlaps_range(
+            ikey_user_key(&m.smallest),
+            ikey_user_key(&m.largest),
+            begin,
+            end,
+          )
+        });
+        if has {
+          max = level;
+        }
+      }
+      max
+    };
+
+    // Compact every level from 0 up to (but not including) max_level, pushing
+    // data toward max_level.  If max_level is already the deepest level (6),
+    // cap at NUM_LEVELS-1 since there is no level above it to compact into.
+    let stop = max_level.min(NUM_LEVELS - 1);
+    for level in 0..stop {
+      compact_level_range(&path, &self.state, &self.options, level, begin, end)?;
+    }
+
+    Ok(())
+  }
+
   pub fn write(&self, opts: &WriteOptions, batch: &WriteBatch) -> Result<(), Error> {
     let mut state = self.state.lock().unwrap();
     let start_seq = state.last_sequence + 1;
@@ -714,28 +769,30 @@ fn finish_compaction_output(
   Ok(())
 }
 
-/// Phase 2 (no lock): merge input files, apply pruning, write L1 output SSTables.
+/// Phase 2 (no lock): merge input files, apply pruning, write output SSTables.
 ///
 /// Shadow-key pruning: for each user key, only the first (newest) version
 /// encountered in the merge order is kept.
 /// Tombstone elision: a deletion marker is dropped when there is provably no
-/// data for that key at L2+ (from_level=2 for L0→L1 compaction).
+/// data for that key at levels > `output_level`.
+///
+/// `inputs` should be ordered so that newer files (by file number) appear
+/// before older ones for the same level, allowing `MergingIterator` to resolve
+/// same-key ties in favour of the newer version via the lower child index.
 fn do_compaction(
   path: &std::path::Path,
   state: &Mutex<DbState>,
   version: &Arc<crate::db::version::Version>,
-  l0_inputs: &[Arc<FileMetaData>],
-  l1_inputs: &[Arc<FileMetaData>],
+  inputs: &[Arc<FileMetaData>],
   last_sequence: u64,
+  output_level: usize,
   opts: &Options,
 ) -> Result<Vec<CompactionOutput>, Error> {
   use crate::db::merge_iter::MergingIterator;
   use crate::iter::InternalIterator;
 
-  // Build children: L0 files first (newest-first, so lower-indexed children
-  // win ties in MergingIterator), then L1 files.
   let mut children: Vec<Box<dyn InternalIterator>> = Vec::new();
-  for meta in l0_inputs.iter().chain(l1_inputs.iter()) {
+  for meta in inputs {
     let table = meta
       .table
       .as_ref()
@@ -777,7 +834,7 @@ fn do_compaction(
     let drop = if last_sequence_for_key <= last_sequence {
       // Shadowed by a newer version that was already written to output.
       true
-    } else if vtype == 0 && seq <= last_sequence && is_base_level(version, uk, 2) {
+    } else if vtype == 0 && seq <= last_sequence && is_base_level(version, uk, output_level + 1) {
       // Tombstone with no data below the output level — safe to elide.
       true
     } else {
@@ -831,22 +888,22 @@ fn do_compaction(
 
 /// Phase 3 (under lock): record deleted input files and new output files in a
 /// single `VersionEdit`, then call `log_and_apply`.
+///
+/// `deleted` is a list of `(level, file_number)` pairs for all input files.
+/// `output_level` is the level the output SSTables are placed at.
 fn install_compaction(
   state: &mut DbState,
-  l0_inputs: &[Arc<FileMetaData>],
-  l1_inputs: &[Arc<FileMetaData>],
+  deleted: &[(i32, u64)],
   outputs: Vec<CompactionOutput>,
+  output_level: i32,
 ) -> Result<(), Error> {
   let vs = state
     .version_set
     .as_mut()
     .expect("install_compaction: no VersionSet");
   let mut edit = VersionEdit::new();
-  for meta in l0_inputs {
-    edit.deleted_files.push((0, meta.number));
-  }
-  for meta in l1_inputs {
-    edit.deleted_files.push((1, meta.number));
+  for &(level, number) in deleted {
+    edit.deleted_files.push((level, number));
   }
   for out in outputs {
     let meta = FileMetaData::with_table(
@@ -856,11 +913,139 @@ fn install_compaction(
       out.largest,
       out.table,
     );
-    edit.new_files.push((1, meta));
+    edit.new_files.push((output_level, meta));
   }
   vs.set_last_sequence(state.last_sequence);
   vs.log_and_apply(&mut edit)?;
   Ok(())
+}
+
+/// True if a file whose user-key range is `[file_small, file_large]` overlaps
+/// the user-key range `[begin, end]` (either bound may be `None` = open).
+fn file_overlaps_range(
+  file_small: &[u8],
+  file_large: &[u8],
+  begin: Option<&[u8]>,
+  end: Option<&[u8]>,
+) -> bool {
+  begin.is_none_or(|b| file_large >= b) && end.is_none_or(|e| file_small <= e)
+}
+
+/// Select files for a range-based compaction of `level` → `level + 1`.
+///
+/// Returns `(level_inputs, next_level_inputs)` for files at `level` that
+/// overlap `[begin, end]` and the `level+1` files that overlap their union
+/// range.  Returns `None` if there is nothing to compact.
+fn pick_range_compaction(
+  version: &crate::db::version::Version,
+  level: usize,
+  begin: Option<&[u8]>,
+  end: Option<&[u8]>,
+) -> Option<CompactionInputs> {
+  use crate::db::version::NUM_LEVELS;
+
+  if level + 1 >= NUM_LEVELS {
+    return None;
+  }
+
+  let level_inputs: Vec<Arc<FileMetaData>> = version.files[level]
+    .iter()
+    .filter(|m| {
+      file_overlaps_range(
+        ikey_user_key(&m.smallest),
+        ikey_user_key(&m.largest),
+        begin,
+        end,
+      )
+    })
+    .cloned()
+    .collect();
+
+  if level_inputs.is_empty() {
+    return None;
+  }
+
+  // Union user-key range of the selected level files.
+  let range_small = level_inputs
+    .iter()
+    .min_by_key(|m| ikey_user_key(&m.smallest))
+    .unwrap()
+    .smallest
+    .clone();
+  let range_large = level_inputs
+    .iter()
+    .max_by_key(|m| ikey_user_key(&m.largest))
+    .unwrap()
+    .largest
+    .clone();
+
+  let next_inputs: Vec<Arc<FileMetaData>> = version.files[level + 1]
+    .iter()
+    .filter(|m| key_ranges_overlap(&m.smallest, &m.largest, &range_small, &range_large))
+    .cloned()
+    .collect();
+
+  Some((level_inputs, next_inputs))
+}
+
+/// Run a single-level range compaction (`level` → `level + 1`) synchronously.
+///
+/// Uses the same three-phase lock protocol as `maybe_compact`.
+/// Returns `Ok(true)` if a compaction ran, `Ok(false)` if nothing to compact.
+fn compact_level_range(
+  path: &std::path::Path,
+  state: &Mutex<DbState>,
+  opts: &Options,
+  level: usize,
+  begin: Option<&[u8]>,
+  end: Option<&[u8]>,
+) -> Result<bool, Error> {
+  // Phase 1: snapshot.
+  let (version, last_sequence) = {
+    let g = state.lock().unwrap();
+    let vs = match &g.version_set {
+      Some(vs) => vs,
+      None => return Ok(false),
+    };
+    (vs.current(), g.last_sequence)
+  };
+
+  let (level_inputs, next_inputs) = match pick_range_compaction(&version, level, begin, end) {
+    Some(p) => p,
+    None => return Ok(false),
+  };
+
+  let output_level = level + 1;
+  let inputs: Vec<Arc<FileMetaData>> = level_inputs
+    .iter()
+    .chain(next_inputs.iter())
+    .cloned()
+    .collect();
+  let deleted: Vec<(i32, u64)> = level_inputs
+    .iter()
+    .map(|m| (level as i32, m.number))
+    .chain(next_inputs.iter().map(|m| (output_level as i32, m.number)))
+    .collect();
+
+  // Phase 2: I/O (no lock).
+  let outputs = do_compaction(
+    path,
+    state,
+    &version,
+    &inputs,
+    last_sequence,
+    output_level,
+    opts,
+  )?;
+
+  // Phase 3: install.
+  {
+    let mut g = state.lock().unwrap();
+    install_compaction(&mut g, &deleted, outputs, output_level as i32)?;
+  }
+
+  delete_obsolete_files(path, state);
+  Ok(true)
 }
 
 /// Run a synchronous L0→L1 compaction if L0 has reached the trigger.
@@ -888,16 +1073,16 @@ fn maybe_compact(path: &std::path::Path, state: &Mutex<DbState>, opts: &Options)
     None => return,
   };
 
+  // Build the flat input list (L0 newest-first, then L1) and deleted pairs.
+  let inputs: Vec<Arc<FileMetaData>> = l0_inputs.iter().chain(l1_inputs.iter()).cloned().collect();
+  let deleted: Vec<(i32, u64)> = l0_inputs
+    .iter()
+    .map(|m| (0i32, m.number))
+    .chain(l1_inputs.iter().map(|m| (1i32, m.number)))
+    .collect();
+
   // Phase 2: I/O (no lock).
-  let outputs = match do_compaction(
-    path,
-    state,
-    &version,
-    &l0_inputs,
-    &l1_inputs,
-    last_sequence,
-    opts,
-  ) {
+  let outputs = match do_compaction(path, state, &version, &inputs, last_sequence, 1, opts) {
     Ok(o) => o,
     Err(_) => return,
   };
@@ -905,7 +1090,7 @@ fn maybe_compact(path: &std::path::Path, state: &Mutex<DbState>, opts: &Options)
   // Phase 3: install.
   {
     let mut g = state.lock().unwrap();
-    if install_compaction(&mut g, &l0_inputs, &l1_inputs, outputs).is_err() {
+    if install_compaction(&mut g, &deleted, outputs, 1).is_err() {
       return;
     }
   }
@@ -1608,5 +1793,111 @@ mod tests {
       l1_count >= 1,
       "expected at least one L1 file after compaction"
     );
+  }
+
+  // ── compact_range tests ────────────────────────────────────────────────────
+
+  #[test]
+  fn compact_range_all_keys_readable_after() {
+    // compact_range over the full key space must not lose any data.
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path(), tiny_options()).unwrap();
+    for i in 0u32..100 {
+      db.put(format!("k{i:04}").as_bytes(), format!("v{i:04}").as_bytes())
+        .unwrap();
+    }
+    db.compact_range(None, None).unwrap();
+    for i in 0u32..100 {
+      assert_eq!(
+        db.get(format!("k{i:04}").as_bytes()).unwrap(),
+        format!("v{i:04}").as_bytes(),
+        "key k{i:04} missing after compact_range"
+      );
+    }
+  }
+
+  #[test]
+  fn compact_range_subrange_preserves_keys_outside() {
+    // Compacting a sub-range must not disturb keys outside it.
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path(), tiny_options()).unwrap();
+    for i in 0u32..100 {
+      db.put(format!("k{i:04}").as_bytes(), b"v").unwrap();
+    }
+    // Compact only the middle third.
+    db.compact_range(Some(b"k0033"), Some(b"k0066")).unwrap();
+    // All keys must still be readable.
+    for i in 0u32..100 {
+      assert!(
+        db.get(format!("k{i:04}").as_bytes()).is_ok(),
+        "key k{i:04} missing after partial compact_range"
+      );
+    }
+  }
+
+  #[test]
+  fn compact_range_moves_data_to_deeper_level() {
+    // After a full compact_range, all data should be below L0.
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path(), tiny_options()).unwrap();
+    for i in 0u32..200 {
+      db.put(format!("k{i:05}").as_bytes(), b"v").unwrap();
+    }
+    db.compact_range(None, None).unwrap();
+    let l0_count = {
+      let g = db.state.lock().unwrap();
+      g.version_set.as_ref().unwrap().current().files[0].len()
+    };
+    assert_eq!(l0_count, 0, "L0 should be empty after full compact_range");
+  }
+
+  #[test]
+  fn compact_range_tombstone_elided_with_no_data_below() {
+    // After compact_range pushes a tombstone to the deepest level, the key
+    // must still be gone (tombstone correctly shadows the value).
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path(), tiny_options()).unwrap();
+    db.put(b"gone", b"value").unwrap();
+    for i in 0u32..100 {
+      db.put(format!("filler{i:05}").as_bytes(), b"x").unwrap();
+    }
+    db.delete(b"gone").unwrap();
+    for i in 100u32..200 {
+      db.put(format!("filler{i:05}").as_bytes(), b"x").unwrap();
+    }
+    db.compact_range(None, None).unwrap();
+    assert!(
+      db.get(b"gone").unwrap_err().is_not_found(),
+      "deleted key must not reappear after compact_range"
+    );
+  }
+
+  #[test]
+  fn compact_range_noop_on_inmemory_db() {
+    let db = Db::default();
+    db.put(b"k", b"v").unwrap();
+    db.compact_range(None, None).unwrap(); // must not panic
+    assert_eq!(db.get(b"k").unwrap(), b"v");
+  }
+
+  #[test]
+  fn compact_range_data_readable_after_reopen() {
+    // Data compacted via compact_range must survive a reopen.
+    let dir = tempfile::tempdir().unwrap();
+    {
+      let db = Db::open(dir.path(), tiny_options()).unwrap();
+      for i in 0u32..100 {
+        db.put(format!("k{i:04}").as_bytes(), format!("v{i:04}").as_bytes())
+          .unwrap();
+      }
+      db.compact_range(None, None).unwrap();
+    }
+    let db = Db::open(dir.path(), Options::default()).unwrap();
+    for i in 0u32..100 {
+      assert_eq!(
+        db.get(format!("k{i:04}").as_bytes()).unwrap(),
+        format!("v{i:04}").as_bytes()
+      );
+    }
   }
 }
