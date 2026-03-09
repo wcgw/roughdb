@@ -325,9 +325,13 @@ mod tests {
     batch.delete(b"foo");
     db.write(&WriteOptions::default(), &batch).unwrap();
     assert!(db
-      .get(&ReadOptions::default(), b"foo")
+      .get_with_options(&ReadOptions::default(), b"foo")
       .unwrap_err()
       .is_not_found());
-    assert_eq!(db.get(&ReadOptions::default(), b"baz").unwrap(), b"qux");
+    assert_eq!(
+      db.get_with_options(&ReadOptions::default(), b"baz")
+        .unwrap(),
+      b"qux"
+    );
   }
 }

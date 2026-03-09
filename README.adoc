@@ -1,3 +1,0 @@
-= RoughDB
-
-Embedded key-value storage written in Rust
