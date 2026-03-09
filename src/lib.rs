@@ -18,7 +18,7 @@ use crate::memtable::{ArcMemTableIter, Memtable, MemtableResult};
 use crate::table::builder::TableBuilder;
 use crate::table::reader::{LookupResult, Table};
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex};
 
 pub mod error;
 pub use error::Error;
@@ -54,14 +54,14 @@ impl Handler for Inserter<'_> {
   }
 }
 
-// ── DbState: lives inside an RwLock ──────────────────────────────────────────
+// ── DbState: lives inside a Mutex ────────────────────────────────────────────
 //
-// Reads take a shared read lock; they check `mem`, then `imm`, then the
-// current `Version` (via `version_set`) without blocking each other.
-// Writes take an exclusive write lock briefly (WAL + memtable insert), then
-// release before doing flush I/O.  Flush I/O holds no lock: it rotates
-// mem→imm under a write lock, does the I/O lock-free, then briefly
-// re-acquires a write lock to install the new version and clear `imm`.
+// Matching LevelDB's single `mutex_`: the lock is taken briefly to snapshot
+// Arc refs (`mem`, `imm`, current `Version`) and then released before any
+// I/O (memtable reads are lock-free; SSTable reads and WAL writes are
+// disk I/O).  Flush I/O is entirely lock-free — `begin_flush` rotates
+// mem→imm and creates the new WAL file under the lock, then drops it;
+// `finish_flush` re-acquires only to install the new Version and swap `log`.
 
 struct DbState {
   /// Sequence number of the last committed write.
@@ -168,7 +168,7 @@ impl DbIter {
 // ── Db ───────────────────────────────────────────────────────────────────────
 
 pub struct Db {
-  state: RwLock<DbState>,
+  state: Mutex<DbState>,
   options: Options,
   /// Database directory.  `None` for in-memory (`Db::default()`).
   path: Option<PathBuf>,
@@ -179,7 +179,7 @@ impl Default for Db {
   /// Intended for tests and ephemeral use.
   fn default() -> Self {
     Self {
-      state: RwLock::new(DbState {
+      state: Mutex::new(DbState {
         last_sequence: 0,
         log: None,
         mem: Arc::new(Memtable::default()),
@@ -260,7 +260,7 @@ impl Db {
     let log_writer = LogWriter::new(log_file, file_len);
 
     Ok(Self {
-      state: RwLock::new(DbState {
+      state: Mutex::new(DbState {
         last_sequence,
         log: Some(log_writer),
         mem,
@@ -311,27 +311,36 @@ impl Db {
     K: AsRef<[u8]>,
   {
     let key = key.as_ref();
-    // A shared read lock allows multiple concurrent readers.
-    let state = self.state.read().unwrap();
 
-    match state.mem.get(key) {
-      MemtableResult::Hit(hit) => return Ok(hit),
+    // Mirror LevelDB's DBImpl::Get: take the lock only long enough to snapshot
+    // the current memtable refs and sequence number, then release before doing
+    // any I/O (memtable reads are lock-free; SSTable reads go to disk).
+    let (sequence, mem, imm, version) = {
+      let state = self.state.lock().unwrap();
+      (
+        state.last_sequence,
+        Arc::clone(&state.mem),
+        state.imm.as_ref().map(Arc::clone),
+        state.version_set.as_ref().map(|vs| vs.current()),
+      )
+    };
+
+    match mem.get(key) {
+      MemtableResult::Hit(v) => return Ok(v),
       MemtableResult::Deleted => return Err(Error::NotFound),
       MemtableResult::Miss => {}
     }
 
-    // Check the sealed memtable being flushed, if any.
-    if let Some(imm) = &state.imm {
+    if let Some(imm) = imm {
       match imm.get(key) {
-        MemtableResult::Hit(hit) => return Ok(hit),
+        MemtableResult::Hit(v) => return Ok(v),
         MemtableResult::Deleted => return Err(Error::NotFound),
         MemtableResult::Miss => {}
       }
     }
 
-    // Search the current Version for the key across all levels.
-    if let Some(vs) = &state.version_set {
-      match vs.current().get(key, state.last_sequence)? {
+    if let Some(version) = version {
+      match version.get(key, sequence)? {
         LookupResult::Value(v) => return Ok(v),
         LookupResult::Deleted => return Err(Error::NotFound),
         LookupResult::NotInTable => {}
@@ -371,22 +380,30 @@ impl Db {
     use crate::db::db_iter::DbIterator;
     use crate::db::merge_iter::MergingIterator;
 
-    let state = self.state.read().unwrap();
-    let sequence = opts.snapshot.map(|s| s.0).unwrap_or(state.last_sequence);
+    // Snapshot Arc refs under the lock, then release before constructing the
+    // iterator (matching LevelDB's NewInternalIterator pattern).
+    let (sequence, mem, imm, version) = {
+      let state = self.state.lock().unwrap();
+      (
+        opts.snapshot.map(|s| s.0).unwrap_or(state.last_sequence),
+        Arc::clone(&state.mem),
+        state.imm.as_ref().map(Arc::clone),
+        state.version_set.as_ref().map(|vs| vs.current()),
+      )
+    };
 
     let mut children: Vec<Box<dyn crate::iter::InternalIterator>> = Vec::new();
 
     // Active memtable (newest writes, scanned first).
-    children.push(Box::new(ArcMemTableIter::new(Arc::clone(&state.mem))));
+    children.push(Box::new(ArcMemTableIter::new(mem)));
 
     // Sealed memtable being flushed to disk (if any).
-    if let Some(imm) = &state.imm {
-      children.push(Box::new(ArcMemTableIter::new(Arc::clone(imm))));
+    if let Some(imm) = imm {
+      children.push(Box::new(ArcMemTableIter::new(imm)));
     }
 
     // SSTable files from the current Version, level by level (L0 first).
-    if let Some(vs) = &state.version_set {
-      let version = vs.current();
+    if let Some(version) = version {
       for level_files in &version.files {
         for meta in level_files {
           if let Some(table) = &meta.table {
@@ -396,14 +413,12 @@ impl Db {
       }
     }
 
-    drop(state);
-
     let inner = DbIterator::new(Box::new(MergingIterator::new(children)), sequence);
     Ok(DbIter { inner })
   }
 
   pub fn write(&self, opts: &WriteOptions, batch: &WriteBatch) -> Result<(), Error> {
-    let mut state = self.state.write().unwrap();
+    let mut state = self.state.lock().unwrap();
     let start_seq = state.last_sequence + 1;
 
     // Clone and stamp so the WAL record carries the correct embedded sequence.
@@ -434,7 +449,7 @@ impl Db {
         // Phase 2: write the SSTable (no lock held — reads proceed freely).
         let result = write_flush(prep, &self.options)?;
         // Phase 3: install the new Version, swap WAL, clear imm (write lock).
-        let mut state = self.state.write().unwrap();
+        let mut state = self.state.lock().unwrap();
         finish_flush(&mut state, result)?;
       }
     }
@@ -445,11 +460,11 @@ impl Db {
 
 // ── flush helpers ─────────────────────────────────────────────────────────────
 //
-// Flush is split into three phases so the write lock is not held during I/O:
+// Flush is split into three phases so the mutex is not held during I/O:
 //
-//   begin_flush  — under write lock: rotate mem→imm, return sealed memtable
+//   begin_flush  — under lock: rotate mem→imm, allocate new WAL file
 //   write_flush  — no lock: write SSTable to disk, open it for reading
-//   finish_flush — under write lock: install new Version in VersionSet, clear imm
+//   finish_flush — under lock: install new Version, swap WAL, clear imm
 
 /// Phase 1 (under write lock): seal `mem` as `imm`, install a fresh memtable,
 /// allocate the next SSTable file number, and create the new WAL file.
