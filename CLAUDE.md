@@ -291,6 +291,22 @@ what remains is compaction, the full Iterator/Snapshot API, and operational hygi
 - [ ] **`LOCK` file**: On `Db::open`, acquire an exclusive `flock` on `<path>/LOCK` to prevent two processes from
   opening the same database simultaneously. Release on `Db::drop`. See `util/env_posix.cc: LockFile`.
 
+**Compression**
+
+- [ ] **Block compression**: Wire `Options::compression` through `TableBuilder` and `Table`.  Currently all blocks
+  are written with type `0x00` (NoCompression) and the reader rejects any other type.  Required changes:
+  - Add `snappy = "..."` and `zstd = "..."` crate dependencies.
+  - `write_raw_block` in `src/table/format.rs`: compress `data` according to `compression_type` before writing;
+    set trailer byte to `0x01` (Snappy) or `0x02` (Zstd).  Use the uncompressed block if compressed output is
+    larger (LevelDB's `kCompressionRatio` heuristic; threshold ≈ 12.5% saving).
+  - `read_block` in `src/table/format.rs`: decompress based on the trailer byte; remove the current hard error on
+    non-zero compression types.
+  - `TableBuilder::new` (or a new constructor) accepts `CompressionType`; pass it from flush and compaction via
+    `Options`.
+  - `Table::get` and `TwoLevelIterator` call `read_block` — no interface changes needed there.
+  - Default remains `Snappy` (matching LevelDB). `Zstd` uses `Options::zstd_compression_level`.
+  - See `table/table_builder.cc: TableBuilder::WriteBlock`, `table/format.cc: ReadBlock`.
+
 ---
 
 ### Post-parity improvements
