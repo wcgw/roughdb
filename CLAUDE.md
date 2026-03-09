@@ -322,20 +322,12 @@ what remains is compaction, the full Iterator/Snapshot API, and operational hygi
 
 **Options wiring**
 
-- [ ] **`ReadOptions::verify_checksums`**: Currently `Version::get` passes `false` to `Table::get` unconditionally
-  (hardcoded at `src/db/version.rs:55,69`).  No new infrastructure needed — `read_block` and `Table::get` already
-  accept the flag.  Required changes:
-  - Add a `verify_checksums: bool` parameter to `Version::get`; thread the flag in from `Db::get_with_options` via
-    `ReadOptions::verify_checksums`.
-  - In `Db::new_iterator`, capture `opts.verify_checksums` in the `BlockFn` closure passed to `TwoLevelIterator` so
-    iterator block reads also respect the flag.
-  - See `db/db_impl.cc: DBImpl::Get`, `table/table.cc: Table::InternalGet`.
-- [ ] **`Options::paranoid_checks`**: Currently ignored.  When set, acts as a database-wide `verify_checksums = true`:
-  OR it with `ReadOptions::verify_checksums` on every SSTable block read (both the `Version::get` path and the
-  `TwoLevelIterator` block opener in `Db::new_iterator`).  Also enable WAL checksum verification: pass
-  `checksum: true` to `log::Reader` when `paranoid_checks` is set (currently hardcoded `false` in `recover_wal`
-  and MANIFEST recovery).  Store `paranoid_checks` in `Db` (already in `self.options`) — no struct changes needed.
-  See `db/db_impl.cc: DBImpl::Open`, `util/env_posix.cc`.
+- [x] **`ReadOptions::verify_checksums` + `Options::paranoid_checks`**: Both are fully wired.
+  `verify_checksums = opts.verify_checksums || self.options.paranoid_checks` is computed in `Db::get_with_options`
+  and `Db::new_iterator` and forwarded to `Version::get(verify_checksums)` and `Table::new_iterator(verify_checksums)`
+  (which threads it into the `BlockFn` closure).  `Options::paranoid_checks` is also passed to `VersionSet::recover`
+  and `recover_wal` as the `checksum` argument to `log::Reader::new`, so MANIFEST and WAL records are verified during
+  recovery.  See `db/db_impl.cc: DBImpl::Get`, `table/table.cc: Table::InternalGet`.
 
 ---
 

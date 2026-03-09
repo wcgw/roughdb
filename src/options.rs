@@ -40,8 +40,13 @@ pub struct Options {
 
   /// Aggressively check data integrity; stop early on any detected error.
   ///
-  /// **Not yet implemented.** The flag is accepted but currently has no effect: WAL and SSTable
-  /// block reads do not perform checksum verification even when this is set.
+  /// When set, acts as a database-wide `verify_checksums = true`: every SSTable block read
+  /// (both point lookups via [`Db::get`] and iterator block reads) verifies its CRC32c checksum,
+  /// and WAL and MANIFEST records are checksum-verified during recovery.  Any mismatch returns
+  /// [`Error::Corruption`].
+  ///
+  /// This flag is OR-ed with [`ReadOptions::verify_checksums`] on each individual read, so
+  /// per-read verification can also be enabled independently.
   ///
   /// Default: false.
   pub paranoid_checks: bool,

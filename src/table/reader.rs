@@ -119,13 +119,13 @@ impl Table {
   ///
   /// The iterator clones the file handle (cheap `dup(2)`) so it can read data
   /// blocks on demand without holding a reference to `self`.
-  pub(crate) fn new_iterator(&self) -> Result<TwoLevelIterator, Error> {
+  pub(crate) fn new_iterator(&self, verify_checksums: bool) -> Result<TwoLevelIterator, Error> {
     use crate::table::two_level_iterator::BlockFn;
     let file = self.file.try_clone()?;
     let index_iter: Box<dyn InternalIterator> = Box::new(self.index_block.iter());
     let block_fn: BlockFn = Box::new(move |handle_value: &[u8]| {
       let (handle, _) = BlockHandle::decode_from(handle_value)?;
-      let contents = read_block(&file, &handle, false)?;
+      let contents = read_block(&file, &handle, verify_checksums)?;
       Ok(Box::new(Block::new(contents.data).iter()) as Box<dyn InternalIterator>)
     });
     Ok(TwoLevelIterator::new(index_iter, block_fn))

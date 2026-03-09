@@ -161,13 +161,13 @@ impl std::fmt::Debug for Snapshot<'_> {
 /// See `include/leveldb/options.h`.
 #[derive(Debug, Clone, Copy)]
 pub struct ReadOptions<'snap> {
-  /// Verify block checksums on every read.
+  /// Verify block checksums on every read in this operation.
   ///
-  /// **Partially implemented.** `Table::get` and `read_block` respect this flag, but
-  /// `Version::get` (the SSTable lookup path used by `Db::get`) currently hardcodes `false`,
-  /// so point lookups never verify checksums even when this is set. Iterator block reads are
-  /// also unaffected. Setting this to `true` has no effect until the flag is fully threaded
-  /// through.
+  /// When set, every SSTable data block read for this `get` or iterator call has its CRC32c
+  /// checksum verified.  Any mismatch returns [`Error::Corruption`].
+  ///
+  /// For database-wide verification without setting this on every `ReadOptions`, use
+  /// [`Options::paranoid_checks`] instead.
   ///
   /// Default: false.
   pub verify_checksums: bool,
@@ -457,7 +457,7 @@ impl Db {
 
     let (version_set, mem, last_sequence) = if db_exists {
       // ── Existing database: MANIFEST-driven recovery ──────────────────────
-      let mut vs = VersionSet::recover(path)?;
+      let mut vs = VersionSet::recover(path, options.paranoid_checks)?;
       let manifest_last_seq = vs.last_sequence();
       let mem = Arc::new(Memtable::default());
 
@@ -468,7 +468,7 @@ impl Db {
         let file = std::fs::File::open(&log_path)?;
         let file_len = file.metadata()?.len();
         if file_len > 0 {
-          Self::recover_wal(file, &mem, manifest_last_seq)?
+          Self::recover_wal(file, &mem, manifest_last_seq, options.paranoid_checks)?
         } else {
           manifest_last_seq
         }
@@ -519,8 +519,13 @@ impl Db {
   ///
   /// Returns the highest sequence number replayed (or `min_sequence` if
   /// nothing was replayed).
-  fn recover_wal(file: std::fs::File, mem: &Memtable, min_sequence: u64) -> Result<u64, Error> {
-    let mut reader = LogReader::new(file, None, true, 0);
+  fn recover_wal(
+    file: std::fs::File,
+    mem: &Memtable,
+    min_sequence: u64,
+    paranoid_checks: bool,
+  ) -> Result<u64, Error> {
+    let mut reader = LogReader::new(file, None, paranoid_checks, 0);
     let mut max_sequence: u64 = min_sequence;
 
     while let Some(record) = reader.read_record() {
@@ -574,6 +579,8 @@ impl Db {
       )
     };
 
+    let verify_checksums = opts.verify_checksums || self.options.paranoid_checks;
+
     match mem.get(key, sequence) {
       MemtableResult::Hit(v) => return Ok(v),
       MemtableResult::Deleted => return Err(Error::NotFound),
@@ -589,7 +596,7 @@ impl Db {
     }
 
     if let Some(version) = version {
-      match version.get(key, sequence)? {
+      match version.get(key, sequence, verify_checksums)? {
         LookupResult::Value(v) => return Ok(v),
         LookupResult::Deleted => return Err(Error::NotFound),
         LookupResult::NotInTable => {}
@@ -658,6 +665,8 @@ impl Db {
       )
     };
 
+    let verify_checksums = opts.verify_checksums || self.options.paranoid_checks;
+
     let mut children: Vec<Box<dyn crate::iter::InternalIterator>> = Vec::new();
 
     // Active memtable (newest writes, scanned first).
@@ -673,7 +682,7 @@ impl Db {
       for level_files in &version.files {
         for meta in level_files {
           if let Some(table) = &meta.table {
-            children.push(Box::new(table.new_iterator()?));
+            children.push(Box::new(table.new_iterator(verify_checksums)?));
           }
         }
       }
@@ -1121,7 +1130,7 @@ fn do_compaction(
       .table
       .as_ref()
       .expect("compaction input must have an open table");
-    children.push(Box::new(table.new_iterator()?));
+    children.push(Box::new(table.new_iterator(opts.paranoid_checks)?));
   }
 
   let mut merger = MergingIterator::new(children);
@@ -2464,6 +2473,112 @@ mod tests {
         format!("v{i:04}").as_bytes()
       );
     }
+  }
+
+  // ── paranoid_checks / verify_checksums tests ───────────────────────────────
+
+  #[test]
+  fn paranoid_checks_does_not_break_normal_operation() {
+    let dir = tempfile::tempdir().unwrap();
+    let opts = Options {
+      create_if_missing: true,
+      paranoid_checks: true,
+      ..Options::default()
+    };
+    let db = Db::open(dir.path(), opts).unwrap();
+    db.put(b"hello", b"world").unwrap();
+    assert_eq!(db.get(b"hello").unwrap(), b"world");
+  }
+
+  #[test]
+  fn paranoid_checks_survives_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+      let db = Db::open(dir.path(), create_options()).unwrap();
+      for i in 0..200u32 {
+        db.put(format!("k{i:04}").as_bytes(), format!("v{i:04}").as_bytes())
+          .unwrap();
+      }
+    }
+    // Reopen with paranoid_checks — recovery and reads must both succeed.
+    let opts = Options {
+      paranoid_checks: true,
+      ..Options::default()
+    };
+    let db = Db::open(dir.path(), opts).unwrap();
+    assert_eq!(db.get(b"k0000").unwrap(), b"v0000");
+    let mut it = db
+      .new_iterator(&ReadOptions {
+        verify_checksums: true,
+        ..ReadOptions::default()
+      })
+      .unwrap();
+    it.seek_to_first();
+    assert!(it.valid());
+  }
+
+  #[test]
+  fn corrupted_block_detected_with_verify_checksums() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+      let db = Db::open(dir.path(), small_options()).unwrap();
+      // Write enough to force at least one .ldb flush (small_options write_buffer_size = 512).
+      for i in 0..200u32 {
+        db.put(format!("k{i:04}").as_bytes(), b"v").unwrap();
+      }
+    } // db dropped — flushes and releases lock
+
+    // Corrupt the middle of the first .ldb file.
+    let ldb: Vec<_> = std::fs::read_dir(dir.path())
+      .unwrap()
+      .filter_map(|e| {
+        let e = e.unwrap();
+        let n = e.file_name().to_string_lossy().into_owned();
+        if n.ends_with(".ldb") {
+          Some(e.path())
+        } else {
+          None
+        }
+      })
+      .collect();
+    assert!(!ldb.is_empty(), "expected at least one .ldb file");
+    let mut data = std::fs::read(&ldb[0]).unwrap();
+    let mid = data.len() / 2;
+    data[mid] ^= 0xff;
+    std::fs::write(&ldb[0], &data).unwrap();
+
+    // Reopen without paranoid — get may or may not fail depending on which block is hit.
+    // Reopen with verify_checksums — must detect the corruption.
+    let db = Db::open(dir.path(), Options::default()).unwrap();
+    let read_opts = ReadOptions {
+      verify_checksums: true,
+      ..ReadOptions::default()
+    };
+    // At least one key should produce a Corruption error when we scan everything.
+    let mut it = db.new_iterator(&read_opts).unwrap();
+    it.seek_to_first();
+    let mut saw_corruption = false;
+    while it.valid() {
+      it.next();
+    }
+    if let Some(e) = it.status() {
+      if matches!(e, Error::Corruption(_)) {
+        saw_corruption = true;
+      }
+    }
+    // Also try a direct get into a corrupted block.
+    for i in 0..200u32 {
+      if let Err(Error::Corruption(_)) =
+        db.get_with_options(&read_opts, format!("k{i:04}").as_bytes())
+      {
+        saw_corruption = true;
+        break;
+      }
+    }
+    assert!(
+      saw_corruption,
+      "expected at least one Corruption error with verify_checksums=true"
+    );
   }
 
   // ── Snapshot tests ─────────────────────────────────────────────────────────

@@ -379,7 +379,7 @@ mod tests {
     }
     let size = builder.finish().unwrap();
     let table = Table::open(tmp.reopen().unwrap(), size).unwrap();
-    Box::new(table.new_iterator().unwrap())
+    Box::new(table.new_iterator(false).unwrap())
   }
 
   fn make_db_iter(children: Vec<Box<dyn InternalIterator>>, seq: u64) -> DbIterator {

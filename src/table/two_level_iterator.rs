@@ -205,7 +205,7 @@ mod tests {
   fn empty_table_not_valid() {
     let (tmp, size) = build_table(&[], 4096);
     let table = Table::open(tmp.reopen().unwrap(), size).unwrap();
-    let mut it = table.new_iterator().unwrap();
+    let mut it = table.new_iterator(false).unwrap();
     it.seek_to_first();
     assert!(!it.valid());
   }
@@ -215,7 +215,7 @@ mod tests {
     let pairs: &[(&[u8], &[u8])] = &[(b"a", b"1"), (b"b", b"2"), (b"c", b"3")];
     let (tmp, size) = build_table(pairs, 4096);
     let table = Table::open(tmp.reopen().unwrap(), size).unwrap();
-    let mut it = table.new_iterator().unwrap();
+    let mut it = table.new_iterator(false).unwrap();
     it.seek_to_first();
     for (k, v) in pairs {
       assert!(it.valid());
@@ -231,7 +231,7 @@ mod tests {
     let pairs: &[(&[u8], &[u8])] = &[(b"a", b"1"), (b"b", b"2"), (b"c", b"3")];
     let (tmp, size) = build_table(pairs, 4096);
     let table = Table::open(tmp.reopen().unwrap(), size).unwrap();
-    let mut it = table.new_iterator().unwrap();
+    let mut it = table.new_iterator(false).unwrap();
     // Lookup key with max sequence number seeks to the newest version.
     let target = make_internal_key(b"b", u64::MAX >> 8, 1);
     it.seek(&target);
@@ -245,7 +245,7 @@ mod tests {
     let pairs: &[(&[u8], &[u8])] = &[(b"a", b"1"), (b"b", b"2")];
     let (tmp, size) = build_table(pairs, 4096);
     let table = Table::open(tmp.reopen().unwrap(), size).unwrap();
-    let mut it = table.new_iterator().unwrap();
+    let mut it = table.new_iterator(false).unwrap();
     let target = make_internal_key(b"z", u64::MAX >> 8, 1);
     it.seek(&target);
     assert!(!it.valid());
@@ -271,7 +271,7 @@ mod tests {
     }
     let size = builder.finish().unwrap();
     let table = Table::open(tmp.reopen().unwrap(), size).unwrap();
-    let mut it = table.new_iterator().unwrap();
+    let mut it = table.new_iterator(false).unwrap();
     it.seek_to_first();
     for (k, v) in &pairs {
       assert!(it.valid(), "expected valid iterator for key {:?}", k);
@@ -301,7 +301,7 @@ mod tests {
     }
     let size = builder.finish().unwrap();
     let table = Table::open(tmp.reopen().unwrap(), size).unwrap();
-    let mut it = table.new_iterator().unwrap();
+    let mut it = table.new_iterator(false).unwrap();
     // Seek to the middle; verify we land at the right key and can iterate forward.
     let target = make_internal_key(b"key00025", u64::MAX >> 8, 1);
     it.seek(&target);
