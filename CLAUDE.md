@@ -293,8 +293,9 @@ what remains is compaction, the full Iterator/Snapshot API, and operational hygi
 
 **Compression**
 
-- [ ] **Block compression**: Wire `Options::compression` through `TableBuilder` and `Table`.  Currently all blocks
-  are written with type `0x00` (NoCompression) and the reader rejects any other type.  Required changes:
+- [ ] **Block compression**: Wire `Options::compression` and `Options::zstd_compression_level` through `TableBuilder`
+  and `Table`.  Currently all blocks are written with type `0x00` (NoCompression) and the reader rejects any other
+  type; both fields are silently ignored.  Required changes:
   - Add `snappy = "..."` and `zstd = "..."` crate dependencies.
   - `write_raw_block` in `src/table/format.rs`: compress `data` according to `compression_type` before writing;
     set trailer byte to `0x01` (Snappy) or `0x02` (Zstd).  Use the uncompressed block if compressed output is
@@ -306,6 +307,23 @@ what remains is compaction, the full Iterator/Snapshot API, and operational hygi
   - `Table::get` and `TwoLevelIterator` call `read_block` — no interface changes needed there.
   - Default remains `Snappy` (matching LevelDB). `Zstd` uses `Options::zstd_compression_level`.
   - See `table/table_builder.cc: TableBuilder::WriteBlock`, `table/format.cc: ReadBlock`.
+
+**Options wiring**
+
+- [ ] **`ReadOptions::verify_checksums`**: Currently `Version::get` passes `false` to `Table::get` unconditionally
+  (hardcoded at `src/db/version.rs:55,69`).  No new infrastructure needed — `read_block` and `Table::get` already
+  accept the flag.  Required changes:
+  - Add a `verify_checksums: bool` parameter to `Version::get`; thread the flag in from `Db::get_with_options` via
+    `ReadOptions::verify_checksums`.
+  - In `Db::new_iterator`, capture `opts.verify_checksums` in the `BlockFn` closure passed to `TwoLevelIterator` so
+    iterator block reads also respect the flag.
+  - See `db/db_impl.cc: DBImpl::Get`, `table/table.cc: Table::InternalGet`.
+- [ ] **`Options::paranoid_checks`**: Currently ignored.  When set, acts as a database-wide `verify_checksums = true`:
+  OR it with `ReadOptions::verify_checksums` on every SSTable block read (both the `Version::get` path and the
+  `TwoLevelIterator` block opener in `Db::new_iterator`).  Also enable WAL checksum verification: pass
+  `checksum: true` to `log::Reader` when `paranoid_checks` is set (currently hardcoded `false` in `recover_wal`
+  and MANIFEST recovery).  Store `paranoid_checks` in `Db` (already in `self.options`) — no struct changes needed.
+  See `db/db_impl.cc: DBImpl::Open`, `util/env_posix.cc`.
 
 ---
 
@@ -322,8 +340,18 @@ the phases above.*
   See `util/bloom.cc` and `include/leveldb/filter_policy.h`. A `FilterPolicy` trait allows custom filters.
 - **Block cache**: Sharded LRU (`src/cache/lru.rs`) with two lists per shard (in-use / evictable), custom deleters,
   capacity-based eviction. Default 8 MB. Required by `Table` reader to cache hot blocks. See `util/cache.cc`.
+- **`ReadOptions::fill_cache`**: Currently ignored — no block cache exists. Once the block cache is implemented,
+  `fill_cache = false` should skip inserting blocks into the cache on reads (useful for bulk scans to avoid
+  evicting hot data). Wire into `read_block` and the `TwoLevelIterator` block-opener closure.
 - **Table cache**: LRU of `(file_number → Table)` entries replacing the `Arc<Table>` in `FileMetaData`. Bounds open
   file descriptors and avoids repeated footer parses. See `db/table_cache.h/cc`.
+- **`Options::max_open_files`**: Currently ignored — all SSTable `File` handles stay open unconditionally via
+  `Arc<Table>` in `FileMetaData`. Once the table cache is implemented, pass
+  `max_open_files - kNumNonTableCacheFiles` as its capacity. See `db/db_impl.cc: DBImpl::Open`.
+- **`Options::reuse_logs`**: Experimental LevelDB flag — when set, the existing WAL and MANIFEST files are reused
+  on `Db::open` rather than creating new ones after recovery, saving an `fsync` of `CURRENT`. Requires MANIFEST
+  recovery to detect the reuse case and skip writing a new `CURRENT`. Low priority.
+  See `db/db_impl.cc: DBImpl::Recover`.
 - **Custom comparator**: Wire `Options::comparator` through to all key-comparison sites (skip list, block seek,
   compaction). Currently hardcoded bytewise. Needed to use RoughDB as a sorted map on non-lexicographic keys.
   See `include/leveldb/comparator.h`.

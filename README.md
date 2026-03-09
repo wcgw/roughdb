@@ -9,11 +9,8 @@ operation, multi-level compaction, and bidirectional iteration.
 
 ## Getting started
 
-Add the crate to your `Cargo.toml`:
-
-```toml
-[dependencies]
-roughdb = { git = "https://github.com/wcgw/roughdb/" }
+```bash
+cargo add roughdb
 ```
 
 ### Opening a database
