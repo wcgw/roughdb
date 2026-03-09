@@ -119,45 +119,6 @@ impl Default for Options {
   }
 }
 
-/// Options that control read operations.
-///
-/// See `include/leveldb/options.h`.
-#[derive(Debug, Clone, Default)]
-pub struct ReadOptions {
-  /// Verify block checksums on every read.
-  ///
-  /// **Partially implemented.** `Table::get` and `read_block` respect this flag, but
-  /// `Version::get` (the SSTable lookup path used by `Db::get`) currently hardcodes `false`,
-  /// so point lookups never verify checksums even when this is set. Iterator block reads are
-  /// also unaffected. Setting this to `true` has no effect until the flag is fully threaded
-  /// through.
-  ///
-  /// Default: false.
-  pub verify_checksums: bool,
-
-  /// Cache blocks read during this operation in the block cache.
-  /// Set to `false` for bulk scans to avoid polluting the cache.
-  ///
-  /// **Not yet implemented.** Accepted but ignored — there is no block cache yet, so all block
-  /// reads bypass caching unconditionally.
-  ///
-  /// Default: true.
-  pub fill_cache: bool,
-
-  /// Read as of this snapshot's sequence number.
-  /// `None` means "use an implicit snapshot of the current state".
-  pub snapshot: Option<Snapshot>,
-}
-
-impl ReadOptions {
-  pub fn new() -> Self {
-    ReadOptions {
-      fill_cache: true,
-      ..Default::default()
-    }
-  }
-}
-
 /// Options that control write operations.
 ///
 /// See `include/leveldb/options.h`.
@@ -168,14 +129,6 @@ pub struct WriteOptions {
   /// When `false`, writes survive process crashes but may be lost on a
   /// hard reboot.
   ///
-  /// Default: false. Active from Phase 2 (WAL).
+  /// Default: false.
   pub sync: bool,
 }
-
-/// An immutable snapshot of the database state at a particular sequence number.
-///
-/// Snapshots are handed out by `Db::get_snapshot` (Phase 9) and passed via
-/// [`ReadOptions::snapshot`] to pin reads to a specific point in time.
-/// The inner sequence number is not part of the public API.
-#[derive(Debug, Clone, Copy)]
-pub struct Snapshot(pub(crate) u64);

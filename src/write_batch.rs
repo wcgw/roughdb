@@ -36,7 +36,13 @@ impl WriteBatch {
     }
   }
 
-  pub fn put(&mut self, key: &[u8], value: &[u8]) {
+  pub fn put<K, V>(&mut self, key: K, value: V)
+  where
+    K: AsRef<[u8]>,
+    V: AsRef<[u8]>,
+  {
+    let (key, value) = (key.as_ref(), value.as_ref());
+    self.rep.reserve(key.len() + value.len() + 21);
     self.rep.push(TAG_VALUE);
     let mut tmp = [0u8; 10];
     let n = write_varu64(&mut tmp, key.len() as u64);
@@ -48,7 +54,12 @@ impl WriteBatch {
     self.set_count(self.count() + 1);
   }
 
-  pub fn delete(&mut self, key: &[u8]) {
+  pub fn delete<K>(&mut self, key: K)
+  where
+    K: AsRef<[u8]>,
+  {
+    let key = key.as_ref();
+    self.rep.reserve(key.len() + 11);
     self.rep.push(TAG_DELETE);
     let mut tmp = [0u8; 10];
     let n = write_varu64(&mut tmp, key.len() as u64);
@@ -218,7 +229,7 @@ mod tests {
   #[test]
   fn put_and_iterate() {
     let mut b = WriteBatch::new();
-    b.put(b"hello", b"world");
+    b.put("hello", "world");
     let mut r = Recording { ops: vec![] };
     b.iterate(&mut r).unwrap();
     assert_eq!(r.ops, vec![Op::Put(b"hello".to_vec(), b"world".to_vec())]);

@@ -108,12 +108,11 @@ use roughdb::ReadOptions;
 let snap = db.get_snapshot();
 
 // Reads with this snapshot see the state at the moment it was taken.
-let opts = ReadOptions { snapshot: Some(snap), ..ReadOptions::default() };
+let opts = ReadOptions { snapshot: Some(&snap), ..ReadOptions::default() };
 let value = db.get_with_options(&opts, b"key")?;
 let mut it = db.new_iterator(&opts)?;
 
-// Release when no longer needed (allows compaction to reclaim old data).
-db.release_snapshot(snap);
+// snap releases automatically when it goes out of scope.
 ```
 
 
