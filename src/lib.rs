@@ -350,13 +350,35 @@ impl DbIter {
   }
 }
 
+// ── LOCK file ────────────────────────────────────────────────────────────────
+
+/// Acquire an exclusive, non-blocking `flock` on `file`.
+///
+/// Returns `Err(Error::IoError(...))` immediately if another process holds the
+/// lock (`EWOULDBLOCK`), rather than blocking indefinitely.
+///
+/// # Safety
+/// `flock(2)` is async-signal-safe and only modifies kernel state associated
+/// with the file descriptor.
+fn acquire_lock(file: &std::fs::File) -> Result<(), Error> {
+  use std::os::unix::io::AsRawFd;
+  // SAFETY: the fd is valid for the lifetime of `file`; flock does not alias memory.
+  let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+  if ret == 0 {
+    Ok(())
+  } else {
+    Err(Error::IoError(std::io::Error::last_os_error()))
+  }
+}
+
 // ── Db ───────────────────────────────────────────────────────────────────────
 
 pub struct Db {
   state: Mutex<DbState>,
   options: Options,
-  /// Database directory.  `None` for in-memory (`Db::default()`).
-  path: Option<PathBuf>,
+  /// `Some((dir, lock))` for persistent databases; `None` for in-memory (`Db::default()`).
+  /// The `lock` file is held open to maintain the exclusive `flock` for the database lifetime.
+  persistent: Option<(PathBuf, std::fs::File)>,
 }
 
 impl Default for Db {
@@ -373,7 +395,7 @@ impl Default for Db {
         snapshots: std::collections::BTreeSet::new(),
       }),
       options: Options::default(),
-      path: None,
+      persistent: None,
     }
   }
 }
@@ -392,6 +414,10 @@ impl Db {
   /// - Recovers the `VersionSet` from the MANIFEST (loads live SSTable files).
   /// - Replays WAL records whose sequence number exceeds the last sequence
   ///   already reflected in the MANIFEST (avoids double-inserting flushed data).
+  ///
+  /// In both cases an exclusive POSIX `flock` is acquired on `<path>/LOCK`.
+  /// If another process already holds the lock, an [`Error::IoError`] is returned
+  /// immediately rather than blocking.  The lock is released when the `Db` is dropped.
   ///
   /// `Db::default()` is retained for in-memory / test use (no WAL, no flush).
   pub fn open<P: AsRef<std::path::Path>>(path: P, options: Options) -> Result<Self, Error> {
@@ -418,6 +444,16 @@ impl Db {
     if !db_exists {
       std::fs::create_dir_all(path)?;
     }
+
+    // Acquire an exclusive non-blocking flock on LOCK before any other I/O.
+    // This prevents two processes from corrupting the same database concurrently.
+    let lock_file = OpenOptions::new()
+      .create(true)
+      .truncate(true)
+      .read(true)
+      .write(true)
+      .open(path.join("LOCK"))?;
+    acquire_lock(&lock_file)?;
 
     let (version_set, mem, last_sequence) = if db_exists {
       // ── Existing database: MANIFEST-driven recovery ──────────────────────
@@ -474,7 +510,7 @@ impl Db {
         snapshots: std::collections::BTreeSet::new(),
       }),
       options,
-      path: Some(path.to_path_buf()),
+      persistent: Some((path.to_path_buf(), lock_file)),
     })
   }
 
@@ -661,8 +697,8 @@ impl Db {
   pub fn compact_range(&self, begin: Option<&[u8]>, end: Option<&[u8]>) -> Result<(), Error> {
     use crate::db::version::NUM_LEVELS;
 
-    let path = match &self.path {
-      Some(p) => p.clone(),
+    let path = match self.path() {
+      Some(p) => p.to_path_buf(),
       None => return Ok(()),
     };
 
@@ -725,7 +761,7 @@ impl Db {
 
     // Trigger an L0 flush when the memtable exceeds the size limit.
     // Only applies to persistent databases (path.is_some()).
-    if let Some(path) = self.path.as_deref() {
+    if let Some(path) = self.path() {
       if state.mem.approximate_memory_usage() >= self.options.write_buffer_size {
         // Phase 1: rotate mem → imm, allocate new WAL file (write lock held).
         let prep = begin_flush(path, &mut state)?;
@@ -763,6 +799,11 @@ impl Db {
     }
 
     Ok(())
+  }
+
+  /// Returns the on-disk database directory, or `None` for in-memory databases.
+  fn path(&self) -> Option<&std::path::Path> {
+    self.persistent.as_ref().map(|(p, _)| p.as_path())
   }
 }
 
@@ -1521,6 +1562,29 @@ mod tests {
       !db_path.exists(),
       "Db::open must not create the directory when create_if_missing = false"
     );
+  }
+
+  #[test]
+  fn lock_prevents_concurrent_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let _db = Db::open(dir.path(), create_options()).unwrap();
+    // Second open while the first is still alive must fail with IoError (EWOULDBLOCK).
+    let err = Db::open(dir.path(), Options::default()).err().unwrap();
+    assert!(
+      matches!(err, Error::IoError(_)),
+      "expected IoError from flock, got {err:?}"
+    );
+  }
+
+  #[test]
+  fn lock_released_on_drop() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path(), create_options()).unwrap();
+    db.put(b"k", b"v").unwrap();
+    drop(db); // releases the flock
+              // Reopening after drop must succeed.
+    let db2 = Db::open(dir.path(), Options::default()).unwrap();
+    assert_eq!(db2.get(b"k").unwrap(), b"v");
   }
 
   #[test]

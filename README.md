@@ -143,7 +143,6 @@ The following are not yet implemented:
 - Compression (Snappy, Zstd) — all blocks written uncompressed
 - `Db::get_property` / `Db::get_approximate_sizes`
 - `DestroyDB`
-- `LOCK` file (multi-process safety)
 - Block cache, table cache, Bloom filters
 
 ## License

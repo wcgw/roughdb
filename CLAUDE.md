@@ -288,8 +288,11 @@ what remains is compaction, the full Iterator/Snapshot API, and operational hygi
 
 **`LOCK` file** *(prerequisite for the above free functions and safe multi-process use)*
 
-- [ ] **`LOCK` file**: On `Db::open`, acquire an exclusive `flock` on `<path>/LOCK` to prevent two processes from
-  opening the same database simultaneously. Release on `Db::drop`. See `util/env_posix.cc: LockFile`.
+- [x] **`LOCK` file**: On `Db::open`, acquire an exclusive `flock` on `<path>/LOCK` to prevent two processes from
+  opening the same database simultaneously. Release on `Db::drop`. `acquire_lock` uses `libc::flock(LOCK_EX |
+  LOCK_NB)` — returns `IoError` immediately rather than blocking if another process holds the lock. The `File`
+  handle is stored as `lock_file: Option<File>` in `Db` (suppressed `dead_code` warning; held for Drop side-effect).
+  See `util/env_posix.cc: LockFile`.
 
 **Compression**
 
