@@ -25,7 +25,7 @@ pub enum CompressionType {
 /// Options that control the overall behaviour of a database.
 ///
 /// See `include/leveldb/options.h`.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Options {
   // ── Behaviour ───────────────────────────────────────────────────────────
   /// Create the database if it does not already exist.
@@ -104,6 +104,25 @@ pub struct Options {
   ///
   /// Default: false.
   pub reuse_logs: bool,
+
+  // ── Filters ─────────────────────────────────────────────────────────────
+  /// Filter policy applied to SSTable data blocks.
+  ///
+  /// When set, each SSTable written by this database includes a filter block.
+  /// Before reading any data block, `Table::get` consults the filter; a
+  /// definite-negative answer skips all data-block I/O entirely, making
+  /// point lookups on absent keys much cheaper.
+  ///
+  /// [`BloomFilterPolicy::new(10)`](crate::BloomFilterPolicy::new) gives
+  /// roughly 1 % false positives at ~10 bits per key — the same default used
+  /// by LevelDB.  Pass `None` to disable filtering (useful for write-heavy
+  /// workloads where all reads are expected to hit).
+  ///
+  /// The filter is also applied when reading SSTables on reopen, provided the
+  /// policy name stored in the metaindex matches the configured policy.
+  ///
+  /// Default: `None` (no filter).
+  pub filter_policy: Option<std::sync::Arc<dyn crate::filter::FilterPolicy>>,
 }
 
 impl Default for Options {
@@ -120,7 +139,30 @@ impl Default for Options {
       compression: CompressionType::Snappy,
       zstd_compression_level: 1,
       reuse_logs: false,
+      filter_policy: None,
     }
+  }
+}
+
+impl std::fmt::Debug for Options {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("Options")
+      .field("create_if_missing", &self.create_if_missing)
+      .field("error_if_exists", &self.error_if_exists)
+      .field("paranoid_checks", &self.paranoid_checks)
+      .field("write_buffer_size", &self.write_buffer_size)
+      .field("max_open_files", &self.max_open_files)
+      .field("block_size", &self.block_size)
+      .field("block_restart_interval", &self.block_restart_interval)
+      .field("max_file_size", &self.max_file_size)
+      .field("compression", &self.compression)
+      .field("zstd_compression_level", &self.zstd_compression_level)
+      .field("reuse_logs", &self.reuse_logs)
+      .field(
+        "filter_policy",
+        &self.filter_policy.as_ref().map(|p| p.name()),
+      )
+      .finish()
   }
 }
 

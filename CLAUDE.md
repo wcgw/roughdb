@@ -299,7 +299,7 @@ what remains is compaction, the full Iterator/Snapshot API, and operational hygi
 
 **Compression**
 
-- [ ] **Bloom filters**: Kirsch-Mitzenmacher double-hashing; `k = round(0.69 * bits_per_key)` hash functions; one filter
+- [x] **Bloom filters**: Kirsch-Mitzenmacher double-hashing; `k = round(0.69 * bits_per_key)` hash functions; one filter
   per ~2 KB of data blocks stored in the SSTable filter block. The filter block is written uncompressed and read at
   `Table::open`; `Table::get` checks it after the index-block lookup and before reading or decompressing any data
   block, so a definite-negative skips all I/O and decompression entirely. A `FilterPolicy` trait allows custom

@@ -11,12 +11,15 @@
 //    limitations under the License.
 
 use crate::error::Error;
+use crate::filter::FilterPolicy;
 use crate::iter::InternalIterator;
 use crate::table::block::Block;
+use crate::table::filter_block::FilterBlockReader;
 use crate::table::format::{read_block, BlockHandle, Footer, FOOTER_ENCODED_LENGTH};
 use crate::table::two_level_iterator::TwoLevelIterator;
 use std::fs::File;
 use std::os::unix::fs::FileExt;
+use std::sync::Arc;
 
 /// Three-way result of a `Table::get` lookup.
 ///
@@ -35,19 +38,29 @@ pub(crate) enum LookupResult {
 
 /// A random-access SSTable reader.
 ///
-/// `Table::open` reads the footer and index block once; subsequent `get` calls
-/// use the in-memory index to locate data blocks, reading them from disk via
-/// `pread` (no seeking — takes `&self`).  See `table/table.h/cc`.
+/// `Table::open` reads the footer, index block, and (optionally) the filter
+/// block once; subsequent `get` calls use the in-memory index and filter to
+/// locate data blocks, reading them from disk via `pread` (no seeking —
+/// takes `&self`).  See `table/table.h/cc`.
 pub(crate) struct Table {
   file: File,
   index_block: Block,
+  /// Parsed filter block, present when the SSTable was written with a filter
+  /// policy whose name matches the one in the metaindex.
+  filter: Option<FilterBlockReader>,
 }
 
 impl Table {
   /// Open an SSTable file of `file_size` bytes.
   ///
-  /// Reads and validates the footer, then reads the index block into memory.
-  pub(crate) fn open(file: File, file_size: u64) -> Result<Self, Error> {
+  /// Reads and validates the footer, then reads the index block and (if
+  /// `filter_policy` is `Some` and the metaindex contains a matching filter
+  /// block) the filter block into memory.
+  pub(crate) fn open(
+    file: File,
+    file_size: u64,
+    filter_policy: Option<&Arc<dyn FilterPolicy>>,
+  ) -> Result<Self, Error> {
     if file_size < FOOTER_ENCODED_LENGTH as u64 {
       return Err(Error::Corruption("SSTable file too small".to_owned()));
     }
@@ -62,7 +75,18 @@ impl Table {
     let index_contents = read_block(&file, &footer.index_handle, false)?;
     let index_block = Block::new(index_contents.data);
 
-    Ok(Table { file, index_block })
+    // Optionally read the filter block from the metaindex.
+    let filter = filter_policy.and_then(|policy| {
+      read_filter_block(&file, &footer.metaindex_handle, policy)
+        .ok()
+        .flatten()
+    });
+
+    Ok(Table {
+      file,
+      index_block,
+      filter,
+    })
   }
 
   /// Look up `user_key` in the table, returning a [`LookupResult`].
@@ -85,6 +109,14 @@ impl Table {
 
     // Decode the BlockHandle from the index entry's value.
     let (handle, _) = BlockHandle::decode_from(idx.value())?;
+
+    // Consult the filter (if present) before doing any data-block I/O.
+    // A definite-negative skips the read entirely; false positives proceed normally.
+    if let Some(filter) = &self.filter {
+      if !filter.key_may_match(handle.offset, user_key) {
+        return Ok(LookupResult::NotInTable);
+      }
+    }
 
     // Read and scan the data block.
     let contents = read_block(&self.file, &handle, verify_checksums)?;
@@ -158,6 +190,49 @@ impl Table {
   }
 }
 
+// ── Private helpers ───────────────────────────────────────────────────────────
+
+/// Read the filter block from a table's metaindex, if the metaindex contains an
+/// entry for the key `"filter.<policy.name()>"`.
+///
+/// Returns `Ok(Some(_))` when a matching filter block is found and parsed
+/// successfully.  Returns `Ok(None)` when no matching entry exists (e.g. the
+/// table was written without a filter policy, or the policy name differs).
+/// Returns `Ok(None)` (rather than an error) on soft failures such as a
+/// truncated or unrecognised metaindex — reading filter blocks is best-effort.
+fn read_filter_block(
+  file: &File,
+  metaindex_handle: &BlockHandle,
+  policy: &Arc<dyn FilterPolicy>,
+) -> Result<Option<FilterBlockReader>, Error> {
+  // Read the metaindex block (always uncompressed; checksums not required here).
+  let meta_contents = read_block(file, metaindex_handle, false)?;
+  let meta_block = Block::new(meta_contents.data);
+
+  // Seek the metaindex for the key "filter.<policy_name>".
+  let filter_key = format!("filter.{}", policy.name());
+  let filter_key_bytes = filter_key.as_bytes();
+  let mut it = meta_block.iter();
+  it.seek(filter_key_bytes);
+  if !it.valid() || it.key() != filter_key_bytes {
+    // No matching filter entry — table was written without this filter policy.
+    return Ok(None);
+  }
+
+  // Decode the BlockHandle to the filter block.
+  let (filter_handle, _) = BlockHandle::decode_from(it.value())?;
+
+  // Read the raw filter block bytes (uncompressed; checksums skipped here as
+  // LevelDB does in `ReadFilter` — the filter block is verified at build time).
+  let filter_contents = read_block(file, &filter_handle, false)?;
+
+  // Parse and return the FilterBlockReader.
+  Ok(FilterBlockReader::new(
+    Arc::clone(policy),
+    filter_contents.data,
+  ))
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -168,7 +243,7 @@ mod tests {
   fn write_table_internal(pairs: &[(&[u8], u64, u8, &[u8])]) -> (tempfile::NamedTempFile, u64) {
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let file = tmp.reopen().unwrap();
-    let mut b = TableBuilder::new(file, 4096, 16);
+    let mut b = TableBuilder::new(file, 4096, 16, None);
     for &(uk, seq, vt, val) in pairs {
       let ikey = make_internal_key(uk, seq, vt);
       b.add(&ikey, val).unwrap();
@@ -180,14 +255,14 @@ mod tests {
   #[test]
   fn open_and_get_user_key() {
     let (tmp, size) = write_table_internal(&[(b"hello", 1, 1, b"world")]);
-    let table = Table::open(tmp.reopen().unwrap(), size).unwrap();
+    let table = Table::open(tmp.reopen().unwrap(), size, None).unwrap();
     assert!(matches!(table.get(b"hello", false).unwrap(), LookupResult::Value(v) if v == b"world"));
   }
 
   #[test]
   fn get_missing_key() {
     let (tmp, size) = write_table_internal(&[(b"a", 1, 1, b"1")]);
-    let table = Table::open(tmp.reopen().unwrap(), size).unwrap();
+    let table = Table::open(tmp.reopen().unwrap(), size, None).unwrap();
     assert!(matches!(
       table.get(b"z", false).unwrap(),
       LookupResult::NotInTable
@@ -198,7 +273,7 @@ mod tests {
   fn get_tombstone_returns_deleted() {
     // vtype=0 is a deletion tombstone — must return Deleted, not NotInTable.
     let (tmp, size) = write_table_internal(&[(b"gone", 1, 0, b"")]);
-    let table = Table::open(tmp.reopen().unwrap(), size).unwrap();
+    let table = Table::open(tmp.reopen().unwrap(), size, None).unwrap();
     assert!(matches!(
       table.get(b"gone", false).unwrap(),
       LookupResult::Deleted
@@ -208,14 +283,14 @@ mod tests {
   #[test]
   fn get_newest_version_wins() {
     let (tmp, size) = write_table_internal(&[(b"key", 10, 1, b"new"), (b"key", 5, 1, b"old")]);
-    let table = Table::open(tmp.reopen().unwrap(), size).unwrap();
+    let table = Table::open(tmp.reopen().unwrap(), size, None).unwrap();
     assert!(matches!(table.get(b"key", false).unwrap(), LookupResult::Value(v) if v == b"new"));
   }
 
   #[test]
   fn verify_checksums_passes_on_valid_block() {
     let (tmp, size) = write_table_internal(&[(b"k", 1, 1, b"v")]);
-    let table = Table::open(tmp.reopen().unwrap(), size).unwrap();
+    let table = Table::open(tmp.reopen().unwrap(), size, None).unwrap();
     assert!(matches!(
       table.get(b"k", true).unwrap(),
       LookupResult::Value(_)
@@ -227,7 +302,7 @@ mod tests {
     let tmp = tempfile::NamedTempFile::new().unwrap();
     std::io::Write::write_all(&mut tmp.reopen().unwrap(), &[0u8; 10]).unwrap();
     assert!(matches!(
-      Table::open(tmp.reopen().unwrap(), 10),
+      Table::open(tmp.reopen().unwrap(), 10, None),
       Err(Error::Corruption(_))
     ));
   }
