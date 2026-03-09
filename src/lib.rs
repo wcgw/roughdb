@@ -318,11 +318,13 @@ impl Db {
   /// Open (or create) a persistent database at `path`.
   ///
   /// ## New database (no `CURRENT` file)
+  /// - Returns [`Error::InvalidArgument`] if `options.create_if_missing` is `false`.
   /// - Creates a `MANIFEST-000002` with the initial `VersionEdit`.
   /// - Creates `CURRENT` pointing to the MANIFEST.
   /// - Creates `000001.log` as the WAL.
   ///
   /// ## Existing database (`CURRENT` file present)
+  /// - Returns [`Error::InvalidArgument`] if `options.error_if_exists` is `true`.
   /// - Recovers the `VersionSet` from the MANIFEST (loads live SSTable files).
   /// - Replays WAL records whose sequence number exceeds the last sequence
   ///   already reflected in the MANIFEST (avoids double-inserting flushed data).
@@ -332,11 +334,28 @@ impl Db {
     use std::fs::OpenOptions;
 
     let path = path.as_ref();
-    std::fs::create_dir_all(path)?;
-
     let current_path = path.join("CURRENT");
+    let db_exists = current_path.exists();
 
-    let (version_set, mem, last_sequence) = if current_path.exists() {
+    if db_exists && options.error_if_exists {
+      return Err(Error::InvalidArgument(format!(
+        "database already exists at {}",
+        path.display()
+      )));
+    }
+    if !db_exists && !options.create_if_missing {
+      return Err(Error::InvalidArgument(format!(
+        "database does not exist at {}",
+        path.display()
+      )));
+    }
+
+    // Create the directory only when we are going to create a new database.
+    if !db_exists {
+      std::fs::create_dir_all(path)?;
+    }
+
+    let (version_set, mem, last_sequence) = if db_exists {
       // ── Existing database: MANIFEST-driven recovery ──────────────────────
       let mut vs = VersionSet::recover(path)?;
       let manifest_last_seq = vs.last_sequence();
@@ -1360,7 +1379,7 @@ fn delete_obsolete_files(path: &std::path::Path, state: &Mutex<DbState>) {
 
 #[cfg(test)]
 mod tests {
-  use crate::{Db, Options, ReadOptions, WriteOptions};
+  use crate::{Db, Error, Options, ReadOptions, WriteOptions};
 
   #[test]
   fn in_memory_round_trip() {
@@ -1376,7 +1395,7 @@ mod tests {
   fn open_creates_and_persists() {
     let dir = tempfile::tempdir().unwrap();
     {
-      let db = Db::open(dir.path(), Options::default()).unwrap();
+      let db = Db::open(dir.path(), create_options()).unwrap();
       db.put(b"key", b"value").unwrap();
       db.put(b"foo", b"bar").unwrap();
       db.delete(b"foo").unwrap();
@@ -1390,8 +1409,67 @@ mod tests {
   #[test]
   fn open_empty_db_is_empty() {
     let dir = tempfile::tempdir().unwrap();
-    let db = Db::open(dir.path(), Options::default()).unwrap();
+    let db = Db::open(dir.path(), create_options()).unwrap();
     assert!(db.get(b"anything").unwrap_err().is_not_found());
+  }
+
+  #[test]
+  fn open_fails_when_missing_and_create_if_missing_false() {
+    let dir = tempfile::tempdir().unwrap();
+    let opts = Options::default(); // create_if_missing = false
+    let err = Db::open(dir.path(), opts).err().unwrap();
+    assert!(
+      matches!(err, Error::InvalidArgument(_)),
+      "expected InvalidArgument"
+    );
+  }
+
+  #[test]
+  fn open_succeeds_when_missing_and_create_if_missing_true() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path(), create_options()).unwrap();
+    db.put(b"k", b"v").unwrap();
+    assert_eq!(db.get(b"k").unwrap(), b"v");
+  }
+
+  #[test]
+  fn open_fails_when_exists_and_error_if_exists_true() {
+    let dir = tempfile::tempdir().unwrap();
+    // Create the database first.
+    Db::open(dir.path(), create_options()).unwrap();
+    // Second open with error_if_exists must fail.
+    let opts = Options {
+      error_if_exists: true,
+      ..Options::default()
+    };
+    let err = Db::open(dir.path(), opts).err().unwrap();
+    assert!(
+      matches!(err, Error::InvalidArgument(_)),
+      "expected InvalidArgument"
+    );
+  }
+
+  #[test]
+  fn open_succeeds_when_exists_and_error_if_exists_false() {
+    let dir = tempfile::tempdir().unwrap();
+    Db::open(dir.path(), create_options()).unwrap();
+    // Default error_if_exists = false — reopening must succeed.
+    let db = Db::open(dir.path(), Options::default()).unwrap();
+    // DB is empty but opens without error.
+    assert!(db.get(b"k").unwrap_err().is_not_found());
+  }
+
+  #[test]
+  fn create_if_missing_does_not_create_directory_on_failure() {
+    // When create_if_missing = false, Db::open must not create the directory.
+    let base = tempfile::tempdir().unwrap();
+    let db_path = base.path().join("nonexistent");
+    assert!(!db_path.exists());
+    let _ = Db::open(&db_path, Options::default());
+    assert!(
+      !db_path.exists(),
+      "Db::open must not create the directory when create_if_missing = false"
+    );
   }
 
   #[test]
@@ -1399,7 +1477,7 @@ mod tests {
     use crate::WriteBatch;
     let dir = tempfile::tempdir().unwrap();
     {
-      let db = Db::open(dir.path(), Options::default()).unwrap();
+      let db = Db::open(dir.path(), create_options()).unwrap();
       let mut batch = WriteBatch::new();
       batch.put(b"a", b"1");
       batch.put(b"b", b"2");
@@ -1416,7 +1494,7 @@ mod tests {
   fn sequence_advances_across_reopen() {
     let dir = tempfile::tempdir().unwrap();
     {
-      let db = Db::open(dir.path(), Options::default()).unwrap();
+      let db = Db::open(dir.path(), create_options()).unwrap();
       db.put(b"k", b"first").unwrap();
     }
     {
@@ -1429,9 +1507,17 @@ mod tests {
 
   // ── L0 flush + disk read tests ─────────────────────────────────────────────
 
+  fn create_options() -> Options {
+    Options {
+      create_if_missing: true,
+      ..Options::default()
+    }
+  }
+
   fn small_options() -> Options {
     // write_buffer_size small enough to flush after a handful of entries.
     Options {
+      create_if_missing: true,
       write_buffer_size: 512,
       ..Options::default()
     }
@@ -1930,6 +2016,7 @@ mod tests {
   /// Options that produce many small flushes so L0 fills quickly.
   fn tiny_options() -> Options {
     Options {
+      create_if_missing: true,
       write_buffer_size: 128,
       ..Options::default()
     }
