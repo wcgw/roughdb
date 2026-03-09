@@ -102,10 +102,10 @@
 //! let snap = db.get_snapshot();
 //! db.put(b"k", b"v2")?;
 //!
-//! let opts = ReadOptions { snapshot: Some(snap), ..ReadOptions::default() };
+//! let opts = ReadOptions { snapshot: Some(&snap), ..ReadOptions::default() };
 //! assert_eq!(db.get_with_options(&opts, b"k")?, b"v1");
 //!
-//! db.release_snapshot(snap);
+//! // snap releases automatically here when it goes out of scope.
 //! # Ok::<(), roughdb::Error>(())
 //! ```
 
@@ -122,7 +122,7 @@ use std::sync::{Arc, Mutex};
 pub mod error;
 pub use error::Error;
 pub mod options;
-pub use options::{CompressionType, Options, ReadOptions, Snapshot, WriteOptions};
+pub use options::{CompressionType, Options, WriteOptions};
 pub(crate) mod coding;
 pub(crate) mod db;
 pub(crate) mod iter;
@@ -131,6 +131,70 @@ pub(crate) mod memtable;
 pub(crate) mod table;
 pub mod write_batch;
 pub use write_batch::{Handler, WriteBatch};
+
+/// An immutable snapshot of the database state at a particular sequence number.
+///
+/// Obtained via [`Db::get_snapshot`] and passed via [`ReadOptions::snapshot`] to pin reads to a
+/// specific point in time.  The snapshot is released automatically when it is dropped; compaction
+/// is then free to discard entries that were only retained because of it.
+///
+/// See `include/leveldb/db.h: DB::GetSnapshot`.
+pub struct Snapshot<'db> {
+  db: &'db Db,
+  pub(crate) seq: u64,
+}
+
+impl Drop for Snapshot<'_> {
+  fn drop(&mut self) {
+    self.db.state.lock().unwrap().snapshots.remove(&self.seq);
+  }
+}
+
+impl std::fmt::Debug for Snapshot<'_> {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("Snapshot").field("seq", &self.seq).finish()
+  }
+}
+
+/// Options that control read operations.
+///
+/// See `include/leveldb/options.h`.
+#[derive(Debug, Clone, Copy)]
+pub struct ReadOptions<'snap> {
+  /// Verify block checksums on every read.
+  ///
+  /// **Partially implemented.** `Table::get` and `read_block` respect this flag, but
+  /// `Version::get` (the SSTable lookup path used by `Db::get`) currently hardcodes `false`,
+  /// so point lookups never verify checksums even when this is set. Iterator block reads are
+  /// also unaffected. Setting this to `true` has no effect until the flag is fully threaded
+  /// through.
+  ///
+  /// Default: false.
+  pub verify_checksums: bool,
+
+  /// Cache blocks read during this operation in the block cache.
+  /// Set to `false` for bulk scans to avoid polluting the cache.
+  ///
+  /// **Not yet implemented.** Accepted but ignored — there is no block cache yet, so all block
+  /// reads bypass caching unconditionally.
+  ///
+  /// Default: true.
+  pub fill_cache: bool,
+
+  /// Read as of this snapshot's sequence number.
+  /// `None` means "use an implicit snapshot of the current state".
+  pub snapshot: Option<&'snap Snapshot<'snap>>,
+}
+
+impl Default for ReadOptions<'_> {
+  fn default() -> Self {
+    ReadOptions {
+      verify_checksums: false,
+      fill_cache: true,
+      snapshot: None,
+    }
+  }
+}
 
 // ── Shared inserter used by both Db::write and Db::recover_wal ───────────────
 
@@ -467,7 +531,7 @@ impl Db {
     let (sequence, mem, imm, version) = {
       let state = self.state.lock().unwrap();
       (
-        opts.snapshot.map(|s| s.0).unwrap_or(state.last_sequence),
+        opts.snapshot.map(|s| s.seq).unwrap_or(state.last_sequence),
         Arc::clone(&state.mem),
         state.imm.as_ref().map(Arc::clone),
         state.version_set.as_ref().map(|vs| vs.current()),
@@ -501,32 +565,19 @@ impl Db {
 
   /// Return an immutable snapshot of the current database state.
   ///
-  /// Pass the returned [`Snapshot`] via [`ReadOptions::snapshot`] to pin reads
-  /// (via `get` or `new_iterator`) to this point in time.  The snapshot is
-  /// valid until `release_snapshot` is called.
+  /// Pass a reference to the returned [`Snapshot`] via [`ReadOptions::snapshot`] to pin reads
+  /// (via [`Db::get_with_options`] or [`Db::new_iterator`]) to this point in time.
   ///
-  /// Pinned snapshots prevent compaction from discarding entries that are still
-  /// visible through them, so snapshots should be released promptly.
+  /// The snapshot is released automatically when it is dropped.  Pinned snapshots prevent
+  /// compaction from discarding entries still visible through them, so avoid holding snapshots
+  /// longer than necessary.
   ///
   /// See `include/leveldb/db.h: DB::GetSnapshot`.
-  pub fn get_snapshot(&self) -> Snapshot {
+  pub fn get_snapshot(&self) -> Snapshot<'_> {
     let mut state = self.state.lock().unwrap();
     let seq = state.last_sequence;
     state.snapshots.insert(seq);
-    Snapshot(seq)
-  }
-
-  /// Release a snapshot previously obtained from [`get_snapshot`].
-  ///
-  /// After this call the snapshot is no longer valid; it must not be used
-  /// in `ReadOptions`.  Compaction is free to reclaim entries that were only
-  /// retained because of this snapshot.
-  ///
-  /// See `include/leveldb/db.h: DB::ReleaseSnapshot`.
-  ///
-  /// [`get_snapshot`]: Db::get_snapshot
-  pub fn release_snapshot(&self, snap: Snapshot) {
-    self.state.lock().unwrap().snapshots.remove(&snap.0);
+    Snapshot { db: self, seq }
   }
 
   pub fn put<K, V>(&self, key: K, value: V) -> Result<(), Error>
@@ -555,7 +606,7 @@ impl Db {
   ///
   /// The memtable(s) and all SSTable file handles are pinned for the lifetime
   /// of the returned `DbIter`; reads and writes proceed concurrently.
-  pub fn new_iterator(&self, opts: &ReadOptions) -> Result<DbIter, Error> {
+  pub fn new_iterator(&self, opts: &ReadOptions<'_>) -> Result<DbIter, Error> {
     use crate::db::db_iter::DbIterator;
     use crate::db::merge_iter::MergingIterator;
 
@@ -564,7 +615,7 @@ impl Db {
     let (sequence, mem, imm, version) = {
       let state = self.state.lock().unwrap();
       (
-        opts.snapshot.map(|s| s.0).unwrap_or(state.last_sequence),
+        opts.snapshot.map(|s| s.seq).unwrap_or(state.last_sequence),
         Arc::clone(&state.mem),
         state.imm.as_ref().map(Arc::clone),
         state.version_set.as_ref().map(|vs| vs.current()),
@@ -2257,12 +2308,12 @@ mod tests {
 
     // With the snapshot we see the value as of when it was taken.
     let opts = ReadOptions {
-      snapshot: Some(snap),
+      snapshot: Some(&snap),
       ..ReadOptions::default()
     };
     assert_eq!(db.get_with_options(&opts, b"k").unwrap(), b"v1");
 
-    db.release_snapshot(snap);
+    drop(snap);
     // After release, reads still see the latest value.
     assert_eq!(db.get(b"k").unwrap(), b"v2");
   }
@@ -2276,14 +2327,13 @@ mod tests {
 
     // Snapshot was taken before the deletion — key should be visible.
     let opts = ReadOptions {
-      snapshot: Some(snap),
+      snapshot: Some(&snap),
       ..ReadOptions::default()
     };
     assert_eq!(db.get_with_options(&opts, b"x").unwrap(), b"alive");
 
     // Current view sees the deletion.
     assert!(db.get(b"x").unwrap_err().is_not_found());
-    db.release_snapshot(snap);
   }
 
   #[test]
@@ -2296,7 +2346,7 @@ mod tests {
     db.delete(b"a").unwrap();
 
     let opts = ReadOptions {
-      snapshot: Some(snap),
+      snapshot: Some(&snap),
       ..ReadOptions::default()
     };
     let mut it = db.new_iterator(&opts).unwrap();
@@ -2312,8 +2362,6 @@ mod tests {
     assert_eq!(it.value(), b"2");
     it.next();
     assert!(!it.valid());
-
-    db.release_snapshot(snap);
   }
 
   #[test]
@@ -2326,18 +2374,15 @@ mod tests {
     db.put(b"k", b"v3").unwrap();
 
     let opts1 = ReadOptions {
-      snapshot: Some(snap1),
+      snapshot: Some(&snap1),
       ..ReadOptions::default()
     };
     let opts2 = ReadOptions {
-      snapshot: Some(snap2),
+      snapshot: Some(&snap2),
       ..ReadOptions::default()
     };
     assert_eq!(db.get_with_options(&opts1, b"k").unwrap(), b"v1");
     assert_eq!(db.get_with_options(&opts2, b"k").unwrap(), b"v2");
     assert_eq!(db.get(b"k").unwrap(), b"v3");
-
-    db.release_snapshot(snap1);
-    db.release_snapshot(snap2);
   }
 }
