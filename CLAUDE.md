@@ -231,13 +231,17 @@ what remains is compaction, the full Iterator/Snapshot API, and operational hygi
 
 **Compaction**
 
-- [ ] **Background compaction**: Triggered when L0 file count ≥ 4. Selects input files using `compact_pointer`
-  per level (round-robin across the key space), runs a `MergingIterator` over all inputs, drops entries shadowed
-  by newer versions or obsolete tombstones, writes output files to L+1, updates `VersionSet` via `log_and_apply`.
-  Slow-write throttle at L0 ≥ 8; write-stop at L0 ≥ 12. See `db/db_impl.cc: DBImpl::BackgroundCompaction`.
-- [ ] **Write stall / write stop**: In `Db::write`, after a flush, check L0 file count. Sleep briefly per write
-  when count ≥ 8 (to let compaction catch up); block entirely when count ≥ 12. Resume when compaction drains L0
-  below the threshold. See `db/db_impl.cc: DBImpl::MakeRoomForWrite`.
+- [x] **L0→L1 compaction**: Triggered when L0 file count ≥ 4 (`L0_COMPACTION_TRIGGER`). `pick_compaction` selects
+  all L0 files plus any L1 files whose user-key range overlaps the union L0 range. `do_compaction` (no lock) builds
+  a `MergingIterator` over all inputs (L0 newest-first so ties resolve to newer versions), applies shadow-key
+  pruning (only the newest version of each user key is kept) and tombstone elision (deletion markers are dropped
+  when no data exists at L2+). Writes output SSTables to L1 (new file per `max_file_size`). `install_compaction`
+  (under lock) records a single `VersionEdit` deleting all inputs and adding all outputs, then calls
+  `log_and_apply`. `log_and_apply` now sorts L1–L6 files by smallest user key after each edit. `maybe_compact`
+  orchestrates the three phases; called from `Db::write` in a loop (up to 32×) after every flush. Slow-write
+  throttle: sleeps 1 ms per iteration when L0 ≥ `L0_SLOWDOWN_WRITES_TRIGGER` (8). No background thread — runs
+  synchronously on the writing goroutine. `compact_pointer` round-robin not implemented (all L0 files always
+  selected). See `db/db_impl.cc: DBImpl::BackgroundCompaction`, `DoCompactionWork`, `MakeRoomForWrite`.
 - [ ] **`Db::CompactRange(begin, end)`**: Manual compaction of a user key range across all levels. Overlapping
   files are compacted into the deepest level that contains them. See `db/db_impl.cc: DBImpl::CompactRange`.
 

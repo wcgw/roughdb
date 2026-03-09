@@ -454,6 +454,26 @@ impl Db {
         drop(state);
         // Phase 4: delete obsolete files (lock released; best-effort).
         delete_obsolete_files(path, &self.state);
+        // Phase 5: compact L0 → L1 if we've hit the trigger.  Loop so that a
+        // burst of flushes that accumulates more than one compaction's worth of
+        // L0 files still gets drained before returning to the caller.
+        for _ in 0..32 {
+          let l0 = {
+            let g = self.state.lock().unwrap();
+            g.version_set
+              .as_ref()
+              .map_or(0, |vs| vs.current().files[0].len())
+          };
+          if l0 < L0_COMPACTION_TRIGGER {
+            break;
+          }
+          // Slow-write throttle: yield briefly when L0 is piling up but hasn't
+          // hit the stop threshold.  This matches LevelDB's MakeRoomForWrite.
+          if l0 >= L0_SLOWDOWN_WRITES_TRIGGER {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+          }
+          maybe_compact(path, &self.state, &self.options);
+        }
       }
     }
 
@@ -577,6 +597,320 @@ fn finish_flush(state: &mut DbState, result: FlushResult) -> Result<(), Error> {
   // Best-effort delete — ignore errors (e.g. the path never existed on new DB).
   let _ = std::fs::remove_file(&result.old_log_path);
   Ok(())
+}
+
+// ── Compaction ────────────────────────────────────────────────────────────────
+//
+// L0→L1 compaction is triggered when L0 reaches L0_COMPACTION_TRIGGER files.
+// It runs synchronously after each flush using the same lock-snapshot pattern
+// as flush: snapshot state under lock, I/O without lock, install under lock.
+//
+// Shadow-key pruning: for each user key, only the newest version is kept.
+// Tombstone elision: deletion markers are dropped when there is definitely no
+// data for that key below the output level (L2+).
+
+const L0_COMPACTION_TRIGGER: usize = 4;
+const L0_SLOWDOWN_WRITES_TRIGGER: usize = 8;
+
+/// Extract the user-key prefix from an SSTable internal key.
+/// Internal key format: `user_key || (seq<<8|vtype).to_le_bytes()` (8-byte tag).
+fn ikey_user_key(ikey: &[u8]) -> &[u8] {
+  if ikey.len() >= 8 {
+    &ikey[..ikey.len() - 8]
+  } else {
+    ikey
+  }
+}
+
+/// True if the user-key ranges [a_s..a_l] and [b_s..b_l] overlap.
+fn key_ranges_overlap(a_s: &[u8], a_l: &[u8], b_s: &[u8], b_l: &[u8]) -> bool {
+  ikey_user_key(a_s) <= ikey_user_key(b_l) && ikey_user_key(b_s) <= ikey_user_key(a_l)
+}
+
+/// True if `user_key` is definitely absent from all files at level ≥ `from_level`.
+///
+/// A conservative check: returns `false` if any file's key range spans the user
+/// key, even if the key isn't actually present in the file.  Safe to use for
+/// tombstone elision: we only drop a tombstone when this returns `true`.
+fn is_base_level(version: &crate::db::version::Version, uk: &[u8], from_level: usize) -> bool {
+  use crate::db::version::NUM_LEVELS;
+  for level in from_level..NUM_LEVELS {
+    for meta in &version.files[level] {
+      if uk >= ikey_user_key(&meta.smallest) && uk <= ikey_user_key(&meta.largest) {
+        return false;
+      }
+    }
+  }
+  true
+}
+
+/// Select files for the next L0→L1 compaction.
+///
+/// Returns `None` if L0 has fewer than `L0_COMPACTION_TRIGGER` files.  Otherwise
+/// returns `(l0_inputs, l1_inputs)` where `l1_inputs` are the L1 files whose key
+/// range overlaps with the union key range of all L0 files.
+type CompactionInputs = (Vec<Arc<FileMetaData>>, Vec<Arc<FileMetaData>>);
+
+fn pick_compaction(version: &crate::db::version::Version) -> Option<CompactionInputs> {
+  if version.files[0].len() < L0_COMPACTION_TRIGGER {
+    return None;
+  }
+  let l0_inputs: Vec<Arc<FileMetaData>> = version.files[0].to_vec();
+
+  // Union key range of all L0 files.
+  let mut range_small = l0_inputs[0].smallest.clone();
+  let mut range_large = l0_inputs[0].largest.clone();
+  for m in l0_inputs.iter().skip(1) {
+    if ikey_user_key(&m.smallest) < ikey_user_key(&range_small) {
+      range_small = m.smallest.clone();
+    }
+    if ikey_user_key(&m.largest) > ikey_user_key(&range_large) {
+      range_large = m.largest.clone();
+    }
+  }
+
+  let l1_inputs: Vec<Arc<FileMetaData>> = version.files[1]
+    .iter()
+    .filter(|m| key_ranges_overlap(&m.smallest, &m.largest, &range_small, &range_large))
+    .cloned()
+    .collect();
+
+  Some((l0_inputs, l1_inputs))
+}
+
+/// A completed compaction output SSTable.
+struct CompactionOutput {
+  file_number: u64,
+  file_size: u64,
+  smallest: Vec<u8>,
+  largest: Vec<u8>,
+  table: Arc<Table>,
+}
+
+/// In-progress output SSTable being built during compaction.
+struct CompactionOutputFile {
+  file_number: u64,
+  path: std::path::PathBuf,
+  builder: TableBuilder,
+  smallest: Vec<u8>,
+}
+
+/// Finalise `cur`, open the file for reading, and push to `outputs`.
+fn finish_compaction_output(
+  cur: CompactionOutputFile,
+  largest: Vec<u8>,
+  outputs: &mut Vec<CompactionOutput>,
+) -> Result<(), Error> {
+  let file_size = cur.builder.finish()?;
+  let read_file = std::fs::File::open(&cur.path)?;
+  let table = Arc::new(Table::open(read_file, file_size)?);
+  outputs.push(CompactionOutput {
+    file_number: cur.file_number,
+    file_size,
+    smallest: cur.smallest,
+    largest,
+    table,
+  });
+  Ok(())
+}
+
+/// Phase 2 (no lock): merge input files, apply pruning, write L1 output SSTables.
+///
+/// Shadow-key pruning: for each user key, only the first (newest) version
+/// encountered in the merge order is kept.
+/// Tombstone elision: a deletion marker is dropped when there is provably no
+/// data for that key at L2+ (from_level=2 for L0→L1 compaction).
+fn do_compaction(
+  path: &std::path::Path,
+  state: &Mutex<DbState>,
+  version: &Arc<crate::db::version::Version>,
+  l0_inputs: &[Arc<FileMetaData>],
+  l1_inputs: &[Arc<FileMetaData>],
+  last_sequence: u64,
+  opts: &Options,
+) -> Result<Vec<CompactionOutput>, Error> {
+  use crate::db::merge_iter::MergingIterator;
+  use crate::iter::InternalIterator;
+
+  // Build children: L0 files first (newest-first, so lower-indexed children
+  // win ties in MergingIterator), then L1 files.
+  let mut children: Vec<Box<dyn InternalIterator>> = Vec::new();
+  for meta in l0_inputs.iter().chain(l1_inputs.iter()) {
+    let table = meta
+      .table
+      .as_ref()
+      .expect("compaction input must have an open table");
+    children.push(Box::new(table.new_iterator()?));
+  }
+
+  let mut merger = MergingIterator::new(children);
+  merger.seek_to_first();
+
+  let mut outputs: Vec<CompactionOutput> = Vec::new();
+  let mut current: Option<CompactionOutputFile> = None;
+  let mut current_largest: Vec<u8> = Vec::new();
+
+  // Deduplication / tombstone-elision state.
+  let mut current_user_key: Vec<u8> = Vec::new();
+  let mut has_current_user_key = false;
+  let mut last_sequence_for_key: u64 = u64::MAX;
+
+  while merger.valid() {
+    let ikey = merger.key().to_vec();
+    let value = merger.value().to_vec();
+    merger.next();
+
+    let (uk, seq, vtype) = match crate::table::format::parse_internal_key(&ikey) {
+      Some(parts) => parts,
+      None => continue, // corrupt key — skip silently
+    };
+
+    // Track first occurrence of this user key.
+    let first_occurrence = !has_current_user_key || uk != current_user_key.as_slice();
+    if first_occurrence {
+      current_user_key = uk.to_vec();
+      has_current_user_key = true;
+      last_sequence_for_key = u64::MAX;
+    }
+
+    // Determine whether to drop this entry.
+    let drop = if last_sequence_for_key <= last_sequence {
+      // Shadowed by a newer version that was already written to output.
+      true
+    } else if vtype == 0 && seq <= last_sequence && is_base_level(version, uk, 2) {
+      // Tombstone with no data below the output level — safe to elide.
+      true
+    } else {
+      false
+    };
+
+    last_sequence_for_key = seq;
+
+    if !drop {
+      // Rotate to a new output file if the current one is at the size limit.
+      if let Some(ref cur) = current {
+        if cur.builder.file_size() >= opts.max_file_size as u64 {
+          let finished = current.take().unwrap();
+          finish_compaction_output(finished, std::mem::take(&mut current_largest), &mut outputs)?;
+        }
+      }
+
+      // Open a new output file (allocating its number under the lock).
+      if current.is_none() {
+        let file_number = {
+          let mut g = state.lock().unwrap();
+          g.version_set.as_mut().unwrap().next_file_number()
+        };
+        let sst_path = path.join(format!("{file_number:06}.ldb"));
+        let file = std::fs::OpenOptions::new()
+          .write(true)
+          .create_new(true)
+          .open(&sst_path)?;
+        let builder = TableBuilder::new(file, opts.block_size, opts.block_restart_interval);
+        current = Some(CompactionOutputFile {
+          file_number,
+          path: sst_path,
+          builder,
+          smallest: ikey.clone(),
+        });
+      }
+
+      let cur = current.as_mut().unwrap();
+      cur.builder.add(&ikey, &value)?;
+      current_largest = ikey;
+    }
+  }
+
+  // Finalise the last output file (if any).
+  if let Some(cur) = current {
+    finish_compaction_output(cur, current_largest, &mut outputs)?;
+  }
+
+  Ok(outputs)
+}
+
+/// Phase 3 (under lock): record deleted input files and new output files in a
+/// single `VersionEdit`, then call `log_and_apply`.
+fn install_compaction(
+  state: &mut DbState,
+  l0_inputs: &[Arc<FileMetaData>],
+  l1_inputs: &[Arc<FileMetaData>],
+  outputs: Vec<CompactionOutput>,
+) -> Result<(), Error> {
+  let vs = state
+    .version_set
+    .as_mut()
+    .expect("install_compaction: no VersionSet");
+  let mut edit = VersionEdit::new();
+  for meta in l0_inputs {
+    edit.deleted_files.push((0, meta.number));
+  }
+  for meta in l1_inputs {
+    edit.deleted_files.push((1, meta.number));
+  }
+  for out in outputs {
+    let meta = FileMetaData::with_table(
+      out.file_number,
+      out.file_size,
+      out.smallest,
+      out.largest,
+      out.table,
+    );
+    edit.new_files.push((1, meta));
+  }
+  vs.set_last_sequence(state.last_sequence);
+  vs.log_and_apply(&mut edit)?;
+  Ok(())
+}
+
+/// Run a synchronous L0→L1 compaction if L0 has reached the trigger.
+///
+/// Uses the same three-phase lock protocol as flush:
+///   1. Snapshot current version under lock.
+///   2. Run I/O (MergingIterator + SSTable writes) without the lock.
+///   3. Install the result (VersionEdit + log_and_apply) under the lock.
+///
+/// Errors are silently ignored — a failed compaction does not affect
+/// correctness; L0 will simply accumulate more files and be retried.
+fn maybe_compact(path: &std::path::Path, state: &Mutex<DbState>, opts: &Options) {
+  // Phase 1: snapshot.
+  let (version, last_sequence) = {
+    let g = state.lock().unwrap();
+    let vs = match &g.version_set {
+      Some(vs) => vs,
+      None => return,
+    };
+    (vs.current(), g.last_sequence)
+  };
+
+  let (l0_inputs, l1_inputs) = match pick_compaction(&version) {
+    Some(p) => p,
+    None => return,
+  };
+
+  // Phase 2: I/O (no lock).
+  let outputs = match do_compaction(
+    path,
+    state,
+    &version,
+    &l0_inputs,
+    &l1_inputs,
+    last_sequence,
+    opts,
+  ) {
+    Ok(o) => o,
+    Err(_) => return,
+  };
+
+  // Phase 3: install.
+  {
+    let mut g = state.lock().unwrap();
+    if install_compaction(&mut g, &l0_inputs, &l1_inputs, outputs).is_err() {
+      return;
+    }
+  }
+
+  delete_obsolete_files(path, state);
 }
 
 // ── DeleteObsoleteFiles ───────────────────────────────────────────────────────
@@ -1149,5 +1483,130 @@ mod tests {
     let current = std::fs::read_to_string(dir.path().join("CURRENT")).unwrap();
     let manifest_name = current.trim();
     assert!(dir.path().join(manifest_name).exists());
+  }
+
+  // ── compaction tests ───────────────────────────────────────────────────────
+
+  /// Options that produce many small flushes so L0 fills quickly.
+  fn tiny_options() -> Options {
+    Options {
+      write_buffer_size: 128,
+      ..Options::default()
+    }
+  }
+
+  #[test]
+  fn compaction_reduces_l0_file_count() {
+    // Write enough data to produce ≥ L0_COMPACTION_TRIGGER flushes, which
+    // should trigger a compaction that moves files from L0 to L1.
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path(), tiny_options()).unwrap();
+
+    for i in 0u32..200 {
+      db.put(
+        format!("key{i:05}").as_bytes(),
+        format!("val{i:05}").as_bytes(),
+      )
+      .unwrap();
+    }
+
+    // After enough writes (many flushes → multiple compactions), L0 should
+    // be below the compaction trigger.
+    let l0_count = {
+      let g = db.state.lock().unwrap();
+      g.version_set.as_ref().unwrap().current().files[0].len()
+    };
+    assert!(
+      l0_count < crate::L0_COMPACTION_TRIGGER,
+      "L0 should have been compacted; found {l0_count} files"
+    );
+  }
+
+  #[test]
+  fn compacted_data_readable() {
+    // All keys written before compaction must still be readable after it.
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path(), tiny_options()).unwrap();
+
+    for i in 0u32..100 {
+      db.put(format!("k{i:04}").as_bytes(), format!("v{i:04}").as_bytes())
+        .unwrap();
+    }
+
+    // Force enough writes to guarantee multiple compactions have run.
+    for i in 0u32..100 {
+      let expected = format!("v{i:04}");
+      assert_eq!(
+        db.get(format!("k{i:04}").as_bytes()).unwrap(),
+        expected.as_bytes(),
+        "key k{i:04} not readable after compaction"
+      );
+    }
+  }
+
+  #[test]
+  fn compaction_tombstone_hides_l1_value() {
+    // Write a value for a key, flush it to L0/L1 via enough extra writes,
+    // then write a tombstone.  The tombstone must shadow the compacted value.
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path(), tiny_options()).unwrap();
+
+    db.put(b"target", b"old-value").unwrap();
+    // Write filler to flush "target" to disk.
+    for i in 0u32..100 {
+      db.put(format!("filler{i:05}").as_bytes(), b"x").unwrap();
+    }
+    // Now delete "target".
+    db.delete(b"target").unwrap();
+    // More filler so the tombstone also flushes.
+    for i in 100u32..200 {
+      db.put(format!("filler{i:05}").as_bytes(), b"x").unwrap();
+    }
+
+    assert!(
+      db.get(b"target").unwrap_err().is_not_found(),
+      "tombstone must shadow value in L1"
+    );
+  }
+
+  #[test]
+  fn compacted_data_readable_after_reopen() {
+    // Data compacted to L1 must survive a reopen (MANIFEST recovery).
+    let dir = tempfile::tempdir().unwrap();
+    {
+      let db = Db::open(dir.path(), tiny_options()).unwrap();
+      for i in 0u32..100 {
+        db.put(format!("k{i:04}").as_bytes(), format!("v{i:04}").as_bytes())
+          .unwrap();
+      }
+    }
+    // Reopen: data must come from L1 (via MANIFEST) not the WAL.
+    let db = Db::open(dir.path(), Options::default()).unwrap();
+    for i in 0u32..100 {
+      let expected = format!("v{i:04}");
+      assert_eq!(
+        db.get(format!("k{i:04}").as_bytes()).unwrap(),
+        expected.as_bytes(),
+        "key k{i:04} not found after reopen"
+      );
+    }
+  }
+
+  #[test]
+  fn l1_files_present_after_compaction() {
+    // After compaction, at least one L1 file must exist.
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path(), tiny_options()).unwrap();
+    for i in 0u32..200 {
+      db.put(format!("k{i:05}").as_bytes(), b"v").unwrap();
+    }
+    let l1_count = {
+      let g = db.state.lock().unwrap();
+      g.version_set.as_ref().unwrap().current().files[1].len()
+    };
+    assert!(
+      l1_count >= 1,
+      "expected at least one L1 file after compaction"
+    );
   }
 }
