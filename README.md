@@ -7,6 +7,11 @@ RoughDB is an LSM-tree key-value store with a LevelDB-compatible on-disk
 format. It supports persistent (WAL + MANIFEST + SSTables) and in-memory
 operation, multi-level compaction, and bidirectional iteration.
 
+> [!WARNING]
+> While I started this all "manually", many years ago... 
+> This is an experiment of sort. While I'm relatively serious about this, I also used it more recently to experiment
+> with different things, including generative AI. I'm reviewing all changes manually and carefully. 
+
 ## Getting started
 
 ```bash
