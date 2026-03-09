@@ -68,20 +68,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
   let db = Db::open(&cli.dir, opts)?;
 
   match cli.command {
-    Command::Get { key } => match db.get(key.as_bytes()) {
+    Command::Get { key } => match db.get(&key) {
       Ok(value) => println!("{}", String::from_utf8_lossy(&value)),
-      Err(e) if e.is_not_found() => {
-        eprintln!("not found: {key}");
-        std::process::exit(1);
-      }
+      Err(e) if e.is_not_found() => eprintln!("not found: {key}"),
       Err(e) => return Err(e.into()),
     },
-    Command::Put { key, value } => {
-      db.put(key.as_bytes(), value.as_bytes())?;
-    }
-    Command::Delete { key } => {
-      db.delete(key.as_bytes())?;
-    }
+    Command::Put { key, value } => db.put(key, value)?,
+    Command::Delete { key } => db.delete(key)?,
   }
 
   Ok(())
