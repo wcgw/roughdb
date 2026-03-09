@@ -11,6 +11,7 @@ bumpalo = "3.12.1"
 crc32c = "0.6.8"
 
 [dev-dependencies]
+clap = { version = "4", features = ["derive"] }
 criterion = "0.5"
 tempfile = "3"
 
