@@ -64,14 +64,22 @@ impl Memtable {
     table.alloc_and_insert(size, |buf| Entry::write_value_to(buf, seq, key, value));
   }
 
-  pub fn get<K: AsRef<[u8]>>(&self, key: K) -> MemtableResult<Vec<u8>> {
+  /// Look up `key` at the given `sequence` number.
+  ///
+  /// Returns `Hit(value)` if the newest version with `seq <= sequence` is a
+  /// Put, `Deleted` if it is a tombstone, or `Miss` if no visible version
+  /// exists.  Pass `u64::MAX` (or use [`Memtable::get_latest`]) to read the
+  /// absolute latest version.
+  pub fn get<K: AsRef<[u8]>>(&self, key: K, sequence: u64) -> MemtableResult<Vec<u8>> {
     let key = key.as_ref();
-    let lsize = Entry::lookup_size(key);
-    let mut lbuf = vec![0u8; lsize];
-    Entry::write_lookup_to(&mut lbuf, key);
+    // Seek to (key, sequence): in skip-list order (user_key ASC, seq DESC),
+    // this positions at the first entry with the same user key and seq ≤ sequence.
+    let ssize = Entry::seek_key_size(key, sequence);
+    let mut sbuf = vec![0u8; ssize];
+    Entry::write_seek_key_to(&mut sbuf, key, sequence);
     // SAFETY: SkipList reads are lock-free via acquire/release atomics.
     let table = unsafe { &*self.table.get() };
-    match table.find_first_at_or_after(&lbuf) {
+    match table.find_first_at_or_after(&sbuf) {
       Some(payload) => {
         let e = Entry::from_slice(payload);
         if e.key() == key {
@@ -338,29 +346,38 @@ mod tests {
   fn insert_get() {
     let table = Memtable::new();
     table.add(0, b"foo", b"bar");
-    assert_eq!(b"bar", table.get(b"foo").unwrap_value().as_slice());
+    assert_eq!(
+      b"bar",
+      table.get(b"foo", u64::MAX).unwrap_value().as_slice()
+    );
   }
 
   #[test]
   fn replace_get() {
     let table = Memtable::new();
     table.add(0, b"foo", b"foo");
-    assert_eq!(b"foo", table.get(b"foo").unwrap_value().as_slice());
+    assert_eq!(
+      b"foo",
+      table.get(b"foo", u64::MAX).unwrap_value().as_slice()
+    );
     table.add(1, b"foo", b"bar");
-    assert_eq!(b"bar", table.get(b"foo").unwrap_value().as_slice());
+    assert_eq!(
+      b"bar",
+      table.get(b"foo", u64::MAX).unwrap_value().as_slice()
+    );
   }
 
   #[test]
   fn miss_get() {
     let table = Memtable::new();
     table.add(0, b"foo", b"bar");
-    assert_eq!(table.get(b"bar"), MemtableResult::Miss);
+    assert_eq!(table.get(b"bar", u64::MAX), MemtableResult::Miss);
   }
 
   #[test]
   fn miss_empty() {
     let table = Memtable::new();
-    assert_eq!(table.get(b"foo"), MemtableResult::Miss);
+    assert_eq!(table.get(b"foo", u64::MAX), MemtableResult::Miss);
   }
 
   #[test]
@@ -368,7 +385,7 @@ mod tests {
     let table = Memtable::new();
     table.add(0, b"foo", b"bar");
     table.delete(1, b"foo");
-    assert_eq!(table.get(b"foo"), MemtableResult::Deleted);
+    assert_eq!(table.get(b"foo", u64::MAX), MemtableResult::Deleted);
   }
 
   #[test]
@@ -377,14 +394,14 @@ mod tests {
     {
       let foo = String::from("foo");
       table.add(0, foo.as_bytes(), foo.as_bytes());
-      let value = table.get(b"foo").unwrap_value();
+      let value = table.get(b"foo", u64::MAX).unwrap_value();
       assert_eq!("foo", from_utf8(value.as_ref()).unwrap());
     }
     {
       let sparkle_heart = String::from("💖");
       table.add(1, b"foo", sparkle_heart.as_bytes());
     }
-    let value = table.get(b"foo").unwrap_value();
+    let value = table.get(b"foo", u64::MAX).unwrap_value();
     assert_eq!("💖", from_utf8(value.as_ref()).unwrap());
     table.delete(2, b"foo");
     assert_eq!(3, unsafe { &*table.table.get() }.len());
