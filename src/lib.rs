@@ -1530,15 +1530,15 @@ mod tests {
     {
       let db = Db::open(dir.path(), create_options()).unwrap();
       let mut batch = WriteBatch::new();
-      batch.put(b"a", b"1");
-      batch.put(b"b", b"2");
-      batch.put(b"c", b"3");
+      batch.put("a", "1");
+      batch.put("b", "2");
+      batch.put("c", "3");
       db.write(&WriteOptions::default(), &batch).unwrap();
     }
     let db = Db::open(dir.path(), Options::default()).unwrap();
-    assert_eq!(db.get(b"a").unwrap(), b"1");
-    assert_eq!(db.get(b"b").unwrap(), b"2");
-    assert_eq!(db.get(b"c").unwrap(), b"3");
+    assert_eq!(db.get("a").unwrap(), b"1");
+    assert_eq!(db.get("b").unwrap(), b"2");
+    assert_eq!(db.get("c").unwrap(), b"3");
   }
 
   #[test]
