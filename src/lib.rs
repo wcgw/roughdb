@@ -10,6 +10,105 @@
 //    See the License for the specific language governing permissions and
 //    limitations under the License.
 
+//! RoughDB — an embedded key-value store written in Rust, porting
+//! [LevelDB](https://github.com/google/leveldb) to Rust.
+//!
+//! RoughDB is an LSM-tree key-value store with a LevelDB-compatible on-disk format.
+//! It supports persistent (WAL + MANIFEST + SSTables) and in-memory operation,
+//! multi-level compaction, snapshots, and bidirectional iteration.
+//!
+//! # Getting started
+//!
+//! ## Opening a database
+//!
+//! ```no_run
+//! use roughdb::{Db, Options};
+//!
+//! let mut opts = Options::default();
+//! opts.create_if_missing = true;
+//!
+//! let db = Db::open("/tmp/my_db", opts)?;
+//! # Ok::<(), roughdb::Error>(())
+//! ```
+//!
+//! Use [`Db::default`] for a lightweight in-memory database (no WAL, no flush):
+//!
+//! ```
+//! let db = roughdb::Db::default();
+//! ```
+//!
+//! ## Reads and writes
+//!
+//! ```
+//! # let db = roughdb::Db::default();
+//! db.put(b"hello", b"world")?;
+//!
+//! match db.get(b"hello") {
+//!     Ok(value) => println!("got: {}", String::from_utf8_lossy(&value)),
+//!     Err(e) if e.is_not_found() => println!("not found"),
+//!     Err(e) => return Err(e),
+//! }
+//!
+//! db.delete(b"hello")?;
+//! # Ok::<(), roughdb::Error>(())
+//! ```
+//!
+//! ## Atomic batch writes
+//!
+//! ```
+//! # let db = roughdb::Db::default();
+//! use roughdb::{WriteBatch, WriteOptions};
+//!
+//! let mut batch = WriteBatch::new();
+//! batch.put(b"key1", b"val1");
+//! batch.put(b"key2", b"val2");
+//! batch.delete(b"old_key");
+//!
+//! db.write(&WriteOptions::default(), &batch)?;
+//! # Ok::<(), roughdb::Error>(())
+//! ```
+//!
+//! ## Iterating over keys
+//!
+//! Iterators start unpositioned — call [`DbIter::seek_to_first`], [`DbIter::seek_to_last`],
+//! or [`DbIter::seek`] before reading.  Both forward and backward traversal are supported;
+//! direction switches are handled transparently.
+//!
+//! ```
+//! # let db = roughdb::Db::default();
+//! # db.put(b"a", b"1").unwrap();
+//! use roughdb::ReadOptions;
+//!
+//! let mut it = db.new_iterator(&ReadOptions::default())?;
+//!
+//! it.seek_to_first();
+//! while it.valid() {
+//!     println!("{:?} = {:?}", it.key(), it.value());
+//!     it.next();
+//! }
+//! # Ok::<(), roughdb::Error>(())
+//! ```
+//!
+//! ## Snapshots
+//!
+//! A snapshot pins the database to a specific point in time; reads through it
+//! see only writes that preceded the snapshot.
+//!
+//! ```
+//! # let db = roughdb::Db::default();
+//! use roughdb::ReadOptions;
+//!
+//! db.put(b"k", b"v1")?;
+//! let snap = db.get_snapshot();
+//! db.put(b"k", b"v2")?;
+//!
+//! let opts = ReadOptions { snapshot: Some(snap), ..ReadOptions::default() };
+//! assert_eq!(db.get_with_options(&opts, b"k")?, b"v1");
+//!
+//! db.release_snapshot(snap);
+//! # Ok::<(), roughdb::Error>(())
+//! ```
+
 use crate::db::version_edit::{FileMetaData, VersionEdit};
 use crate::db::version_set::VersionSet;
 use crate::log::reader::Reader as LogReader;
