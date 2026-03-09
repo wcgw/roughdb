@@ -90,6 +90,28 @@ impl TwoLevelIterator {
       }
     }
   }
+
+  /// Move backward past any empty or exhausted data blocks.
+  fn skip_empty_data_blocks_backward(&mut self) {
+    loop {
+      if self.data_iter.as_ref().is_some_and(|it| it.valid()) {
+        break;
+      }
+      if !self.index_iter.valid() {
+        self.data_iter = None;
+        return;
+      }
+      self.index_iter.prev();
+      if !self.index_iter.valid() {
+        self.data_iter = None;
+        return;
+      }
+      self.init_data_block();
+      if let Some(ref mut it) = self.data_iter {
+        it.seek_to_last();
+      }
+    }
+  }
 }
 
 impl InternalIterator for TwoLevelIterator {
@@ -106,6 +128,15 @@ impl InternalIterator for TwoLevelIterator {
     self.skip_empty_data_blocks_forward();
   }
 
+  fn seek_to_last(&mut self) {
+    self.index_iter.seek_to_last();
+    self.init_data_block();
+    if let Some(ref mut it) = self.data_iter {
+      it.seek_to_last();
+    }
+    self.skip_empty_data_blocks_backward();
+  }
+
   fn seek(&mut self, target: &[u8]) {
     self.index_iter.seek(target);
     self.init_data_block();
@@ -119,6 +150,12 @@ impl InternalIterator for TwoLevelIterator {
     debug_assert!(self.valid());
     self.data_iter.as_mut().unwrap().next();
     self.skip_empty_data_blocks_forward();
+  }
+
+  fn prev(&mut self) {
+    debug_assert!(self.valid());
+    self.data_iter.as_mut().unwrap().prev();
+    self.skip_empty_data_blocks_backward();
   }
 
   fn key(&self) -> &[u8] {

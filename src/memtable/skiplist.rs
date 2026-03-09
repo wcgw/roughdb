@@ -636,6 +636,66 @@ impl<'a> SkipListIter<'a> {
     self.current = unsafe { (*self.head).load_next(0) };
   }
 
+  /// Position at the last entry.  No-op (leaves iterator invalid) on an
+  /// empty list.
+  ///
+  /// Walks from `head` at the highest level, jumping right whenever possible,
+  /// stepping down at null links — the classic skip-list "find last" traversal.
+  pub(crate) fn seek_to_last(&mut self) {
+    // SAFETY: `list` and `head` are valid for `'a`.
+    let max_height = unsafe { (*self.list).max_height() };
+    let mut x = self.head;
+    let mut level = max_height - 1;
+    loop {
+      // SAFETY: `x` is `head` or a valid linked node; `level` < its height.
+      let next = unsafe { (*x).load_next(level) };
+      if !next.is_null() {
+        x = next;
+      } else if level == 0 {
+        break;
+      } else {
+        level -= 1;
+      }
+    }
+    // `x` is now `head` (empty list) or the last real node.
+    self.current = if std::ptr::eq(x, self.head) {
+      ptr::null()
+    } else {
+      x
+    };
+  }
+
+  /// Move to the predecessor of the current node.
+  ///
+  /// The skip list has no back-pointers, so we scan level-0 links from
+  /// `head` to find the node immediately before `self.current`.  This is
+  /// O(N) in the number of entries, which is acceptable for the backward
+  /// iteration use-case (compaction and user `Prev` calls are not on the
+  /// critical performance path).
+  ///
+  /// # Panics
+  /// Panics (debug) if `valid()` is false.
+  pub(crate) fn prev(&mut self) {
+    debug_assert!(self.valid(), "prev() called on exhausted iterator");
+    // Walk level-0 from head until the next pointer equals self.current.
+    let mut x = self.head;
+    loop {
+      // SAFETY: `x` is `head` or a valid linked node; level-0 is always
+      // initialised.
+      let next = unsafe { (*x).load_next(0) };
+      if std::ptr::eq(next, self.current) || next.is_null() {
+        break;
+      }
+      x = next;
+    }
+    // If `x` is `head`, `current` was the first real node → no predecessor.
+    self.current = if std::ptr::eq(x, self.head) {
+      ptr::null()
+    } else {
+      x
+    };
+  }
+
   /// Position at the first entry whose payload sorts ≥ `key_data`.
   ///
   /// `key_data` must be a valid Entry-encoded key (as produced by
@@ -763,5 +823,72 @@ mod tests {
     assert_eq!(seek(&list, b"aaa"), Some(b"A".to_vec()));
     assert_eq!(seek(&list, b"bbb"), Some(b"B".to_vec()));
     assert_eq!(seek(&list, b"ccc"), Some(b"C".to_vec()));
+  }
+
+  // ── Backward iteration tests ──────────────────────────────────────────────
+
+  #[test]
+  fn seek_to_last_empty_list() {
+    let list = make_list();
+    let mut it = list.iter();
+    it.seek_to_last();
+    assert!(!it.valid());
+  }
+
+  #[test]
+  fn seek_to_last_single_entry() {
+    let mut list = make_list();
+    insert_key(&mut list, b"only", 1, b"v");
+    let mut it = list.iter();
+    it.seek_to_last();
+    assert!(it.valid());
+    let e = Entry::from_slice(it.payload());
+    assert_eq!(e.key(), b"only");
+    it.prev();
+    assert!(!it.valid());
+  }
+
+  #[test]
+  fn seek_to_last_returns_lexicographically_last() {
+    let mut list = make_list();
+    insert_key(&mut list, b"aaa", 1, b"A");
+    insert_key(&mut list, b"ccc", 2, b"C");
+    insert_key(&mut list, b"bbb", 3, b"B");
+    let mut it = list.iter();
+    it.seek_to_last();
+    assert!(it.valid());
+    // The skip list stores entries in Entry order (key ASC, seq DESC).
+    // "ccc" is lexicographically last.
+    let e = Entry::from_slice(it.payload());
+    assert_eq!(e.key(), b"ccc");
+  }
+
+  #[test]
+  fn prev_traverses_all_entries_backward() {
+    let mut list = make_list();
+    insert_key(&mut list, b"a", 1, b"A");
+    insert_key(&mut list, b"b", 2, b"B");
+    insert_key(&mut list, b"c", 3, b"C");
+
+    let mut it = list.iter();
+    it.seek_to_last();
+    let mut keys: Vec<Vec<u8>> = Vec::new();
+    while it.valid() {
+      let e = Entry::from_slice(it.payload());
+      keys.push(e.key().to_vec());
+      it.prev();
+    }
+    assert_eq!(keys, vec![b"c".to_vec(), b"b".to_vec(), b"a".to_vec()]);
+  }
+
+  #[test]
+  fn prev_at_first_entry_becomes_invalid() {
+    let mut list = make_list();
+    insert_key(&mut list, b"x", 1, b"v");
+    let mut it = list.iter();
+    it.seek_to_first();
+    assert!(it.valid());
+    it.prev();
+    assert!(!it.valid());
   }
 }

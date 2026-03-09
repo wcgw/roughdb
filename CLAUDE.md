@@ -251,15 +251,18 @@ what remains is compaction, the full Iterator/Snapshot API, and operational hygi
 
 **Iterator and snapshot API** *(all required by `include/leveldb/db.h`)*
 
-- [ ] **Backward iteration**: `SkipListIter::prev()`, `MemTableIterator::prev()` / `seek_to_last()`,
-  `BlockIter::prev()`, `TwoLevelIterator::prev()`, `MergingIterator::prev()`, `DbIterator::prev()`. Required for
-  the public `Iterator::Prev()` and `Iterator::SeekToLast()` methods. See `table/iterator.h`.
-- [x] **`Db::new_iterator(read_opts)`** (forward-only): Returns `Result<DbIter, Error>`. Pins `Arc<Memtable>` for
-  `mem` and `imm` via `ArcMemTableIter` (owned wrapper using `unsafe` transmute of `'a` lifetime, backed by the
-  Arc). Creates `TwoLevelIterator` per SSTable from the current `Version`. Builds `MergingIterator` →
-  `DbIterator`. Exposes: `valid`, `seek_to_first`, `seek`, `next`, `key`, `value`, `status`. `DbState.mem` and
-  `.imm` changed to `Arc<Memtable>` to enable Arc cloning for the iterator. `SeekToLast`/`Prev` deferred to
-  backward iteration above. See `db/db_impl.cc`.
+- [x] **Backward iteration**: `SkipListIter::seek_to_last()` / `prev()` (scan level-0 from head; no back-pointers),
+  `BlockIter::seek_to_last()` (last restart + scan forward) / `prev()` (binary-search restart points, scan to
+  predecessor), `TwoLevelIterator::prev()` + `skip_empty_data_blocks_backward()`, `MergingIterator::prev()` /
+  `find_largest()` (symmetric to `find_smallest`), `DbIterator::prev()` / `seek_to_last()` / `find_prev_user_entry()`
+  (LevelDB-style direction field; Reverse direction stores entry in `saved_key`/`saved_value`; direction switch in
+  `next()` handled). `InternalIterator` trait extended with `seek_to_last` + `prev`. Public `DbIter` exposes both.
+  26 new unit tests across all layers; 161 tests total. See `table/iterator.h` and `db/db_iter.cc`.
+- [x] **`Db::new_iterator(read_opts)`**: Returns `Result<DbIter, Error>`. Pins `Arc<Memtable>` for `mem` and `imm`
+  via `ArcMemTableIter` (owned wrapper using `unsafe` transmute of `'a` lifetime, backed by the Arc). Creates
+  `TwoLevelIterator` per SSTable from the current `Version`. Builds `MergingIterator` → `DbIterator`. Exposes:
+  `valid`, `seek_to_first`, `seek_to_last`, `seek`, `next`, `prev`, `key`, `value`, `status`. `DbState.mem` and
+  `.imm` changed to `Arc<Memtable>` to enable Arc cloning for the iterator. See `db/db_impl.cc`.
 - [ ] **`Db::GetSnapshot` / `ReleaseSnapshot`**: A snapshot is a pinned sequence number. `GetSnapshot` returns
   the current `last_sequence` wrapped in a `Snapshot` handle and records it in a list so compaction won't drop
   entries still visible to it. `ReleaseSnapshot` removes it from the list. See `db/snapshot.h`.

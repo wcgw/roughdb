@@ -20,9 +20,13 @@ use crate::error::Error;
 pub(crate) trait InternalIterator {
   fn valid(&self) -> bool;
   fn seek_to_first(&mut self);
+  /// Position at the last entry.
+  fn seek_to_last(&mut self);
   /// Position at the first entry whose key ≥ `target`.
   fn seek(&mut self, target: &[u8]);
   fn next(&mut self);
+  /// Move to the previous entry.  Only call when `valid()` is true.
+  fn prev(&mut self);
   /// Current internal key.  Only valid when `valid()` is true.
   fn key(&self) -> &[u8];
   /// Current value.  Only valid when `valid()` is true.

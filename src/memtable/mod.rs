@@ -159,6 +159,12 @@ impl<'a> MemTableIterator<'a> {
     self.update_cached_key();
   }
 
+  /// Position at the last entry.
+  pub(crate) fn seek_to_last(&mut self) {
+    self.inner.seek_to_last();
+    self.update_cached_key();
+  }
+
   /// Position at the first entry whose SSTable internal key is ≥ `target`.
   pub(crate) fn seek(&mut self, target: &[u8]) {
     if let Some((user_key, seq, _)) = crate::table::format::parse_internal_key(target) {
@@ -196,6 +202,13 @@ impl<'a> MemTableIterator<'a> {
     self.inner.advance();
     self.update_cached_key();
   }
+
+  /// Move to the previous entry.
+  pub(crate) fn prev(&mut self) {
+    debug_assert!(self.valid());
+    self.inner.prev();
+    self.update_cached_key();
+  }
 }
 
 impl crate::iter::InternalIterator for MemTableIterator<'_> {
@@ -207,12 +220,20 @@ impl crate::iter::InternalIterator for MemTableIterator<'_> {
     self.seek_to_first();
   }
 
+  fn seek_to_last(&mut self) {
+    self.seek_to_last();
+  }
+
   fn seek(&mut self, target: &[u8]) {
     self.seek(target);
   }
 
   fn next(&mut self) {
     self.advance();
+  }
+
+  fn prev(&mut self) {
+    self.prev();
   }
 
   fn key(&self) -> &[u8] {
@@ -273,12 +294,20 @@ impl crate::iter::InternalIterator for ArcMemTableIter {
     self.iter.seek_to_first();
   }
 
+  fn seek_to_last(&mut self) {
+    self.iter.seek_to_last();
+  }
+
   fn seek(&mut self, target: &[u8]) {
     self.iter.seek(target);
   }
 
   fn next(&mut self) {
     self.iter.advance();
+  }
+
+  fn prev(&mut self) {
+    self.iter.prev();
   }
 
   fn key(&self) -> &[u8] {
