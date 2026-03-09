@@ -205,6 +205,22 @@ impl VersionSet {
   pub(crate) fn current(&self) -> Arc<Version> {
     Arc::clone(&self.current)
   }
+
+  pub(crate) fn manifest_number(&self) -> u64 {
+    self.manifest_number
+  }
+
+  /// Add the file numbers of every live SSTable across all levels to `live`.
+  ///
+  /// Called by `delete_obsolete_files` to compute the set of files that must
+  /// not be deleted.  Matches LevelDB's `VersionSet::AddLiveFiles`.
+  pub(crate) fn add_live_files(&self, live: &mut HashSet<u64>) {
+    for level_files in &self.current.files {
+      for meta in level_files {
+        live.insert(meta.number);
+      }
+    }
+  }
 }
 
 // ── Builder ───────────────────────────────────────────────────────────────────

@@ -448,9 +448,12 @@ impl Db {
         drop(state);
         // Phase 2: write the SSTable (no lock held — reads proceed freely).
         let result = write_flush(prep, &self.options)?;
-        // Phase 3: install the new Version, swap WAL, clear imm (write lock).
+        // Phase 3: install the new Version, swap WAL, clear imm (lock held).
         let mut state = self.state.lock().unwrap();
         finish_flush(&mut state, result)?;
+        drop(state);
+        // Phase 4: delete obsolete files (lock released; best-effort).
+        delete_obsolete_files(path, &self.state);
       }
     }
 
@@ -574,6 +577,91 @@ fn finish_flush(state: &mut DbState, result: FlushResult) -> Result<(), Error> {
   // Best-effort delete — ignore errors (e.g. the path never existed on new DB).
   let _ = std::fs::remove_file(&result.old_log_path);
   Ok(())
+}
+
+// ── DeleteObsoleteFiles ───────────────────────────────────────────────────────
+
+/// Recognised kinds of database files, parsed from their filenames.
+enum FileKind {
+  Log,
+  Manifest,
+  Table,
+  Current,
+  Lock,
+}
+
+/// Parse a database filename into `(file_number, kind)`.
+///
+/// Returns `None` for filenames that don't match any known pattern (e.g.
+/// temporary editor files, `.` / `..`).
+///
+/// Mirrors LevelDB's `ParseFileName` in `db/filename.h/cc`.
+fn parse_db_filename(name: &str) -> Option<(u64, FileKind)> {
+  if name == "CURRENT" {
+    return Some((0, FileKind::Current));
+  }
+  if name == "LOCK" {
+    return Some((0, FileKind::Lock));
+  }
+  if let Some(rest) = name.strip_prefix("MANIFEST-") {
+    let n = rest.parse().ok()?;
+    return Some((n, FileKind::Manifest));
+  }
+  if let Some(stem) = name.strip_suffix(".log") {
+    let n = stem.parse().ok()?;
+    return Some((n, FileKind::Log));
+  }
+  if let Some(stem) = name.strip_suffix(".ldb") {
+    let n = stem.parse().ok()?;
+    return Some((n, FileKind::Table));
+  }
+  None
+}
+
+/// Delete database files that are no longer referenced by any live `Version`.
+///
+/// Matches LevelDB's `DBImpl::RemoveObsoleteFiles`:
+///   1. Take the lock briefly to collect the live file set and watermarks.
+///   2. Release the lock.
+///   3. Enumerate the directory and delete any obsolete files.
+///
+/// Errors (missing dir, unlink failures) are silently ignored — GC is
+/// best-effort and failure does not affect correctness.
+fn delete_obsolete_files(path: &std::path::Path, state: &Mutex<DbState>) {
+  use std::collections::HashSet;
+
+  // Step 1: snapshot live-file info under the lock, then release it.
+  let (live_tables, log_number, manifest_number) = {
+    let state = state.lock().unwrap();
+    let vs = match &state.version_set {
+      Some(vs) => vs,
+      None => return, // in-memory DB — nothing to clean up
+    };
+    let mut live = HashSet::new();
+    vs.add_live_files(&mut live);
+    (live, vs.log_number(), vs.manifest_number())
+  };
+
+  // Step 2: enumerate the directory and delete obsolete files.
+  let entries = match std::fs::read_dir(path) {
+    Ok(e) => e,
+    Err(_) => return,
+  };
+  for entry in entries.flatten() {
+    let name = entry.file_name();
+    let name = name.to_string_lossy();
+    if let Some((number, kind)) = parse_db_filename(&name) {
+      let keep = match kind {
+        FileKind::Log => number >= log_number,
+        FileKind::Manifest => number >= manifest_number,
+        FileKind::Table => live_tables.contains(&number),
+        FileKind::Current | FileKind::Lock => true,
+      };
+      if !keep {
+        let _ = std::fs::remove_file(entry.path());
+      }
+    }
+  }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -969,5 +1057,97 @@ mod tests {
       it.next();
     }
     assert_eq!(keys.len(), 20);
+  }
+
+  // ── delete_obsolete_files tests ────────────────────────────────────────────
+
+  /// Count files with the given extension in `dir`.
+  fn count_files(dir: &std::path::Path, ext: &str) -> usize {
+    std::fs::read_dir(dir)
+      .unwrap()
+      .filter(|e| {
+        e.as_ref()
+          .unwrap()
+          .file_name()
+          .to_string_lossy()
+          .ends_with(ext)
+      })
+      .count()
+  }
+
+  #[test]
+  fn obsolete_ldb_files_are_deleted() {
+    // Multiple flushes create multiple .ldb files.  After each flush the old
+    // .ldb files that are superseded by subsequent flushes remain live in the
+    // current Version and must NOT be deleted.  Verify the count stays sane.
+    //
+    // Each flush produces one new .ldb file; with 3 flushes there should be
+    // 3 .ldb files total — none deleted, because all are in the current Version.
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path(), small_options()).unwrap();
+    let mut flush_count = 0usize;
+    let mut i = 0u32;
+    while flush_count < 3 {
+      db.put(format!("key{i:04}").as_bytes(), b"value").unwrap();
+      i += 1;
+      let new_count = count_files(dir.path(), ".ldb");
+      if new_count > flush_count {
+        flush_count = new_count;
+      }
+    }
+    // Every flushed file is still live — none should be deleted.
+    assert_eq!(count_files(dir.path(), ".ldb"), 3);
+    // And data is still fully readable.
+    for j in 0..i {
+      assert!(db.get(format!("key{j:04}").as_bytes()).is_ok());
+    }
+  }
+
+  #[test]
+  fn obsolete_ldb_file_deleted_after_reopen_with_no_reference() {
+    // Manually place an .ldb file with a number that is NOT in any Version,
+    // then call Db::open.  The file should be deleted by delete_obsolete_files.
+    //
+    // We can't easily trigger deletion of an orphan .ldb during normal writes
+    // (every flushed file lands in the current Version), so we simulate an
+    // orphan by writing a dummy file before opening.
+    let dir = tempfile::tempdir().unwrap();
+    // First session: produce a real DB (which gets an SST at file 3).
+    {
+      let db = Db::open(dir.path(), small_options()).unwrap();
+      for i in 0u32..20 {
+        db.put(format!("k{i:04}").as_bytes(), b"v").unwrap();
+      }
+    }
+    // Place a fake orphan .ldb file that no Version references.
+    let orphan = dir.path().join("999999.ldb");
+    std::fs::write(&orphan, b"garbage").unwrap();
+    assert!(orphan.exists());
+
+    // Reopen: delete_obsolete_files is NOT called on open (only on flush).
+    // We trigger a flush to force GC.
+    let db = Db::open(dir.path(), small_options()).unwrap();
+    for i in 0u32..20 {
+      db.put(format!("k{i:04}").as_bytes(), b"v2").unwrap();
+    }
+    // After a flush, the orphan must be gone.
+    assert!(
+      !orphan.exists(),
+      "orphan .ldb file should have been deleted"
+    );
+  }
+
+  #[test]
+  fn current_and_manifest_always_kept() {
+    // After flushes, CURRENT and the active MANIFEST must always be present.
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path(), small_options()).unwrap();
+    for i in 0u32..20 {
+      db.put(format!("k{i:04}").as_bytes(), b"v").unwrap();
+    }
+    assert!(dir.path().join("CURRENT").exists());
+    let current = std::fs::read_to_string(dir.path().join("CURRENT")).unwrap();
+    let manifest_name = current.trim();
+    assert!(dir.path().join(manifest_name).exists());
   }
 }

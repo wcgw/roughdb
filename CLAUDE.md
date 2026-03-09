@@ -223,9 +223,11 @@ what remains is compaction, the full Iterator/Snapshot API, and operational hygi
   under the write lock; `finish_flush` calls `vs.set_log_number(new)` before `log_and_apply` so the MANIFEST
   atomically records the new SST and the new log number; then swaps `state.log` and deletes the old WAL.
   Prevents unbounded WAL growth. See `db/db_impl.cc: DBImpl::MakeRoomForWrite`.
-- [ ] **`DeleteObsoleteFiles`**: After every `log_and_apply` (flush or compaction), compute the union of files
-  referenced by all live `Version`s, diff against directory contents, and delete any `.ldb` / `.log` files not in
-  the union. See `db/db_impl.cc: DBImpl::RemoveObsoleteFiles`.
+- [x] **`DeleteObsoleteFiles`**: After every flush, `delete_obsolete_files` takes the lock briefly to snapshot the
+  live `.ldb` set (`VersionSet::add_live_files`), `log_number`, and `manifest_number`, then releases the lock and
+  scans the directory. Keep rules: `.log` ≥ `log_number`, `MANIFEST-*` ≥ `manifest_number`, `.ldb` in live set,
+  `CURRENT`/`LOCK` always kept. `parse_db_filename` mirrors LevelDB's `ParseFileName`. Called in `Db::write` after
+  `finish_flush` drops its lock. See `db/db_impl.cc: DBImpl::RemoveObsoleteFiles`.
 
 **Compaction**
 
