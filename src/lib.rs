@@ -694,6 +694,59 @@ impl Db {
   /// created files are eligible for further compaction in the same call.
   ///
   /// No-op for in-memory databases (`Db::default()`).
+  /// Destroy the database at `path`, deleting all of its files and the directory.
+  ///
+  /// Acquires the `LOCK` file before removing anything to ensure no other process
+  /// has the database open.  Returns [`Error::IoError`] immediately (without blocking)
+  /// if the lock cannot be acquired.
+  ///
+  /// All recognised database files (`CURRENT`, `MANIFEST-*`, `*.log`, `*.ldb`, `LOCK`) are
+  /// removed.  Unrecognised files are left in place; the directory is removed only if it is
+  /// empty afterwards.
+  ///
+  /// Returns `Ok(())` if `path` does not exist.
+  ///
+  /// See `db/db_impl.cc: DestroyDB`.
+  pub fn destroy<P: AsRef<std::path::Path>>(path: P) -> Result<(), Error> {
+    let path = path.as_ref();
+
+    if !path.exists() {
+      return Ok(());
+    }
+
+    // Acquire the lock to confirm no other process has the database open.
+    let lock_path = path.join("LOCK");
+    let lock_file = std::fs::OpenOptions::new()
+      .create(true)
+      .truncate(true)
+      .read(true)
+      .write(true)
+      .open(&lock_path)?;
+    acquire_lock(&lock_file)?;
+
+    // Enumerate and remove every recognised database file (except LOCK — last).
+    for entry in std::fs::read_dir(path)? {
+      let entry = entry?;
+      let name = entry.file_name();
+      let name = name.to_string_lossy();
+      if name == "LOCK" {
+        continue; // removed after we release the flock below
+      }
+      if parse_db_filename(&name).is_some() {
+        let _ = std::fs::remove_file(entry.path());
+      }
+    }
+
+    // Release the flock by dropping the file, then remove the LOCK file itself.
+    drop(lock_file);
+    let _ = std::fs::remove_file(&lock_path);
+
+    // Remove the directory if it is now empty; ignore the error if it is not.
+    let _ = std::fs::remove_dir(path);
+
+    Ok(())
+  }
+
   pub fn compact_range(&self, begin: Option<&[u8]>, end: Option<&[u8]>) -> Result<(), Error> {
     use crate::db::version::NUM_LEVELS;
 
@@ -1585,6 +1638,61 @@ mod tests {
               // Reopening after drop must succeed.
     let db2 = Db::open(dir.path(), Options::default()).unwrap();
     assert_eq!(db2.get(b"k").unwrap(), b"v");
+  }
+
+  // ── Db::destroy tests ──────────────────────────────────────────────────────
+
+  #[test]
+  fn destroy_nonexistent_path_is_ok() {
+    let base = tempfile::tempdir().unwrap();
+    assert!(Db::destroy(base.path().join("no_such_db")).is_ok());
+  }
+
+  #[test]
+  fn destroy_removes_all_db_files_and_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+      let db = Db::open(dir.path(), create_options()).unwrap();
+      // Write enough to trigger a flush so we get at least one .ldb file.
+      for i in 0..200u32 {
+        db.put(format!("k{i:04}").as_bytes(), b"v").unwrap();
+      }
+    } // db dropped here — releases lock
+
+    Db::destroy(dir.path()).unwrap();
+    assert!(
+      !dir.path().exists(),
+      "directory should be removed after destroy"
+    );
+  }
+
+  #[test]
+  fn destroy_fails_if_db_is_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let _db = Db::open(dir.path(), create_options()).unwrap();
+    let err = Db::destroy(dir.path()).err().unwrap();
+    assert!(
+      matches!(err, Error::IoError(_)),
+      "expected IoError from flock, got {err:?}"
+    );
+  }
+
+  #[test]
+  fn destroy_leaves_unrecognised_files() {
+    let dir = tempfile::tempdir().unwrap();
+    Db::open(dir.path(), create_options()).unwrap();
+    // Plant an unrecognised file.
+    std::fs::write(dir.path().join("extra.txt"), b"keep me").unwrap();
+
+    Db::destroy(dir.path()).unwrap();
+
+    // The directory must still exist (not empty) and contain only the extra file.
+    assert!(dir.path().exists());
+    let remaining: Vec<_> = std::fs::read_dir(dir.path())
+      .unwrap()
+      .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+      .collect();
+    assert_eq!(remaining, vec!["extra.txt"]);
   }
 
   #[test]

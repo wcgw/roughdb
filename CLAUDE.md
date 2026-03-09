@@ -283,8 +283,11 @@ what remains is compaction, the full Iterator/Snapshot API, and operational hygi
 - [ ] **`Db::GetApproximateSizes(ranges)`**: Given a slice of `(start_key, end_key)` ranges, return approximate
   on-disk byte count for each range by walking the index blocks of overlapping SSTables. Used by tools to estimate
   data distribution. See `db/db_impl.cc: DBImpl::GetApproximateSizes`.
-- [ ] **`DestroyDB(path, options)`**: Free function. Locks the database, then deletes all known database files
-  (MANIFEST, WAL, SSTables, CURRENT, LOCK) and the directory. See `db/db_impl.cc`.
+- [x] **`Db::destroy(path)`**: Associated function (no open instance needed). Acquires `LOCK` non-blocking —
+  returns `IoError` immediately if another process holds it. Enumerates the directory via `parse_db_filename`,
+  deletes every recognised file except `LOCK`, then drops the flock and deletes `LOCK`. Calls `remove_dir`
+  (not `remove_dir_all`) — silently ignores failure so unrecognised files are left in place.
+  Returns `Ok(())` if `path` does not exist. See `db/db_impl.cc: DestroyDB`.
 
 **`LOCK` file** *(prerequisite for the above free functions and safe multi-process use)*
 
