@@ -168,9 +168,27 @@ impl VersionSet {
         // L0: newest-first — prepend.
         new_files[0].insert(0, Arc::clone(meta));
       } else {
-        // L1+: append (sorted by smallest key in Phase 6).
+        // L1+: append; sorted below.
         new_files[level].push(Arc::clone(meta));
       }
+    }
+
+    // Keep L1–L6 sorted by smallest user key so binary search and overlap
+    // checks work correctly.  L0 files are intentionally newest-first.
+    for level_files in new_files.iter_mut().skip(1) {
+      level_files.sort_by(|a, b| {
+        let ak = if a.smallest.len() >= 8 {
+          &a.smallest[..a.smallest.len() - 8]
+        } else {
+          &a.smallest
+        };
+        let bk = if b.smallest.len() >= 8 {
+          &b.smallest[..b.smallest.len() - 8]
+        } else {
+          &b.smallest
+        };
+        ak.cmp(bk)
+      });
     }
 
     self.current = Arc::new(Version { files: new_files });
@@ -204,6 +222,22 @@ impl VersionSet {
 
   pub(crate) fn current(&self) -> Arc<Version> {
     Arc::clone(&self.current)
+  }
+
+  pub(crate) fn manifest_number(&self) -> u64 {
+    self.manifest_number
+  }
+
+  /// Add the file numbers of every live SSTable across all levels to `live`.
+  ///
+  /// Called by `delete_obsolete_files` to compute the set of files that must
+  /// not be deleted.  Matches LevelDB's `VersionSet::AddLiveFiles`.
+  pub(crate) fn add_live_files(&self, live: &mut HashSet<u64>) {
+    for level_files in &self.current.files {
+      for meta in level_files {
+        live.insert(meta.number);
+      }
+    }
   }
 }
 

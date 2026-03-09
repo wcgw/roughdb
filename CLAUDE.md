@@ -223,21 +223,31 @@ what remains is compaction, the full Iterator/Snapshot API, and operational hygi
   under the write lock; `finish_flush` calls `vs.set_log_number(new)` before `log_and_apply` so the MANIFEST
   atomically records the new SST and the new log number; then swaps `state.log` and deletes the old WAL.
   Prevents unbounded WAL growth. See `db/db_impl.cc: DBImpl::MakeRoomForWrite`.
-- [ ] **`DeleteObsoleteFiles`**: After every `log_and_apply` (flush or compaction), compute the union of files
-  referenced by all live `Version`s, diff against directory contents, and delete any `.ldb` / `.log` files not in
-  the union. See `db/db_impl.cc: DBImpl::RemoveObsoleteFiles`.
+- [x] **`DeleteObsoleteFiles`**: After every flush, `delete_obsolete_files` takes the lock briefly to snapshot the
+  live `.ldb` set (`VersionSet::add_live_files`), `log_number`, and `manifest_number`, then releases the lock and
+  scans the directory. Keep rules: `.log` ≥ `log_number`, `MANIFEST-*` ≥ `manifest_number`, `.ldb` in live set,
+  `CURRENT`/`LOCK` always kept. `parse_db_filename` mirrors LevelDB's `ParseFileName`. Called in `Db::write` after
+  `finish_flush` drops its lock. See `db/db_impl.cc: DBImpl::RemoveObsoleteFiles`.
 
 **Compaction**
 
-- [ ] **Background compaction**: Triggered when L0 file count ≥ 4. Selects input files using `compact_pointer`
-  per level (round-robin across the key space), runs a `MergingIterator` over all inputs, drops entries shadowed
-  by newer versions or obsolete tombstones, writes output files to L+1, updates `VersionSet` via `log_and_apply`.
-  Slow-write throttle at L0 ≥ 8; write-stop at L0 ≥ 12. See `db/db_impl.cc: DBImpl::BackgroundCompaction`.
-- [ ] **Write stall / write stop**: In `Db::write`, after a flush, check L0 file count. Sleep briefly per write
-  when count ≥ 8 (to let compaction catch up); block entirely when count ≥ 12. Resume when compaction drains L0
-  below the threshold. See `db/db_impl.cc: DBImpl::MakeRoomForWrite`.
-- [ ] **`Db::CompactRange(begin, end)`**: Manual compaction of a user key range across all levels. Overlapping
-  files are compacted into the deepest level that contains them. See `db/db_impl.cc: DBImpl::CompactRange`.
+- [x] **L0→L1 compaction**: Triggered when L0 file count ≥ 4 (`L0_COMPACTION_TRIGGER`). `pick_compaction` selects
+  all L0 files plus any L1 files whose user-key range overlaps the union L0 range. `do_compaction` (no lock) builds
+  a `MergingIterator` over all inputs (L0 newest-first so ties resolve to newer versions), applies shadow-key
+  pruning (only the newest version of each user key is kept) and tombstone elision (deletion markers are dropped
+  when no data exists at L2+). Writes output SSTables to L1 (new file per `max_file_size`). `install_compaction`
+  (under lock) records a single `VersionEdit` deleting all inputs and adding all outputs, then calls
+  `log_and_apply`. `log_and_apply` now sorts L1–L6 files by smallest user key after each edit. `maybe_compact`
+  orchestrates the three phases; called from `Db::write` in a loop (up to 32×) after every flush. Slow-write
+  throttle: sleeps 1 ms per iteration when L0 ≥ `L0_SLOWDOWN_WRITES_TRIGGER` (8). No background thread — runs
+  synchronously on the writing goroutine. `compact_pointer` round-robin not implemented (all L0 files always
+  selected). See `db/db_impl.cc: DBImpl::BackgroundCompaction`, `DoCompactionWork`, `MakeRoomForWrite`.
+- [x] **`Db::compact_range(begin, end)`**: Manual compaction of a user-key range (`Option<&[u8]>` for open bounds).
+  Finds the deepest level with files overlapping `[begin, end]`, then calls `compact_level_range` for each level
+  from 0 to `max_level - 1`.  Each call uses the three-phase lock protocol; newly compacted files are visible to
+  subsequent levels' compactions via a fresh version snapshot.  `pick_range_compaction` selects files at `level`
+  that overlap `[begin, end]` plus next-level files that overlap the union range; reuses `do_compaction` and
+  `install_compaction`.  No-op on in-memory databases.  See `db/db_impl.cc: DBImpl::CompactRange`.
 
 **Iterator and snapshot API** *(all required by `include/leveldb/db.h`)*
 
