@@ -11,7 +11,7 @@
 //    limitations under the License.
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
-use roughdb::Db;
+use roughdb::{Db, ReadOptions};
 
 /// Number of entries per benchmark iteration — sized to stay within a
 /// realistic memtable budget (LevelDB default: 4 MiB write buffer).
@@ -112,7 +112,7 @@ fn read_benchmarks(c: &mut Criterion) {
   group.bench_function("sequential", |b| {
     b.iter(|| {
       for i in 0..N {
-        black_box(db.get(make_key(i))).unwrap();
+        black_box(db.get(&ReadOptions::default(), make_key(i))).unwrap();
       }
     });
   });
@@ -121,7 +121,7 @@ fn read_benchmarks(c: &mut Criterion) {
   group.bench_function("random", |b| {
     b.iter(|| {
       for &i in &order {
-        let _ = black_box(db.get(make_key(i)));
+        let _ = black_box(db.get(&ReadOptions::default(), make_key(i)));
       }
     });
   });
@@ -130,7 +130,9 @@ fn read_benchmarks(c: &mut Criterion) {
   group.bench_function("missing", |b| {
     b.iter(|| {
       for i in N..2 * N {
-        black_box(db.get(make_key(i))).unwrap_err().is_not_found();
+        black_box(db.get(&ReadOptions::default(), make_key(i)))
+          .unwrap_err()
+          .is_not_found();
       }
     });
   });

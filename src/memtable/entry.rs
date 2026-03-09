@@ -110,6 +110,7 @@ impl<'a> Entry<'a> {
   }
 
   /// Byte count of a lookup key for `key` (seq = [`u64::MAX`], no value).
+  #[cfg(test)]
   pub(crate) fn lookup_size(key: &[u8]) -> usize {
     let mut tmp = [0u8; 10];
     let ksize = write_varu64(&mut tmp, key.len() as u64);
@@ -147,6 +148,7 @@ impl<'a> Entry<'a> {
   /// Encode a lookup key into `buf` (which must be at least
   /// [`lookup_size`] bytes long).  A lookup key encodes only
   /// `[klen | key | seq=MAX]`; it has no value-type or value bytes.
+  #[cfg(test)]
   pub(crate) fn write_lookup_to(buf: &mut [u8], key: &[u8]) {
     let mut kd = [0u8; 10];
     let ks = write_varu64(&mut kd, key.len() as u64);

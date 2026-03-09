@@ -263,12 +263,16 @@ what remains is compaction, the full Iterator/Snapshot API, and operational hygi
   `TwoLevelIterator` per SSTable from the current `Version`. Builds `MergingIterator` → `DbIterator`. Exposes:
   `valid`, `seek_to_first`, `seek_to_last`, `seek`, `next`, `prev`, `key`, `value`, `status`. `DbState.mem` and
   `.imm` changed to `Arc<Memtable>` to enable Arc cloning for the iterator. See `db/db_impl.cc`.
-- [ ] **`Db::GetSnapshot` / `ReleaseSnapshot`**: A snapshot is a pinned sequence number. `GetSnapshot` returns
-  the current `last_sequence` wrapped in a `Snapshot` handle and records it in a list so compaction won't drop
-  entries still visible to it. `ReleaseSnapshot` removes it from the list. See `db/snapshot.h`.
-- [ ] **`Db::get` snapshot support**: `ReadOptions::snapshot` is currently ignored. Wire it up: if a snapshot is
-  provided, use its sequence number as the visibility cutoff in `Memtable::get` and `Version::get`; otherwise use
-  `last_sequence` as today. See `db/db_impl.cc: DBImpl::Get`.
+- [x] **`Db::GetSnapshot` / `ReleaseSnapshot`**: `get_snapshot()` locks, reads `last_sequence`, inserts into
+  `DbState::snapshots: BTreeSet<u64>`, returns `Snapshot(seq)`. `release_snapshot(snap)` removes from the set.
+  Compaction (`do_compaction`, `maybe_compact`, `compact_level_range`) uses `oldest_snapshot = snapshots.min()
+  .unwrap_or(last_sequence)` as the visibility cutoff so entries observable through any live snapshot are not
+  pruned. See `db/snapshot.h`.
+- [x] **`Db::get` snapshot support**: `Db::get` now takes `&ReadOptions` as first argument. Snapshot seq comes
+  from `opts.snapshot.map(|s| s.0).unwrap_or(last_sequence)`. `Memtable::get` changed to take `seq: u64`;
+  uses `write_seek_key_to(key, seq)` instead of `write_lookup_to(key)` so reads are snapshot-aware.
+  `lookup_size`/`write_lookup_to` gated with `#[cfg(test)]`. 4 new snapshot tests; 165 total.
+  See `db/db_impl.cc: DBImpl::Get`.
 
 **Remaining user-facing API surface** *(in `include/leveldb/db.h`)*
 

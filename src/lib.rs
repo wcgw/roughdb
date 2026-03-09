@@ -78,6 +78,10 @@ struct DbState {
   /// Tracks the set of live SSTable files and the MANIFEST.
   /// `None` for in-memory databases (`Db::default()`).
   version_set: Option<VersionSet>,
+  /// Sequence numbers pinned by live snapshots (acquired via `get_snapshot`).
+  /// Compaction uses the minimum value here as the visibility cutoff so it
+  /// does not drop entries still observable through an active snapshot.
+  snapshots: std::collections::BTreeSet<u64>,
 }
 
 // ── FlushPrep / FlushResult ───────────────────────────────────────────────────
@@ -203,6 +207,7 @@ impl Default for Db {
         mem: Arc::new(Memtable::default()),
         imm: None,
         version_set: None,
+        snapshots: std::collections::BTreeSet::new(),
       }),
       options: Options::default(),
       path: None,
@@ -284,6 +289,7 @@ impl Db {
         mem,
         imm: None,
         version_set,
+        snapshots: std::collections::BTreeSet::new(),
       }),
       options,
       path: Some(path.to_path_buf()),
@@ -324,7 +330,7 @@ impl Db {
     Ok(max_sequence)
   }
 
-  pub fn get<K>(&self, key: K) -> Result<Vec<u8>, Error>
+  pub fn get<K>(&self, opts: &ReadOptions, key: K) -> Result<Vec<u8>, Error>
   where
     K: AsRef<[u8]>,
   {
@@ -336,21 +342,21 @@ impl Db {
     let (sequence, mem, imm, version) = {
       let state = self.state.lock().unwrap();
       (
-        state.last_sequence,
+        opts.snapshot.map(|s| s.0).unwrap_or(state.last_sequence),
         Arc::clone(&state.mem),
         state.imm.as_ref().map(Arc::clone),
         state.version_set.as_ref().map(|vs| vs.current()),
       )
     };
 
-    match mem.get(key) {
+    match mem.get(key, sequence) {
       MemtableResult::Hit(v) => return Ok(v),
       MemtableResult::Deleted => return Err(Error::NotFound),
       MemtableResult::Miss => {}
     }
 
     if let Some(imm) = imm {
-      match imm.get(key) {
+      match imm.get(key, sequence) {
         MemtableResult::Hit(v) => return Ok(v),
         MemtableResult::Deleted => return Err(Error::NotFound),
         MemtableResult::Miss => {}
@@ -366,6 +372,36 @@ impl Db {
     }
 
     Err(Error::NotFound)
+  }
+
+  /// Return an immutable snapshot of the current database state.
+  ///
+  /// Pass the returned [`Snapshot`] via [`ReadOptions::snapshot`] to pin reads
+  /// (via `get` or `new_iterator`) to this point in time.  The snapshot is
+  /// valid until `release_snapshot` is called.
+  ///
+  /// Pinned snapshots prevent compaction from discarding entries that are still
+  /// visible through them, so snapshots should be released promptly.
+  ///
+  /// See `include/leveldb/db.h: DB::GetSnapshot`.
+  pub fn get_snapshot(&self) -> Snapshot {
+    let mut state = self.state.lock().unwrap();
+    let seq = state.last_sequence;
+    state.snapshots.insert(seq);
+    Snapshot(seq)
+  }
+
+  /// Release a snapshot previously obtained from [`get_snapshot`].
+  ///
+  /// After this call the snapshot is no longer valid; it must not be used
+  /// in `ReadOptions`.  Compaction is free to reclaim entries that were only
+  /// retained because of this snapshot.
+  ///
+  /// See `include/leveldb/db.h: DB::ReleaseSnapshot`.
+  ///
+  /// [`get_snapshot`]: Db::get_snapshot
+  pub fn release_snapshot(&self, snap: Snapshot) {
+    self.state.lock().unwrap().snapshots.remove(&snap.0);
   }
 
   pub fn put<K, V>(&self, key: K, value: V) -> Result<(), Error>
@@ -802,7 +838,7 @@ fn do_compaction(
   state: &Mutex<DbState>,
   version: &Arc<crate::db::version::Version>,
   inputs: &[Arc<FileMetaData>],
-  last_sequence: u64,
+  oldest_snapshot: u64,
   output_level: usize,
   opts: &Options,
 ) -> Result<Vec<CompactionOutput>, Error> {
@@ -849,11 +885,12 @@ fn do_compaction(
     }
 
     // Determine whether to drop this entry.
-    let drop = if last_sequence_for_key <= last_sequence {
-      // Shadowed by a newer version that was already written to output.
+    let drop = if last_sequence_for_key <= oldest_snapshot {
+      // A newer version for this user key was already emitted and is visible
+      // to even the oldest active snapshot — this older version is invisible.
       true
-    } else if vtype == 0 && seq <= last_sequence && is_base_level(version, uk, output_level + 1) {
-      // Tombstone with no data below the output level — safe to elide.
+    } else if vtype == 0 && seq <= oldest_snapshot && is_base_level(version, uk, output_level + 1) {
+      // Tombstone that no snapshot can see below this level — safe to elide.
       true
     } else {
       false
@@ -1019,13 +1056,19 @@ fn compact_level_range(
   end: Option<&[u8]>,
 ) -> Result<bool, Error> {
   // Phase 1: snapshot.
-  let (version, last_sequence) = {
+  let (version, oldest_snapshot) = {
     let g = state.lock().unwrap();
     let vs = match &g.version_set {
       Some(vs) => vs,
       None => return Ok(false),
     };
-    (vs.current(), g.last_sequence)
+    let oldest = g
+      .snapshots
+      .iter()
+      .next()
+      .copied()
+      .unwrap_or(g.last_sequence);
+    (vs.current(), oldest)
   };
 
   let (level_inputs, next_inputs) = match pick_range_compaction(&version, level, begin, end) {
@@ -1051,7 +1094,7 @@ fn compact_level_range(
     state,
     &version,
     &inputs,
-    last_sequence,
+    oldest_snapshot,
     output_level,
     opts,
   )?;
@@ -1077,13 +1120,19 @@ fn compact_level_range(
 /// correctness; L0 will simply accumulate more files and be retried.
 fn maybe_compact(path: &std::path::Path, state: &Mutex<DbState>, opts: &Options) {
   // Phase 1: snapshot.
-  let (version, last_sequence) = {
+  let (version, oldest_snapshot) = {
     let g = state.lock().unwrap();
     let vs = match &g.version_set {
       Some(vs) => vs,
       None => return,
     };
-    (vs.current(), g.last_sequence)
+    let oldest = g
+      .snapshots
+      .iter()
+      .next()
+      .copied()
+      .unwrap_or(g.last_sequence);
+    (vs.current(), oldest)
   };
 
   let (l0_inputs, l1_inputs) = match pick_compaction(&version) {
@@ -1100,7 +1149,7 @@ fn maybe_compact(path: &std::path::Path, state: &Mutex<DbState>, opts: &Options)
     .collect();
 
   // Phase 2: I/O (no lock).
-  let outputs = match do_compaction(path, state, &version, &inputs, last_sequence, 1, opts) {
+  let outputs = match do_compaction(path, state, &version, &inputs, oldest_snapshot, 1, opts) {
     Ok(o) => o,
     Err(_) => return,
   };
@@ -1205,16 +1254,25 @@ fn delete_obsolete_files(path: &std::path::Path, state: &Mutex<DbState>) {
 
 #[cfg(test)]
 mod tests {
-  use crate::{Db, Options, WriteOptions};
+  use crate::{Db, Options, ReadOptions, WriteOptions};
 
   #[test]
   fn in_memory_round_trip() {
     let db = Db::default();
-    assert!(db.get(b"42").unwrap_err().is_not_found());
+    assert!(db
+      .get(&ReadOptions::default(), b"42")
+      .unwrap_err()
+      .is_not_found());
     db.put(b"42", b"An answer to some question").unwrap();
-    assert_eq!(db.get(b"42").unwrap(), b"An answer to some question");
+    assert_eq!(
+      db.get(&ReadOptions::default(), b"42").unwrap(),
+      b"An answer to some question"
+    );
     db.delete(b"42").unwrap();
-    assert!(db.get(b"42").unwrap_err().is_not_found());
+    assert!(db
+      .get(&ReadOptions::default(), b"42")
+      .unwrap_err()
+      .is_not_found());
   }
 
   #[test]
@@ -1228,15 +1286,21 @@ mod tests {
     }
     // Reopen: recovery must restore state from the WAL.
     let db = Db::open(dir.path(), Options::default()).unwrap();
-    assert_eq!(db.get(b"key").unwrap(), b"value");
-    assert!(db.get(b"foo").unwrap_err().is_not_found());
+    assert_eq!(db.get(&ReadOptions::default(), b"key").unwrap(), b"value");
+    assert!(db
+      .get(&ReadOptions::default(), b"foo")
+      .unwrap_err()
+      .is_not_found());
   }
 
   #[test]
   fn open_empty_db_is_empty() {
     let dir = tempfile::tempdir().unwrap();
     let db = Db::open(dir.path(), Options::default()).unwrap();
-    assert!(db.get(b"anything").unwrap_err().is_not_found());
+    assert!(db
+      .get(&ReadOptions::default(), b"anything")
+      .unwrap_err()
+      .is_not_found());
   }
 
   #[test]
@@ -1252,9 +1316,9 @@ mod tests {
       db.write(&WriteOptions::default(), &batch).unwrap();
     }
     let db = Db::open(dir.path(), Options::default()).unwrap();
-    assert_eq!(db.get(b"a").unwrap(), b"1");
-    assert_eq!(db.get(b"b").unwrap(), b"2");
-    assert_eq!(db.get(b"c").unwrap(), b"3");
+    assert_eq!(db.get(&ReadOptions::default(), b"a").unwrap(), b"1");
+    assert_eq!(db.get(&ReadOptions::default(), b"b").unwrap(), b"2");
+    assert_eq!(db.get(&ReadOptions::default(), b"c").unwrap(), b"3");
   }
 
   #[test]
@@ -1269,7 +1333,7 @@ mod tests {
       db.put(b"k", b"second").unwrap();
     }
     let db = Db::open(dir.path(), Options::default()).unwrap();
-    assert_eq!(db.get(b"k").unwrap(), b"second");
+    assert_eq!(db.get(&ReadOptions::default(), b"k").unwrap(), b"second");
   }
 
   // ── L0 flush + disk read tests ─────────────────────────────────────────────
@@ -1332,7 +1396,8 @@ mod tests {
     for i in 0u32..20 {
       let expected = format!("val{i:04}");
       assert_eq!(
-        db.get(format!("key{i:04}").as_bytes()).unwrap(),
+        db.get(&ReadOptions::default(), format!("key{i:04}").as_bytes())
+          .unwrap(),
         expected.as_bytes()
       );
     }
@@ -1351,9 +1416,12 @@ mod tests {
     db.delete(b"fk0000").unwrap();
 
     // The tombstone in mem must shadow the value in L0.
-    assert!(db.get(b"fk0000").unwrap_err().is_not_found());
+    assert!(db
+      .get(&ReadOptions::default(), b"fk0000")
+      .unwrap_err()
+      .is_not_found());
     // Other keys are still readable.
-    assert_eq!(db.get(b"fk0001").unwrap(), b"v");
+    assert_eq!(db.get(&ReadOptions::default(), b"fk0001").unwrap(), b"v");
   }
 
   #[test]
@@ -1438,7 +1506,11 @@ mod tests {
     // Reopen must succeed and all keys must be readable.
     let db = Db::open(dir.path(), Options::default()).unwrap();
     for i in 0u32..20 {
-      assert_eq!(db.get(format!("k{i:04}").as_bytes()).unwrap(), b"v");
+      assert_eq!(
+        db.get(&ReadOptions::default(), format!("k{i:04}").as_bytes())
+          .unwrap(),
+        b"v"
+      );
     }
   }
 
@@ -1472,7 +1544,8 @@ mod tests {
     for i in 0u32..20 {
       let expected = format!("v{i:04}");
       assert_eq!(
-        db.get(format!("k{i:04}").as_bytes()).unwrap(),
+        db.get(&ReadOptions::default(), format!("k{i:04}").as_bytes())
+          .unwrap(),
         expected.as_bytes(),
         "key k{i:04} not found after reopen"
       );
@@ -1718,7 +1791,9 @@ mod tests {
     assert_eq!(count_files(dir.path(), ".ldb"), 3);
     // And data is still fully readable.
     for j in 0..i {
-      assert!(db.get(format!("key{j:04}").as_bytes()).is_ok());
+      assert!(db
+        .get(&ReadOptions::default(), format!("key{j:04}").as_bytes())
+        .is_ok());
     }
   }
 
@@ -1822,7 +1897,8 @@ mod tests {
     for i in 0u32..100 {
       let expected = format!("v{i:04}");
       assert_eq!(
-        db.get(format!("k{i:04}").as_bytes()).unwrap(),
+        db.get(&ReadOptions::default(), format!("k{i:04}").as_bytes())
+          .unwrap(),
         expected.as_bytes(),
         "key k{i:04} not readable after compaction"
       );
@@ -1849,7 +1925,9 @@ mod tests {
     }
 
     assert!(
-      db.get(b"target").unwrap_err().is_not_found(),
+      db.get(&ReadOptions::default(), b"target")
+        .unwrap_err()
+        .is_not_found(),
       "tombstone must shadow value in L1"
     );
   }
@@ -1870,7 +1948,8 @@ mod tests {
     for i in 0u32..100 {
       let expected = format!("v{i:04}");
       assert_eq!(
-        db.get(format!("k{i:04}").as_bytes()).unwrap(),
+        db.get(&ReadOptions::default(), format!("k{i:04}").as_bytes())
+          .unwrap(),
         expected.as_bytes(),
         "key k{i:04} not found after reopen"
       );
@@ -1909,7 +1988,8 @@ mod tests {
     db.compact_range(None, None).unwrap();
     for i in 0u32..100 {
       assert_eq!(
-        db.get(format!("k{i:04}").as_bytes()).unwrap(),
+        db.get(&ReadOptions::default(), format!("k{i:04}").as_bytes())
+          .unwrap(),
         format!("v{i:04}").as_bytes(),
         "key k{i:04} missing after compact_range"
       );
@@ -1929,7 +2009,8 @@ mod tests {
     // All keys must still be readable.
     for i in 0u32..100 {
       assert!(
-        db.get(format!("k{i:04}").as_bytes()).is_ok(),
+        db.get(&ReadOptions::default(), format!("k{i:04}").as_bytes())
+          .is_ok(),
         "key k{i:04} missing after partial compact_range"
       );
     }
@@ -1967,7 +2048,9 @@ mod tests {
     }
     db.compact_range(None, None).unwrap();
     assert!(
-      db.get(b"gone").unwrap_err().is_not_found(),
+      db.get(&ReadOptions::default(), b"gone")
+        .unwrap_err()
+        .is_not_found(),
       "deleted key must not reappear after compact_range"
     );
   }
@@ -1977,7 +2060,7 @@ mod tests {
     let db = Db::default();
     db.put(b"k", b"v").unwrap();
     db.compact_range(None, None).unwrap(); // must not panic
-    assert_eq!(db.get(b"k").unwrap(), b"v");
+    assert_eq!(db.get(&ReadOptions::default(), b"k").unwrap(), b"v");
   }
 
   #[test]
@@ -1995,9 +2078,111 @@ mod tests {
     let db = Db::open(dir.path(), Options::default()).unwrap();
     for i in 0u32..100 {
       assert_eq!(
-        db.get(format!("k{i:04}").as_bytes()).unwrap(),
+        db.get(&ReadOptions::default(), format!("k{i:04}").as_bytes())
+          .unwrap(),
         format!("v{i:04}").as_bytes()
       );
     }
+  }
+
+  // ── Snapshot tests ─────────────────────────────────────────────────────────
+
+  #[test]
+  fn snapshot_pins_sequence_number() {
+    let db = Db::default();
+    db.put(b"k", b"v1").unwrap();
+    let snap = db.get_snapshot();
+    db.put(b"k", b"v2").unwrap();
+
+    // Without a snapshot we see the latest value.
+    assert_eq!(db.get(&ReadOptions::default(), b"k").unwrap(), b"v2");
+
+    // With the snapshot we see the value as of when it was taken.
+    let opts = ReadOptions {
+      snapshot: Some(snap),
+      ..ReadOptions::default()
+    };
+    assert_eq!(db.get(&opts, b"k").unwrap(), b"v1");
+
+    db.release_snapshot(snap);
+    // After release, reads still see the latest value.
+    assert_eq!(db.get(&ReadOptions::default(), b"k").unwrap(), b"v2");
+  }
+
+  #[test]
+  fn snapshot_sees_key_not_yet_deleted() {
+    let db = Db::default();
+    db.put(b"x", b"alive").unwrap();
+    let snap = db.get_snapshot();
+    db.delete(b"x").unwrap();
+
+    // Snapshot was taken before the deletion — key should be visible.
+    let opts = ReadOptions {
+      snapshot: Some(snap),
+      ..ReadOptions::default()
+    };
+    assert_eq!(db.get(&opts, b"x").unwrap(), b"alive");
+
+    // Current view sees the deletion.
+    assert!(db
+      .get(&ReadOptions::default(), b"x")
+      .unwrap_err()
+      .is_not_found());
+    db.release_snapshot(snap);
+  }
+
+  #[test]
+  fn snapshot_iterator_sees_point_in_time() {
+    let db = Db::default();
+    db.put(b"a", b"1").unwrap();
+    db.put(b"b", b"2").unwrap();
+    let snap = db.get_snapshot();
+    db.put(b"c", b"3").unwrap();
+    db.delete(b"a").unwrap();
+
+    let opts = ReadOptions {
+      snapshot: Some(snap),
+      ..ReadOptions::default()
+    };
+    let mut it = db.new_iterator(&opts).unwrap();
+    it.seek_to_first();
+
+    // Should see a=1, b=2 but not c=3 (added after snap) and not a=deleted.
+    assert!(it.valid());
+    assert_eq!(it.key(), b"a");
+    assert_eq!(it.value(), b"1");
+    it.next();
+    assert!(it.valid());
+    assert_eq!(it.key(), b"b");
+    assert_eq!(it.value(), b"2");
+    it.next();
+    assert!(!it.valid());
+
+    db.release_snapshot(snap);
+  }
+
+  #[test]
+  fn multiple_snapshots_independent() {
+    let db = Db::default();
+    db.put(b"k", b"v1").unwrap();
+    let snap1 = db.get_snapshot();
+    db.put(b"k", b"v2").unwrap();
+    let snap2 = db.get_snapshot();
+    db.put(b"k", b"v3").unwrap();
+
+    let opts1 = ReadOptions {
+      snapshot: Some(snap1),
+      ..ReadOptions::default()
+    };
+    let opts2 = ReadOptions {
+      snapshot: Some(snap2),
+      ..ReadOptions::default()
+    };
+    assert_eq!(db.get(&opts1, b"k").unwrap(), b"v1");
+    assert_eq!(db.get(&opts2, b"k").unwrap(), b"v2");
+    assert_eq!(db.get(&ReadOptions::default(), b"k").unwrap(), b"v3");
+
+    db.release_snapshot(snap1);
+    db.release_snapshot(snap2);
   }
 }

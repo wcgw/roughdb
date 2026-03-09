@@ -182,7 +182,7 @@ impl Default for WriteBatch {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::{Db, WriteOptions};
+  use crate::{Db, ReadOptions, WriteOptions};
 
   struct Recording {
     ops: Vec<Op>,
@@ -324,7 +324,10 @@ mod tests {
     batch.put(b"baz", b"qux");
     batch.delete(b"foo");
     db.write(&WriteOptions::default(), &batch).unwrap();
-    assert!(db.get(b"foo").unwrap_err().is_not_found());
-    assert_eq!(db.get(b"baz").unwrap(), b"qux");
+    assert!(db
+      .get(&ReadOptions::default(), b"foo")
+      .unwrap_err()
+      .is_not_found());
+    assert_eq!(db.get(&ReadOptions::default(), b"baz").unwrap(), b"qux");
   }
 }
