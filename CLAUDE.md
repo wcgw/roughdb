@@ -283,16 +283,28 @@ what remains is compaction, the full Iterator/Snapshot API, and operational hygi
 - [ ] **`Db::GetApproximateSizes(ranges)`**: Given a slice of `(start_key, end_key)` ranges, return approximate
   on-disk byte count for each range by walking the index blocks of overlapping SSTables. Used by tools to estimate
   data distribution. See `db/db_impl.cc: DBImpl::GetApproximateSizes`.
-- [ ] **`DestroyDB(path, options)`**: Free function. Locks the database, then deletes all known database files
-  (MANIFEST, WAL, SSTables, CURRENT, LOCK) and the directory. See `db/db_impl.cc`.
+- [x] **`Db::destroy(path)`**: Associated function (no open instance needed). Acquires `LOCK` non-blocking —
+  returns `IoError` immediately if another process holds it. Enumerates the directory via `parse_db_filename`,
+  deletes every recognised file except `LOCK`, then drops the flock and deletes `LOCK`. Calls `remove_dir`
+  (not `remove_dir_all`) — silently ignores failure so unrecognised files are left in place.
+  Returns `Ok(())` if `path` does not exist. See `db/db_impl.cc: DestroyDB`.
 
 **`LOCK` file** *(prerequisite for the above free functions and safe multi-process use)*
 
-- [ ] **`LOCK` file**: On `Db::open`, acquire an exclusive `flock` on `<path>/LOCK` to prevent two processes from
-  opening the same database simultaneously. Release on `Db::drop`. See `util/env_posix.cc: LockFile`.
+- [x] **`LOCK` file**: On `Db::open`, acquire an exclusive `flock` on `<path>/LOCK` to prevent two processes from
+  opening the same database simultaneously. Release on `Db::drop`. `acquire_lock` uses `libc::flock(LOCK_EX |
+  LOCK_NB)` — returns `IoError` immediately rather than blocking if another process holds the lock. The `File`
+  handle is stored as `lock_file: Option<File>` in `Db` (suppressed `dead_code` warning; held for Drop side-effect).
+  See `util/env_posix.cc: LockFile`.
 
 **Compression**
 
+- [ ] **Bloom filters**: Kirsch-Mitzenmacher double-hashing; `k = round(0.69 * bits_per_key)` hash functions; one filter
+  per ~2 KB of data blocks stored in the SSTable filter block. The filter block is written uncompressed and read at
+  `Table::open`; `Table::get` checks it after the index-block lookup and before reading or decompressing any data
+  block, so a definite-negative skips all I/O and decompression entirely. A `FilterPolicy` trait allows custom
+  filters. `Options::filter_policy` wires the chosen policy into flush and compaction.
+  See `util/bloom.cc` and `include/leveldb/filter_policy.h`.
 - [ ] **Block compression**: Wire `Options::compression` and `Options::zstd_compression_level` through `TableBuilder`
   and `Table`.  Currently all blocks are written with type `0x00` (NoCompression) and the reader rejects any other
   type; both fields are silently ignored.  Required changes:
@@ -335,9 +347,6 @@ the phases above.*
 - **Batch-grouped writes**: Multiple concurrent `Db::write` callers are grouped by a leader that writes a single
   combined WAL record and memtable batch, amortising `fsync` cost over many writers. Transparent to callers; the
   current single-writer-at-a-time path is correct. See `db/db_impl.cc: DBImpl::Write`.
-- **Bloom filters**: Kirsch-Mitzenmacher double-hashing; `k = round(0.69 * bits_per_key)` hash functions; one filter
-  per ~2 KB of data blocks stored in the SSTable filter block. Avoids unnecessary block reads for missing keys.
-  See `util/bloom.cc` and `include/leveldb/filter_policy.h`. A `FilterPolicy` trait allows custom filters.
 - **Block cache**: Sharded LRU (`src/cache/lru.rs`) with two lists per shard (in-use / evictable), custom deleters,
   capacity-based eviction. Default 8 MB. Required by `Table` reader to cache hot blocks. See `util/cache.cc`.
 - **`ReadOptions::fill_cache`**: Currently ignored — no block cache exists. Once the block cache is implemented,
