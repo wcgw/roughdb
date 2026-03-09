@@ -14,7 +14,14 @@ use crate::error::Error;
 use crate::iter::InternalIterator;
 use crate::table::format::{make_internal_key, parse_internal_key};
 
-/// User-facing forward iterator over a merged view of the database.
+/// Direction of the last positioning or movement operation.
+#[derive(Debug, PartialEq)]
+enum Direction {
+  Forward,
+  Reverse,
+}
+
+/// User-facing iterator over a merged view of the database.
 ///
 /// Wraps an [`InternalIterator`] (typically a [`MergingIterator`]) and applies:
 ///
@@ -24,13 +31,15 @@ use crate::table::format::{make_internal_key, parse_internal_key};
 /// - **Version merging**: only the newest visible version of each user key is
 ///   returned; older versions are silently skipped.
 ///
-/// In LevelDB's design the iterator is always in one of two directions.  We
-/// implement forward-only for now (`Prev` / `SeekToLast` are deferred to
-/// post-parity backward iteration).
+/// Supports both forward (`seek_to_first`, `seek`, `next`) and backward
+/// (`seek_to_last`, `prev`) iteration.  Switching directions is handled
+/// transparently.
 ///
-/// When `valid()` is true the internal iterator is positioned at the exact
-/// entry yielded by `key()` / `value()`, so those methods borrow directly from
-/// the inner iterator without copying.
+/// **Direction semantics** (matching LevelDB's `DBIter`):
+/// - Forward: `iter` is positioned at the current entry; `key()` / `value()`
+///   borrow directly from `iter` without copying.
+/// - Reverse: `iter` is positioned at the entry *just before* the current one
+///   in key order; `key()` / `value()` return `saved_key` / `saved_value`.
 ///
 /// See `db/db_iter.h/cc` in LevelDB.
 ///
@@ -44,6 +53,12 @@ pub(crate) struct DbIterator {
   status: Option<Error>,
   /// Whether the iterator is positioned at a valid user entry.
   valid: bool,
+  /// Current traversal direction.
+  direction: Direction,
+  /// In Reverse direction: user key of the current entry.
+  saved_key: Vec<u8>,
+  /// In Reverse direction: value bytes of the current entry.
+  saved_value: Vec<u8>,
 }
 
 impl DbIterator {
@@ -53,6 +68,9 @@ impl DbIterator {
       sequence,
       status: None,
       valid: false,
+      direction: Direction::Forward,
+      saved_key: Vec::new(),
+      saved_value: Vec::new(),
     }
   }
 
@@ -118,6 +136,70 @@ impl DbIterator {
     }
   }
 
+  /// Scan backward through the internal iterator to find the previous
+  /// user-visible entry, storing it in `saved_key` / `saved_value`.
+  ///
+  /// Must be called with `direction == Reverse`.  `iter` should be positioned
+  /// at or before the entry just before the one we want to present:
+  /// - On entry, `saved_key` holds the user key that we must scan *past*
+  ///   (i.e. we want a user key strictly less than it).
+  /// - On return, if a valid entry is found, `self.valid = true` and
+  ///   `saved_key` / `saved_value` hold the new current user entry.
+  ///   `iter` is left positioned at the entry *before* the new current one.
+  /// - If no valid entry exists, `self.valid = false` and direction is reset
+  ///   to Forward (matching LevelDB).
+  ///
+  /// See `db/db_iter.cc: DBIter::FindPrevUserEntry`.
+  fn find_prev_user_entry(&mut self) {
+    debug_assert_eq!(self.direction, Direction::Reverse);
+    // `value_type` tracks whether we have saved a Value entry in this call.
+    // Starts as 0 (Deletion) so the break condition does not fire on the
+    // first visible entry.
+    let mut value_type: u8 = 0; // 0 = Deletion, 1 = Value
+
+    while self.iter.valid() {
+      let ikey = self.iter.key();
+      if let Some((user_key, seq, vtype)) = parse_internal_key(ikey) {
+        if seq <= self.sequence {
+          // Stop when we encounter a value entry for a user key that is
+          // strictly smaller than the one we saved (we've found our answer).
+          if value_type != 0 && user_key < self.saved_key.as_slice() {
+            break;
+          }
+          value_type = vtype;
+          if vtype == 0 {
+            // Deletion marker: clear the saved entry (this key is deleted).
+            self.saved_key.clear();
+            self.saved_value.clear();
+          } else {
+            // Value: update saved entry with the most recent version seen.
+            let raw_value = self.iter.value();
+            self.saved_value.clear();
+            self.saved_value.extend_from_slice(raw_value);
+            self.saved_key.clear();
+            self.saved_key.extend_from_slice(user_key);
+          }
+        }
+        // seq > snapshot: invisible; fall through to iter.prev()
+      } else {
+        self.status = Some(Error::Corruption(
+          "corrupted internal key in DbIterator (reverse)".to_string(),
+        ));
+      }
+      self.iter.prev();
+    }
+
+    if value_type == 0 {
+      // Reached the beginning without finding a visible entry.
+      self.valid = false;
+      self.saved_key.clear();
+      self.saved_value.clear();
+      self.direction = Direction::Forward;
+    } else {
+      self.valid = true;
+    }
+  }
+
   // ── Public iterator interface ───────────────────────────────────────────
 
   pub(crate) fn valid(&self) -> bool {
@@ -126,6 +208,7 @@ impl DbIterator {
 
   /// Position at the first user-visible entry.
   pub(crate) fn seek_to_first(&mut self) {
+    self.direction = Direction::Forward;
     self.iter.seek_to_first();
     if self.iter.valid() {
       let mut skip = Vec::new();
@@ -135,8 +218,20 @@ impl DbIterator {
     }
   }
 
+  /// Position at the last user-visible entry.
+  ///
+  /// After this call the iterator is in Reverse direction; `key()` and
+  /// `value()` return `saved_key` / `saved_value`.
+  pub(crate) fn seek_to_last(&mut self) {
+    self.direction = Direction::Reverse;
+    self.saved_value.clear();
+    self.iter.seek_to_last();
+    self.find_prev_user_entry();
+  }
+
   /// Position at the first user-visible entry with `user_key >= target`.
   pub(crate) fn seek(&mut self, user_key: &[u8]) {
+    self.direction = Direction::Forward;
     // Seek the internal iterator to `(user_key, snapshot_seq, Value)`, the
     // largest internal key that sorts at or before any real entry for this
     // user key at the snapshot.
@@ -153,38 +248,105 @@ impl DbIterator {
   /// Advance to the next user-visible entry.
   pub(crate) fn next(&mut self) {
     debug_assert!(self.valid);
-    // Copy the current user key so we can skip all remaining internal entries
-    // for it (older versions + duplicate writes).
-    let ikey = self.iter.key().to_vec();
-    let mut skip = parse_internal_key(&ikey)
-      .map(|(uk, _, _)| uk.to_vec())
-      .unwrap_or_default();
-    // Advance the internal iterator past the current entry, then search.
-    self.iter.next();
-    if !self.iter.valid() {
-      self.valid = false;
-      return;
+
+    let mut skip: Vec<u8>;
+
+    if self.direction == Direction::Reverse {
+      // Switching from Reverse to Forward.
+      // `iter` is positioned at an entry with user_key < saved_key (the
+      // entry that caused `find_prev_user_entry` to stop), or it is invalid
+      // (we were at the very first entry).
+      self.direction = Direction::Forward;
+      if !self.iter.valid() {
+        self.iter.seek_to_first();
+      } else {
+        self.iter.next();
+      }
+      if !self.iter.valid() {
+        self.valid = false;
+        self.saved_key.clear();
+        return;
+      }
+      // Use saved_key as the key to skip (advance past the entry we were
+      // presenting before the direction switch).
+      skip = std::mem::take(&mut self.saved_key);
+    } else {
+      // Forward → Forward: copy current key and advance.
+      let ikey = self.iter.key().to_vec();
+      skip = parse_internal_key(&ikey)
+        .map(|(uk, _, _)| uk.to_vec())
+        .unwrap_or_default();
+      self.iter.next();
+      if !self.iter.valid() {
+        self.valid = false;
+        return;
+      }
     }
+
     self.find_next_user_entry(true, &mut skip);
+  }
+
+  /// Move to the previous user-visible entry.
+  ///
+  /// If currently in Forward direction, switches to Reverse by scanning
+  /// backward past the current entry.
+  pub(crate) fn prev(&mut self) {
+    debug_assert!(self.valid);
+
+    if self.direction == Direction::Forward {
+      // Switching from Forward to Reverse.
+      // `iter` is positioned AT the current entry.  Save the current user
+      // key, then scan backward until we see a different (smaller) user key.
+      debug_assert!(self.iter.valid());
+      let ikey = self.iter.key().to_vec();
+      self.saved_key.clear();
+      if let Some((uk, _, _)) = parse_internal_key(&ikey) {
+        self.saved_key.extend_from_slice(uk);
+      }
+      loop {
+        self.iter.prev();
+        if !self.iter.valid() {
+          self.valid = false;
+          self.saved_key.clear();
+          self.saved_value.clear();
+          return;
+        }
+        if let Some((uk, _, _)) = parse_internal_key(self.iter.key()) {
+          if uk < self.saved_key.as_slice() {
+            break;
+          }
+        }
+      }
+      self.direction = Direction::Reverse;
+    }
+
+    self.find_prev_user_entry();
   }
 
   /// Current user key.  Only valid when `valid()` is true.
   ///
-  /// The internal iterator is positioned at this entry, so the slice borrows
-  /// from the inner iterator without copying.
+  /// In Forward direction the slice borrows from the inner iterator (no copy).
+  /// In Reverse direction returns `saved_key`.
   pub(crate) fn key(&self) -> &[u8] {
     debug_assert!(self.valid);
-    let ikey = self.iter.key();
-    // User key occupies all bytes except the trailing 8-byte tag.
-    parse_internal_key(ikey)
-      .map(|(uk, _, _)| uk)
-      .unwrap_or(ikey)
+    if self.direction == Direction::Forward {
+      let ikey = self.iter.key();
+      parse_internal_key(ikey)
+        .map(|(uk, _, _)| uk)
+        .unwrap_or(ikey)
+    } else {
+      &self.saved_key
+    }
   }
 
   /// Current value.  Only valid when `valid()` is true.
   pub(crate) fn value(&self) -> &[u8] {
     debug_assert!(self.valid);
-    self.iter.value()
+    if self.direction == Direction::Forward {
+      self.iter.value()
+    } else {
+      &self.saved_value
+    }
   }
 
   pub(crate) fn status(&self) -> Option<&Error> {
@@ -385,5 +547,105 @@ mod tests {
         (b"d".to_vec(), b"vd".to_vec()),
       ]
     );
+  }
+
+  // ── Backward iteration tests ──────────────────────────────────────────────
+
+  #[test]
+  fn seek_to_last_empty_not_valid() {
+    let mut it = make_db_iter(vec![], 100);
+    it.seek_to_last();
+    assert!(!it.valid());
+  }
+
+  #[test]
+  fn seek_to_last_basic() {
+    let child = table_iter(&[(b"a", 1, 1, b"1"), (b"b", 2, 1, b"2"), (b"c", 3, 1, b"3")]);
+    let mut it = make_db_iter(vec![child], 10);
+    it.seek_to_last();
+    assert!(it.valid());
+    assert_eq!(it.key(), b"c");
+    assert_eq!(it.value(), b"3");
+  }
+
+  #[test]
+  fn prev_iterates_all_backward() {
+    let child = table_iter(&[(b"a", 1, 1, b"1"), (b"b", 2, 1, b"2"), (b"c", 3, 1, b"3")]);
+    let mut it = make_db_iter(vec![child], 10);
+    it.seek_to_last();
+    let mut result: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    while it.valid() {
+      result.push((it.key().to_vec(), it.value().to_vec()));
+      it.prev();
+    }
+    assert_eq!(
+      result,
+      vec![
+        (b"c".to_vec(), b"3".to_vec()),
+        (b"b".to_vec(), b"2".to_vec()),
+        (b"a".to_vec(), b"1".to_vec()),
+      ]
+    );
+  }
+
+  #[test]
+  fn prev_tombstone_hides_deleted_key() {
+    // del b@3 (first in SSTable for "b"), put b@1; snapshot=10 → "b" deleted.
+    let child = table_iter(&[
+      (b"a", 1, 1, b"va"),
+      (b"b", 3, 0, b""), // tombstone
+      (b"b", 1, 1, b"vb"),
+      (b"c", 2, 1, b"vc"),
+    ]);
+    let mut it = make_db_iter(vec![child], 10);
+    it.seek_to_last();
+    let mut keys: Vec<Vec<u8>> = Vec::new();
+    while it.valid() {
+      keys.push(it.key().to_vec());
+      it.prev();
+    }
+    assert_eq!(keys, vec![b"c".to_vec(), b"a".to_vec()]);
+  }
+
+  #[test]
+  fn prev_snapshot_filters_future_entries() {
+    // "c" written at seq=5 is invisible at snapshot=3.
+    let child = table_iter(&[(b"a", 1, 1, b"a"), (b"b", 2, 1, b"b"), (b"c", 5, 1, b"c")]);
+    let mut it = make_db_iter(vec![child], 3);
+    it.seek_to_last();
+    assert!(it.valid());
+    assert_eq!(it.key(), b"b");
+    it.prev();
+    assert!(it.valid());
+    assert_eq!(it.key(), b"a");
+    it.prev();
+    assert!(!it.valid());
+  }
+
+  #[test]
+  fn prev_after_forward_seek() {
+    let child = table_iter(&[(b"a", 1, 1, b"a"), (b"b", 2, 1, b"b"), (b"c", 3, 1, b"c")]);
+    let mut it = make_db_iter(vec![child], 10);
+    it.seek(b"b");
+    assert_eq!(it.key(), b"b");
+    it.prev();
+    assert!(it.valid());
+    assert_eq!(it.key(), b"a");
+    it.prev();
+    assert!(!it.valid());
+  }
+
+  #[test]
+  fn next_after_prev_switches_direction() {
+    let child = table_iter(&[(b"a", 1, 1, b"a"), (b"b", 2, 1, b"b"), (b"c", 3, 1, b"c")]);
+    let mut it = make_db_iter(vec![child], 10);
+    it.seek_to_last();
+    assert_eq!(it.key(), b"c");
+    it.prev();
+    assert_eq!(it.key(), b"b");
+    // Switch back to forward.
+    it.next();
+    assert!(it.valid());
+    assert_eq!(it.key(), b"c");
   }
 }

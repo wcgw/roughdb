@@ -111,16 +111,21 @@ struct FlushResult {
 
 // ── DbIter ────────────────────────────────────────────────────────────────────
 
-/// User-facing forward iterator over a consistent snapshot of the database.
+/// User-facing iterator over a consistent snapshot of the database.
 ///
 /// Applies snapshot filtering, tombstone handling, and version merging across
 /// the active memtable, any in-progress flush memtable, and all SSTable files.
 ///
 /// Obtain via [`Db::new_iterator`].  The iterator starts **unpositioned**;
-/// call [`seek_to_first`] or [`seek`] before reading keys or values.
+/// call [`seek_to_first`], [`seek_to_last`], or [`seek`] before reading keys
+/// or values.  Supports both forward ([`next`]) and backward ([`prev`])
+/// traversal; direction switches are handled transparently.
 ///
 /// [`seek_to_first`]: DbIter::seek_to_first
+/// [`seek_to_last`]: DbIter::seek_to_last
 /// [`seek`]: DbIter::seek
+/// [`next`]: DbIter::next
+/// [`prev`]: DbIter::prev
 pub struct DbIter {
   inner: db::db_iter::DbIterator,
 }
@@ -136,6 +141,11 @@ impl DbIter {
     self.inner.seek_to_first();
   }
 
+  /// Position at the last user-visible entry.
+  pub fn seek_to_last(&mut self) {
+    self.inner.seek_to_last();
+  }
+
   /// Position at the first user-visible entry with `key >= target`.
   pub fn seek(&mut self, key: &[u8]) {
     self.inner.seek(key);
@@ -147,6 +157,14 @@ impl DbIter {
   /// Panics (debug) if `valid()` is false.
   pub fn next(&mut self) {
     self.inner.next();
+  }
+
+  /// Move to the previous user-visible entry.
+  ///
+  /// # Panics
+  /// Panics (debug) if `valid()` is false.
+  pub fn prev(&mut self) {
+    self.inner.prev();
   }
 
   /// Current user key.  Only valid when `valid()` is true.
@@ -1576,6 +1594,88 @@ mod tests {
       it.next();
     }
     assert_eq!(keys.len(), 20);
+  }
+
+  // ── Backward iteration tests ───────────────────────────────────────────────
+
+  #[test]
+  fn iterator_seek_to_last_in_memory() {
+    use crate::ReadOptions;
+    let db = Db::default();
+    db.put(b"a", b"1").unwrap();
+    db.put(b"c", b"3").unwrap();
+    db.put(b"b", b"2").unwrap();
+    let mut it = db.new_iterator(&ReadOptions::default()).unwrap();
+    it.seek_to_last();
+    assert!(it.valid());
+    assert_eq!(it.key(), b"c");
+    assert_eq!(it.value(), b"3");
+  }
+
+  #[test]
+  fn iterator_prev_in_memory() {
+    use crate::ReadOptions;
+    let db = Db::default();
+    for &k in &[b"a" as &[u8], b"b", b"c", b"d"] {
+      db.put(k, k).unwrap();
+    }
+    let mut it = db.new_iterator(&ReadOptions::default()).unwrap();
+    it.seek_to_last();
+    let mut keys: Vec<Vec<u8>> = Vec::new();
+    while it.valid() {
+      keys.push(it.key().to_vec());
+      it.prev();
+    }
+    assert_eq!(
+      keys,
+      vec![b"d".to_vec(), b"c".to_vec(), b"b".to_vec(), b"a".to_vec()]
+    );
+  }
+
+  #[test]
+  fn iterator_prev_skips_deleted_keys() {
+    use crate::ReadOptions;
+    let db = Db::default();
+    db.put(b"a", b"a").unwrap();
+    db.put(b"b", b"b").unwrap();
+    db.put(b"c", b"c").unwrap();
+    db.delete(b"b").unwrap();
+    let mut it = db.new_iterator(&ReadOptions::default()).unwrap();
+    it.seek_to_last();
+    let mut keys: Vec<Vec<u8>> = Vec::new();
+    while it.valid() {
+      keys.push(it.key().to_vec());
+      it.prev();
+    }
+    assert_eq!(keys, vec![b"c".to_vec(), b"a".to_vec()]);
+  }
+
+  #[test]
+  fn iterator_prev_spans_l0_and_memtable() {
+    use crate::ReadOptions;
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path(), small_options()).unwrap();
+    // Force a flush.
+    for i in 0u32..20 {
+      db.put(format!("k{i:02}").as_bytes(), b"v").unwrap();
+    }
+    // A few more keys in the current memtable.
+    db.put(b"z1", b"v").unwrap();
+    db.put(b"z2", b"v").unwrap();
+
+    let mut it = db.new_iterator(&ReadOptions::default()).unwrap();
+    it.seek_to_last();
+    assert!(it.valid());
+    assert_eq!(it.key(), b"z2");
+
+    // Collect all keys backward and verify they are in descending order.
+    let mut prev_key: Vec<u8> = it.key().to_vec();
+    it.prev();
+    while it.valid() {
+      assert!(it.key() < prev_key.as_slice());
+      prev_key = it.key().to_vec();
+      it.prev();
+    }
   }
 
   // ── delete_obsolete_files tests ────────────────────────────────────────────

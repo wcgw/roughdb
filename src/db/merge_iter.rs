@@ -57,6 +57,28 @@ impl MergingIterator {
       })
       .map(|(i, _)| i);
   }
+
+  /// Scan all valid children and set `current` to the one with the largest
+  /// key.  Among equal keys the child with the lowest index wins (same
+  /// tiebreaking as forward direction).
+  fn find_largest(&mut self) {
+    self.current = self
+      .children
+      .iter()
+      .enumerate()
+      .filter(|(_, c)| c.valid())
+      .max_by(|(i, a), (j, b)| {
+        let ord = cmp_internal_keys(a.key(), b.key());
+        // For equal keys, lower index wins: reverse-compare indices so that
+        // max_by selects the lower index (it returns the "larger" element).
+        if ord == std::cmp::Ordering::Equal {
+          j.cmp(i)
+        } else {
+          ord
+        }
+      })
+      .map(|(i, _)| i);
+  }
 }
 
 impl InternalIterator for MergingIterator {
@@ -71,6 +93,13 @@ impl InternalIterator for MergingIterator {
     self.find_smallest();
   }
 
+  fn seek_to_last(&mut self) {
+    for child in &mut self.children {
+      child.seek_to_last();
+    }
+    self.find_largest();
+  }
+
   fn seek(&mut self, target: &[u8]) {
     for child in &mut self.children {
       child.seek(target);
@@ -83,6 +112,13 @@ impl InternalIterator for MergingIterator {
     let cur = self.current.unwrap();
     self.children[cur].next();
     self.find_smallest();
+  }
+
+  fn prev(&mut self) {
+    debug_assert!(self.valid());
+    let cur = self.current.unwrap();
+    self.children[cur].prev();
+    self.find_largest();
   }
 
   fn key(&self) -> &[u8] {
@@ -163,6 +199,14 @@ mod tests {
       };
     }
 
+    fn seek_to_last(&mut self) {
+      self.pos = if self.entries.is_empty() {
+        usize::MAX
+      } else {
+        self.entries.len() - 1
+      };
+    }
+
     fn seek(&mut self, target: &[u8]) {
       self.pos = self
         .entries
@@ -176,6 +220,15 @@ mod tests {
       self.pos += 1;
       if self.pos >= self.entries.len() {
         self.pos = usize::MAX;
+      }
+    }
+
+    fn prev(&mut self) {
+      debug_assert!(self.valid());
+      if self.pos == 0 {
+        self.pos = usize::MAX;
+      } else {
+        self.pos -= 1;
       }
     }
 
@@ -308,6 +361,85 @@ mod tests {
         b"beta".to_vec(),
         b"delta".to_vec(),
         b"gamma".to_vec()
+      ]
+    );
+  }
+
+  // ── Backward iteration tests ──────────────────────────────────────────────
+
+  #[test]
+  fn seek_to_last_empty() {
+    let mut it = MergingIterator::new(vec![]);
+    it.seek_to_last();
+    assert!(!it.valid());
+  }
+
+  #[test]
+  fn seek_to_last_single_child() {
+    let c0 = vec_iter(&[(b"a", 1, b"1"), (b"b", 2, b"2"), (b"c", 3, b"3")]);
+    let mut it = MergingIterator::new(vec![c0]);
+    it.seek_to_last();
+    assert!(it.valid());
+    assert_eq!(user_key(it.key()), b"c");
+    assert_eq!(it.value(), b"3");
+  }
+
+  #[test]
+  fn prev_iterates_backward_two_children() {
+    let c0 = vec_iter(&[(b"a", 1, b"a0"), (b"c", 3, b"c0"), (b"e", 5, b"e0")]);
+    let c1 = vec_iter(&[(b"b", 2, b"b1"), (b"d", 4, b"d1"), (b"f", 6, b"f1")]);
+    let mut it = MergingIterator::new(vec![c0, c1]);
+    it.seek_to_last();
+    let mut keys: Vec<Vec<u8>> = Vec::new();
+    while it.valid() {
+      keys.push(user_key(it.key()).to_vec());
+      it.prev();
+    }
+    assert_eq!(
+      keys,
+      vec![
+        b"f".to_vec(),
+        b"e".to_vec(),
+        b"d".to_vec(),
+        b"c".to_vec(),
+        b"b".to_vec(),
+        b"a".to_vec(),
+      ]
+    );
+  }
+
+  #[test]
+  fn seek_to_last_with_multi_version_key() {
+    // c0 has z@seq=2, c1 has z@seq=1.  Internal key ordering: z@2 < z@1
+    // (higher seq sorts first = is "smaller").  find_largest picks z@1 (c1).
+    let c0 = vec_iter(&[(b"z", 2, b"newer")]);
+    let c1 = vec_iter(&[(b"z", 1, b"older")]);
+    let mut it = MergingIterator::new(vec![c0, c1]);
+    it.seek_to_last();
+    assert!(it.valid());
+    // z@1 is the larger internal key → child 1 wins at the MergingIterator level.
+    assert_eq!(it.value(), b"older");
+    // The DbIterator (on top) would then scan backward and surface "newer".
+  }
+
+  #[test]
+  fn backward_with_sstable_children() {
+    let t0 = table_iter(&[(b"alpha", b"A"), (b"gamma", b"G")]);
+    let t1 = table_iter(&[(b"beta", b"B"), (b"delta", b"D")]);
+    let mut it = MergingIterator::new(vec![t0, t1]);
+    it.seek_to_last();
+    let mut keys: Vec<Vec<u8>> = Vec::new();
+    while it.valid() {
+      keys.push(user_key(it.key()).to_vec());
+      it.prev();
+    }
+    assert_eq!(
+      keys,
+      vec![
+        b"gamma".to_vec(),
+        b"delta".to_vec(),
+        b"beta".to_vec(),
+        b"alpha".to_vec(),
       ]
     );
   }

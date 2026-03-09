@@ -152,6 +152,24 @@ impl InternalIterator for BlockIter {
     self.decode_entry();
   }
 
+  /// Position at the last entry.
+  ///
+  /// Starts from the last restart point and scans forward to the final entry.
+  fn seek_to_last(&mut self) {
+    if self.num_restarts == 0 || self.restarts_offset == 0 {
+      return; // empty block stays invalid
+    }
+    let last_restart = self.num_restarts - 1;
+    self.current = self.restart_point(last_restart);
+    self.key.clear();
+    self.decode_entry();
+    // Advance until no more entries remain before the restart array.
+    while self.value_start + self.value_len < self.restarts_offset {
+      self.current = self.value_start + self.value_len;
+      self.decode_entry();
+    }
+  }
+
   /// Position at the first entry with `key >= target`.
   ///
   /// Uses binary search over restart points, then linear scan within the
@@ -179,6 +197,46 @@ impl InternalIterator for BlockIter {
     debug_assert!(self.valid());
     self.current = self.value_start + self.value_len;
     if self.current < self.restarts_offset {
+      self.decode_entry();
+    }
+  }
+
+  /// Move to the entry immediately before the current one.
+  ///
+  /// Uses restart points to binary-search for the restart block that
+  /// contains the predecessor, then forward-scans within that block.
+  /// O(restart_interval) forward steps after an O(log(num_restarts)) search.
+  fn prev(&mut self) {
+    debug_assert!(self.valid());
+    let current_pos = self.current;
+
+    // If we are at the very first entry (restart point 0 is always offset 0),
+    // there is no predecessor — become invalid.
+    if current_pos == 0 {
+      self.current = self.restarts_offset; // past restarts → invalid
+      self.key.clear();
+      return;
+    }
+
+    // Find the largest restart index whose offset is strictly < current_pos.
+    // Restart indices are sorted ascending, so we scan linearly (num_restarts
+    // is typically small, e.g. block_size / restart_interval ≈ 16).
+    let mut lo = 0usize;
+    for i in 1..self.num_restarts {
+      if self.restart_point(i) < current_pos {
+        lo = i;
+      } else {
+        break;
+      }
+    }
+
+    // Scan forward from restart_point(lo) until the *next* entry is at
+    // current_pos — that makes the current entry the predecessor.
+    self.current = self.restart_point(lo);
+    self.key.clear();
+    self.decode_entry();
+    while self.value_start + self.value_len < current_pos {
+      self.current = self.value_start + self.value_len;
       self.decode_entry();
     }
   }
@@ -285,5 +343,80 @@ mod tests {
     assert!(it.valid());
     assert_eq!(it.key(), b"f");
     assert_eq!(it.value(), &[b'f' + 1]);
+  }
+
+  // ── Backward iteration tests ──────────────────────────────────────────────
+
+  #[test]
+  fn seek_to_last_empty_block() {
+    let mut bb = BlockBuilder::new(16);
+    let block = Block::new(bb.finish().to_vec());
+    let mut it = block.iter();
+    it.seek_to_last();
+    assert!(!it.valid());
+  }
+
+  #[test]
+  fn seek_to_last_single_entry() {
+    let block = make_block(&[(b"only", b"v")], 16);
+    let mut it = block.iter();
+    it.seek_to_last();
+    assert!(it.valid());
+    assert_eq!(it.key(), b"only");
+    assert_eq!(it.value(), b"v");
+    it.prev();
+    assert!(!it.valid());
+  }
+
+  #[test]
+  fn seek_to_last_multiple_entries() {
+    let block = make_block(&[(b"a", b"1"), (b"b", b"2"), (b"c", b"3")], 16);
+    let mut it = block.iter();
+    it.seek_to_last();
+    assert!(it.valid());
+    assert_eq!(it.key(), b"c");
+    assert_eq!(it.value(), b"3");
+  }
+
+  #[test]
+  fn prev_iterates_all_entries_backward() {
+    let pairs: &[(&[u8], &[u8])] = &[(b"a", b"1"), (b"b", b"2"), (b"c", b"3")];
+    let block = make_block(pairs, 16);
+    let mut it = block.iter();
+    it.seek_to_last();
+    let mut result: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    while it.valid() {
+      result.push((it.key().to_vec(), it.value().to_vec()));
+      it.prev();
+    }
+    assert_eq!(
+      result,
+      vec![
+        (b"c".to_vec(), b"3".to_vec()),
+        (b"b".to_vec(), b"2".to_vec()),
+        (b"a".to_vec(), b"1".to_vec()),
+      ]
+    );
+  }
+
+  #[test]
+  fn prev_across_restart_boundaries() {
+    // restart_interval=3: restarts at entries 0, 3, 6, …
+    let pairs: Vec<(Vec<u8>, Vec<u8>)> = (b'a'..=b'i').map(|c| (vec![c], vec![c + 1])).collect();
+    let pairs_ref: Vec<(&[u8], &[u8])> = pairs
+      .iter()
+      .map(|(k, v)| (k.as_slice(), v.as_slice()))
+      .collect();
+    let block = make_block(&pairs_ref, 3);
+    let mut it = block.iter();
+    it.seek_to_last();
+    let mut keys: Vec<u8> = Vec::new();
+    while it.valid() {
+      assert_eq!(it.key().len(), 1);
+      keys.push(it.key()[0]);
+      it.prev();
+    }
+    let expected: Vec<u8> = (b'a'..=b'i').rev().collect();
+    assert_eq!(keys, expected);
   }
 }
