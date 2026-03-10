@@ -12,7 +12,6 @@
 
 use crate::coding::{read_varu64, write_varu64};
 use crate::error::Error;
-use crate::table::reader::Table;
 use std::sync::Arc;
 
 // LevelDB-compatible MANIFEST tag constants.
@@ -26,11 +25,10 @@ const TAG_PREV_LOG_NUMBER: u64 = 9;
 
 /// Metadata for one SSTable file.
 ///
-/// The `table` field is in-memory only and is never encoded in the MANIFEST.
-/// It is `Some` for every file that lives in a live [`Version`]; `None` only
-/// during intermediate MANIFEST replay before tables are opened.
+/// Open `Table` handles are managed by the [`TableCache`]; this struct carries
+/// only the durable metadata that is encoded in the MANIFEST.
 ///
-/// [`Version`]: super::version::Version
+/// [`TableCache`]: super::table_cache::TableCache
 pub(crate) struct FileMetaData {
   pub number: u64,
   pub file_size: u64,
@@ -38,26 +36,15 @@ pub(crate) struct FileMetaData {
   pub smallest: Vec<u8>,
   /// Largest internal key stored in this file.
   pub largest: Vec<u8>,
-  /// Open table reader.  `None` only during MANIFEST recovery before
-  /// `VersionSet::recover` opens the table.
-  pub table: Option<Arc<Table>>,
 }
 
 impl FileMetaData {
-  /// Construct a fully-initialized `FileMetaData` with an open table.
-  pub(crate) fn with_table(
-    number: u64,
-    file_size: u64,
-    smallest: Vec<u8>,
-    largest: Vec<u8>,
-    table: Arc<Table>,
-  ) -> Arc<Self> {
+  pub(crate) fn new(number: u64, file_size: u64, smallest: Vec<u8>, largest: Vec<u8>) -> Arc<Self> {
     Arc::new(Self {
       number,
       file_size,
       smallest,
       largest,
-      table: Some(table),
     })
   }
 }
@@ -71,8 +58,7 @@ pub(crate) struct VersionEdit {
   pub prev_log_number: Option<u64>,
   pub next_file_number: Option<u64>,
   pub last_sequence: Option<u64>,
-  /// Files added: `(level, metadata)`. The `table` field of each `FileMetaData`
-  /// is `Some` when produced by the flush path; `None` when decoded from the MANIFEST.
+  /// Files added: `(level, metadata)`.
   pub new_files: Vec<(i32, Arc<FileMetaData>)>,
   /// Files removed: `(level, file_number)`.
   pub deleted_files: Vec<(i32, u64)>,
@@ -222,13 +208,7 @@ impl VersionEdit {
           pos += n;
           edit.new_files.push((
             level as i32,
-            Arc::new(FileMetaData {
-              number,
-              file_size,
-              smallest,
-              largest,
-              table: None, // opened by VersionSet::recover after replay
-            }),
+            FileMetaData::new(number, file_size, smallest, largest),
           ));
         }
         TAG_COMPARATOR => {
@@ -292,16 +272,14 @@ mod tests {
     edit.last_sequence = Some(999);
     edit.deleted_files.push((0, 5));
     edit.deleted_files.push((1, 10));
-    // FileMetaData without a table (table=None is fine for encode/decode).
     edit.new_files.push((
       0,
-      Arc::new(FileMetaData {
-        number: 7,
-        file_size: 1024,
-        smallest: b"aaa\x01\x00\x00\x00\x00\x00\x00\x00\x00".to_vec(),
-        largest: b"zzz\x01\x00\x00\x00\x00\x00\x00\x00\x00".to_vec(),
-        table: None,
-      }),
+      FileMetaData::new(
+        7,
+        1024,
+        b"aaa\x01\x00\x00\x00\x00\x00\x00\x00\x00".to_vec(),
+        b"zzz\x01\x00\x00\x00\x00\x00\x00\x00\x00".to_vec(),
+      ),
     ));
 
     let encoded = edit.encode();
@@ -319,7 +297,6 @@ mod tests {
     assert_eq!(meta.file_size, 1024);
     assert_eq!(meta.smallest, b"aaa\x01\x00\x00\x00\x00\x00\x00\x00\x00");
     assert_eq!(meta.largest, b"zzz\x01\x00\x00\x00\x00\x00\x00\x00\x00");
-    assert!(meta.table.is_none());
   }
 
   #[test]

@@ -10,13 +10,12 @@
 //    See the License for the specific language governing permissions and
 //    limitations under the License.
 
+use crate::db::table_cache::TableCache;
 use crate::db::version::Version;
 use crate::db::version_edit::{FileMetaData, VersionEdit};
 use crate::error::Error;
-use crate::filter::FilterPolicy;
 use crate::log::reader::Reader as LogReader;
 use crate::log::writer::Writer as LogWriter;
-use crate::table::reader::Table;
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::path::Path;
@@ -99,14 +98,11 @@ impl VersionSet {
 
   /// Recover a `VersionSet` from an existing MANIFEST.
   ///
-  /// Reads `CURRENT`, replays each `VersionEdit` in the MANIFEST log, opens
-  /// all live SSTable files, and returns a `VersionSet` ready for
+  /// Reads `CURRENT`, replays each `VersionEdit` in the MANIFEST log, and
+  /// assembles the initial `Version` (metadata only — tables are opened lazily
+  /// by the `TableCache` on first access).  Returns a `VersionSet` ready for
   /// `log_and_apply`.
-  pub(crate) fn recover(
-    path: &Path,
-    paranoid_checks: bool,
-    filter_policy: Option<Arc<dyn FilterPolicy>>,
-  ) -> Result<Self, Error> {
+  pub(crate) fn recover(path: &Path, paranoid_checks: bool) -> Result<Self, Error> {
     let manifest_name = read_current_file(path)?;
     let manifest_path = path.join(&manifest_name);
 
@@ -128,8 +124,7 @@ impl VersionSet {
     let last_sequence = builder.last_sequence;
     let log_number = builder.log_number;
 
-    // Open Table for each live file.
-    let files = builder.build(path, filter_policy)?;
+    let files = builder.build();
 
     // Re-open the MANIFEST for appending (continue after the last record).
     let manifest_file_for_write = OpenOptions::new().append(true).open(&manifest_path)?;
@@ -149,10 +144,13 @@ impl VersionSet {
   /// Apply `edit` to the current `Version` and append it to the MANIFEST.
   ///
   /// Fills in `next_file_number`, `last_sequence`, and `log_number` from the
-  /// current `VersionSet` state before encoding.
-  ///
-  /// All `new_files` entries in `edit` must have `table: Some(...)`.
-  pub(crate) fn log_and_apply(&mut self, edit: &mut VersionEdit) -> Result<(), Error> {
+  /// current `VersionSet` state before encoding.  Deleted files are evicted
+  /// from `tc` so their file handles are released.
+  pub(crate) fn log_and_apply(
+    &mut self,
+    edit: &mut VersionEdit,
+    tc: &TableCache,
+  ) -> Result<(), Error> {
     edit.next_file_number = Some(self.next_file_number);
     edit.last_sequence = Some(self.last_sequence);
     edit.log_number = Some(self.log_number);
@@ -166,6 +164,7 @@ impl VersionSet {
     for &(level, number) in &edit.deleted_files {
       let level = level as usize;
       new_files[level].retain(|m| m.number != number);
+      tc.evict(number);
     }
     for (level, meta) in &edit.new_files {
       let level = *level as usize;
@@ -294,12 +293,12 @@ impl Builder {
     }
   }
 
-  /// Open Tables for all live files and assemble the initial `Version`.
-  fn build(
-    self,
-    path: &Path,
-    filter_policy: Option<Arc<dyn FilterPolicy>>,
-  ) -> Result<Version, Error> {
+  /// Assemble the initial `Version` from replayed MANIFEST edits.
+  ///
+  /// Tables are opened lazily by the `TableCache` on first access — no I/O
+  /// here, matching LevelDB's separation between `VersionSet` and
+  /// `TableCache`.
+  fn build(self) -> Version {
     let mut files: [Vec<Arc<FileMetaData>>; 7] = std::array::from_fn(|_| Vec::new());
 
     // Collect live files per level (stable insertion order for L0).
@@ -313,27 +312,15 @@ impl Builder {
         // L0: newest-first (sort by file number descending).
         level_files.sort_by(|a, b| b.0.cmp(&a.0));
       } else {
-        // L1+: sort by smallest key (binary search in Phase 6).
+        // L1+: sort by smallest key.
         level_files.sort_by(|a, b| a.1.smallest.cmp(&b.1.smallest));
       }
-
       for (_, meta) in level_files {
-        let sst_path = path.join(format!("{:06}.ldb", meta.number));
-        let file = File::open(&sst_path).map_err(|e| {
-          Error::Corruption(format!("cannot open SSTable {:06}.ldb: {e}", meta.number))
-        })?;
-        let table = Arc::new(Table::open(file, meta.file_size, filter_policy.clone())?);
-        files[level].push(FileMetaData::with_table(
-          meta.number,
-          meta.file_size,
-          meta.smallest.clone(),
-          meta.largest.clone(),
-          table,
-        ));
+        files[level].push(meta);
       }
     }
 
-    Ok(Version { files })
+    Version { files }
   }
 }
 
@@ -351,16 +338,18 @@ fn parse_manifest_number(name: &str) -> Result<u64, Error> {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::db::table_cache::{TableCache, NUM_NON_TABLE_CACHE_FILES};
   use crate::options::Options;
   use crate::table::builder::TableBuilder;
   use crate::table::format::make_internal_key;
 
-  /// Write a minimal SSTable at `path/NNNNNN.ldb` and return (file_number, file_size, Arc<Table>).
-  fn write_sst(
-    dir: &Path,
-    file_number: u64,
-    entries: &[(&[u8], u64, u8, &[u8])],
-  ) -> (u64, u64, Arc<Table>) {
+  fn make_tc(dir: &Path) -> TableCache {
+    let opts = Options::default();
+    TableCache::new(dir, opts.max_open_files - NUM_NON_TABLE_CACHE_FILES, None)
+  }
+
+  /// Write a minimal SSTable at `path/NNNNNN.ldb` and return (file_number, file_size).
+  fn write_sst(dir: &Path, file_number: u64, entries: &[(&[u8], u64, u8, &[u8])]) -> (u64, u64) {
     let sst_path = dir.join(format!("{file_number:06}.ldb"));
     let file = std::fs::OpenOptions::new()
       .write(true)
@@ -379,9 +368,7 @@ mod tests {
       builder.add(&make_internal_key(uk, seq, vt), val).unwrap();
     }
     let size = builder.finish().unwrap();
-    let read_file = File::open(&sst_path).unwrap();
-    let table = Arc::new(Table::open(read_file, size, None).unwrap());
-    (file_number, size, table)
+    (file_number, size)
   }
 
   #[test]
@@ -398,13 +385,14 @@ mod tests {
   fn log_and_apply_persists() {
     let dir = tempfile::tempdir().unwrap();
     let mut vs = VersionSet::create(dir.path()).unwrap();
+    let tc = make_tc(dir.path());
 
     // Simulate flushing file 3.
-    let (fnum, fsize, table) = write_sst(dir.path(), 3, &[(b"hello", 1, 1, b"world")]);
-    let meta = FileMetaData::with_table(fnum, fsize, b"hello".to_vec(), b"hello".to_vec(), table);
+    let (fnum, fsize) = write_sst(dir.path(), 3, &[(b"hello", 1, 1, b"world")]);
+    let meta = FileMetaData::new(fnum, fsize, b"hello".to_vec(), b"hello".to_vec());
     let mut edit = VersionEdit::new();
     edit.new_files.push((0, meta));
-    vs.log_and_apply(&mut edit).unwrap();
+    vs.log_and_apply(&mut edit, &tc).unwrap();
 
     // Current version must have file 3 in L0.
     let cur = vs.current();
@@ -413,7 +401,7 @@ mod tests {
 
     // Drop and recover — the file must still appear.
     drop(vs);
-    let vs2 = VersionSet::recover(dir.path(), false, None).unwrap();
+    let vs2 = VersionSet::recover(dir.path(), false).unwrap();
     let cur2 = vs2.current();
     assert_eq!(cur2.files[0].len(), 1);
     assert_eq!(cur2.files[0][0].number, 3);
@@ -423,32 +411,38 @@ mod tests {
   fn recover_reopens_tables() {
     let dir = tempfile::tempdir().unwrap();
     let mut vs = VersionSet::create(dir.path()).unwrap();
+    let tc = make_tc(dir.path());
 
-    let (fnum, fsize, table) = write_sst(dir.path(), 3, &[(b"key", 1, 1, b"val")]);
-    let meta = FileMetaData::with_table(fnum, fsize, b"key".to_vec(), b"key".to_vec(), table);
+    let (fnum, fsize) = write_sst(dir.path(), 3, &[(b"key", 1, 1, b"val")]);
+    let meta = FileMetaData::new(fnum, fsize, b"key".to_vec(), b"key".to_vec());
     let mut edit = VersionEdit::new();
     edit.new_files.push((0, meta));
-    vs.log_and_apply(&mut edit).unwrap();
+    vs.log_and_apply(&mut edit, &tc).unwrap();
     drop(vs);
 
-    let vs2 = VersionSet::recover(dir.path(), false, None).unwrap();
+    let vs2 = VersionSet::recover(dir.path(), false).unwrap();
+    let tc2 = make_tc(dir.path());
     let cur = vs2.current();
     use crate::table::reader::LookupResult;
-    assert!(matches!(cur.get(b"key", 0, false).unwrap(), LookupResult::Value(v) if v == b"val"));
+    assert!(matches!(
+      cur.get(b"key", 0, false, &tc2).unwrap(),
+      LookupResult::Value(v) if v == b"val"
+    ));
   }
 
   #[test]
   fn sequence_survives_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let mut vs = VersionSet::create(dir.path()).unwrap();
+    let tc = make_tc(dir.path());
 
     vs.set_last_sequence(42);
     let mut edit = VersionEdit::new();
     // log_and_apply persists last_sequence even with no file changes.
-    vs.log_and_apply(&mut edit).unwrap();
+    vs.log_and_apply(&mut edit, &tc).unwrap();
     drop(vs);
 
-    let vs2 = VersionSet::recover(dir.path(), false, None).unwrap();
+    let vs2 = VersionSet::recover(dir.path(), false).unwrap();
     assert_eq!(vs2.last_sequence(), 42);
   }
 }

@@ -109,6 +109,7 @@
 //! # Ok::<(), roughdb::Error>(())
 //! ```
 
+use crate::db::table_cache::TableCache;
 use crate::db::version_edit::{FileMetaData, VersionEdit};
 use crate::db::version_set::VersionSet;
 use crate::log::reader::Reader as LogReader;
@@ -373,14 +374,18 @@ fn acquire_lock(file: &std::fs::File) -> Result<(), Error> {
   }
 }
 
+struct Persistence {
+  dir: PathBuf,
+  table_cache: TableCache,
+  _lock: std::fs::File,
+}
+
 // ── Db ───────────────────────────────────────────────────────────────────────
 
 pub struct Db {
   state: Mutex<DbState>,
   options: Options,
-  /// `Some((dir, lock))` for persistent databases; `None` for in-memory (`Db::default()`).
-  /// The `lock` file is held open to maintain the exclusive `flock` for the database lifetime.
-  persistent: Option<(PathBuf, std::fs::File)>,
+  persistence: Option<Persistence>,
 }
 
 impl Default for Db {
@@ -397,7 +402,7 @@ impl Default for Db {
         snapshots: std::collections::BTreeSet::new(),
       }),
       options: Options::default(),
-      persistent: None,
+      persistence: None,
     }
   }
 }
@@ -457,10 +462,17 @@ impl Db {
       .open(path.join("LOCK"))?;
     acquire_lock(&lock_file)?;
 
+    // Create the table cache for this persistent database.
+    let cache_capacity = options
+      .max_open_files
+      .saturating_sub(crate::db::table_cache::NUM_NON_TABLE_CACHE_FILES)
+      .max(1);
+    let table_cache =
+      crate::db::table_cache::TableCache::new(path, cache_capacity, options.filter_policy.clone());
+
     let (version_set, mem, last_sequence) = if db_exists {
       // ── Existing database: MANIFEST-driven recovery ──────────────────────
-      let mut vs =
-        VersionSet::recover(path, options.paranoid_checks, options.filter_policy.clone())?;
+      let mut vs = VersionSet::recover(path, options.paranoid_checks)?;
       let manifest_last_seq = vs.last_sequence();
       let mem = Arc::new(Memtable::default());
 
@@ -513,7 +525,11 @@ impl Db {
         snapshots: std::collections::BTreeSet::new(),
       }),
       options,
-      persistent: Some((path.to_path_buf(), lock_file)),
+      persistence: Some(Persistence {
+        dir: path.to_path_buf(),
+        table_cache,
+        _lock: lock_file,
+      }),
     })
   }
 
@@ -599,10 +615,12 @@ impl Db {
     }
 
     if let Some(version) = version {
-      match version.get(key, sequence, verify_checksums)? {
-        LookupResult::Value(v) => return Ok(v),
-        LookupResult::Deleted => return Err(Error::NotFound),
-        LookupResult::NotInTable => {}
+      if let Some(persistence) = &self.persistence {
+        match version.get(key, sequence, verify_checksums, &persistence.table_cache)? {
+          LookupResult::Value(v) => return Ok(v),
+          LookupResult::Deleted => return Err(Error::NotFound),
+          LookupResult::NotInTable => {}
+        }
       }
     }
 
@@ -717,14 +735,16 @@ impl Db {
     ranges
       .iter()
       .map(|&(start, limit)| {
-        let Some(ref v) = version else { return 0 };
+        let (Some(ref v), Some(ref tc)) = (&version, &self.persistence) else {
+          return 0;
+        };
         // Convert user keys to lookup internal keys (seq=u64::MAX>>8, vtype=1)
         // so they sort before all real entries for the same user key — the same
         // sentinel used in Table::get.
         let istart = make_internal_key(start, u64::MAX >> 8, 1);
         let ilimit = make_internal_key(limit, u64::MAX >> 8, 1);
-        let start_off = v.approximate_offset_of(&istart);
-        let limit_off = v.approximate_offset_of(&ilimit);
+        let start_off = v.approximate_offset_of(&istart, &tc.table_cache);
+        let limit_off = v.approximate_offset_of(&ilimit, &tc.table_cache);
         limit_off.saturating_sub(start_off)
       })
       .collect()
@@ -785,12 +805,13 @@ impl Db {
     }
 
     // SSTable files from the current Version, level by level (L0 first).
-    if let Some(version) = version {
+    if let (Some(version), Some(persistence)) = (version, &self.persistence) {
       for level_files in &version.files {
         for meta in level_files {
-          if let Some(table) = &meta.table {
-            children.push(Box::new(table.new_iterator(verify_checksums)?));
-          }
+          let table = persistence
+            .table_cache
+            .get_or_open(meta.number, meta.file_size)?;
+          children.push(Box::new(table.new_iterator(verify_checksums)?));
         }
       }
     }
@@ -866,10 +887,12 @@ impl Db {
   pub fn compact_range(&self, begin: Option<&[u8]>, end: Option<&[u8]>) -> Result<(), Error> {
     use crate::db::version::NUM_LEVELS;
 
-    let path = match self.path() {
-      Some(p) => p.to_path_buf(),
+    let persistence = match &self.persistence {
+      Some(p) => p,
       None => return Ok(()),
     };
+
+    let path = persistence.dir.as_path();
 
     // Find the deepest level that currently has files overlapping [begin, end].
     let max_level = {
@@ -901,7 +924,15 @@ impl Db {
     // cap at NUM_LEVELS-1 since there is no level above it to compact into.
     let stop = max_level.min(NUM_LEVELS - 1);
     for level in 0..stop {
-      compact_level_range(&path, &self.state, &self.options, level, begin, end)?;
+      compact_level_range(
+        path,
+        &self.state,
+        &self.options,
+        &persistence.table_cache,
+        level,
+        begin,
+        end,
+      )?;
     }
 
     Ok(())
@@ -930,7 +961,8 @@ impl Db {
 
     // Trigger an L0 flush when the memtable exceeds the size limit.
     // Only applies to persistent databases (path.is_some()).
-    if let Some(path) = self.path() {
+    if let Some(persistence) = &self.persistence {
+      let path = persistence.dir.as_path();
       if state.mem.approximate_memory_usage() >= self.options.write_buffer_size {
         // Phase 1: rotate mem → imm, allocate new WAL file (write lock held).
         let prep = begin_flush(path, &mut state)?;
@@ -940,7 +972,7 @@ impl Db {
         let result = write_flush(prep, &self.options)?;
         // Phase 3: install the new Version, swap WAL, clear imm (lock held).
         let mut state = self.state.lock().unwrap();
-        finish_flush(&mut state, result)?;
+        finish_flush(&mut state, result, &persistence.table_cache)?;
         drop(state);
         // Phase 4: delete obsolete files (lock released; best-effort).
         delete_obsolete_files(path, &self.state);
@@ -962,17 +994,12 @@ impl Db {
           if l0 >= L0_SLOWDOWN_WRITES_TRIGGER {
             std::thread::sleep(std::time::Duration::from_millis(1));
           }
-          maybe_compact(path, &self.state, &self.options);
+          maybe_compact(path, &self.state, &self.options, &persistence.table_cache);
         }
       }
     }
 
     Ok(())
-  }
-
-  /// Returns the on-disk database directory, or `None` for in-memory databases.
-  fn path(&self) -> Option<&std::path::Path> {
-    self.persistent.as_ref().map(|(p, _)| p.as_path())
   }
 }
 
@@ -1079,13 +1106,18 @@ fn write_flush(prep: FlushPrep, opts: &Options) -> Result<FlushResult, Error> {
 ///
 /// `set_log_number` is called *before* `log_and_apply` so the MANIFEST record
 /// carries the correct log number — matching LevelDB's `MakeRoomForWrite`.
-fn finish_flush(state: &mut DbState, result: FlushResult) -> Result<(), Error> {
-  let meta = FileMetaData::with_table(
+fn finish_flush(
+  state: &mut DbState,
+  result: FlushResult,
+  tc: &crate::db::table_cache::TableCache,
+) -> Result<(), Error> {
+  // Register the new table in the cache before installing the version.
+  tc.insert(result.file_number, result.table);
+  let meta = FileMetaData::new(
     result.file_number,
     result.file_size,
     result.smallest,
     result.largest,
-    result.table,
   );
   let mut edit = VersionEdit::new();
   edit.new_files.push((0, meta));
@@ -1095,7 +1127,7 @@ fn finish_flush(state: &mut DbState, result: FlushResult) -> Result<(), Error> {
     .expect("finish_flush: no VersionSet");
   vs.set_last_sequence(state.last_sequence);
   vs.set_log_number(result.new_log_number);
-  vs.log_and_apply(&mut edit)?;
+  vs.log_and_apply(&mut edit, tc)?;
   // Switch to the new WAL; the MANIFEST now points past the old one.
   state.log = Some(result.new_log);
   state.imm = None;
@@ -1230,6 +1262,7 @@ fn finish_compaction_output(
 /// `inputs` should be ordered so that newer files (by file number) appear
 /// before older ones for the same level, allowing `MergingIterator` to resolve
 /// same-key ties in favour of the newer version via the lower child index.
+#[allow(clippy::too_many_arguments)]
 fn do_compaction(
   path: &std::path::Path,
   state: &Mutex<DbState>,
@@ -1238,16 +1271,14 @@ fn do_compaction(
   oldest_snapshot: u64,
   output_level: usize,
   opts: &Options,
+  tc: &crate::db::table_cache::TableCache,
 ) -> Result<Vec<CompactionOutput>, Error> {
   use crate::db::merge_iter::MergingIterator;
   use crate::iter::InternalIterator;
 
   let mut children: Vec<Box<dyn InternalIterator>> = Vec::new();
   for meta in inputs {
-    let table = meta
-      .table
-      .as_ref()
-      .expect("compaction input must have an open table");
+    let table = tc.get_or_open(meta.number, meta.file_size)?;
     children.push(Box::new(table.new_iterator(opts.paranoid_checks)?));
   }
 
@@ -1364,6 +1395,7 @@ fn install_compaction(
   deleted: &[(i32, u64)],
   outputs: Vec<CompactionOutput>,
   output_level: i32,
+  tc: &crate::db::table_cache::TableCache,
 ) -> Result<(), Error> {
   let vs = state
     .version_set
@@ -1374,17 +1406,13 @@ fn install_compaction(
     edit.deleted_files.push((level, number));
   }
   for out in outputs {
-    let meta = FileMetaData::with_table(
-      out.file_number,
-      out.file_size,
-      out.smallest,
-      out.largest,
-      out.table,
-    );
+    // Register the output table in the cache before installing the version.
+    tc.insert(out.file_number, out.table);
+    let meta = FileMetaData::new(out.file_number, out.file_size, out.smallest, out.largest);
     edit.new_files.push((output_level, meta));
   }
   vs.set_last_sequence(state.last_sequence);
-  vs.log_and_apply(&mut edit)?;
+  vs.log_and_apply(&mut edit, tc)?;
   Ok(())
 }
 
@@ -1464,6 +1492,7 @@ fn compact_level_range(
   path: &std::path::Path,
   state: &Mutex<DbState>,
   opts: &Options,
+  tc: &crate::db::table_cache::TableCache,
   level: usize,
   begin: Option<&[u8]>,
   end: Option<&[u8]>,
@@ -1510,12 +1539,13 @@ fn compact_level_range(
     oldest_snapshot,
     output_level,
     opts,
+    tc,
   )?;
 
   // Phase 3: install.
   {
     let mut g = state.lock().unwrap();
-    install_compaction(&mut g, &deleted, outputs, output_level as i32)?;
+    install_compaction(&mut g, &deleted, outputs, output_level as i32, tc)?;
   }
 
   delete_obsolete_files(path, state);
@@ -1531,7 +1561,12 @@ fn compact_level_range(
 ///
 /// Errors are silently ignored — a failed compaction does not affect
 /// correctness; L0 will simply accumulate more files and be retried.
-fn maybe_compact(path: &std::path::Path, state: &Mutex<DbState>, opts: &Options) {
+fn maybe_compact(
+  path: &std::path::Path,
+  state: &Mutex<DbState>,
+  opts: &Options,
+  tc: &crate::db::table_cache::TableCache,
+) {
   // Phase 1: snapshot.
   let (version, oldest_snapshot) = {
     let g = state.lock().unwrap();
@@ -1574,6 +1609,7 @@ fn maybe_compact(path: &std::path::Path, state: &Mutex<DbState>, opts: &Options)
     oldest_snapshot,
     1,
     opts,
+    tc,
   ) {
     Ok(o) => o,
     Err(_) => return,
@@ -1582,7 +1618,7 @@ fn maybe_compact(path: &std::path::Path, state: &Mutex<DbState>, opts: &Options)
   // Phase 3: install.
   {
     let mut g = state.lock().unwrap();
-    if install_compaction(&mut g, &deleted, outputs, 1).is_err() {
+    if install_compaction(&mut g, &deleted, outputs, 1, tc).is_err() {
       return;
     }
   }
