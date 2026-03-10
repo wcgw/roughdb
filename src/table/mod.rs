@@ -13,6 +13,7 @@
 pub(crate) mod block;
 pub(crate) mod block_builder;
 pub(crate) mod builder;
+pub(crate) mod filter_block;
 pub(crate) mod format;
 pub(crate) mod reader;
 pub(crate) mod two_level_iterator;

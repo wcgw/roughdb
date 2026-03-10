@@ -121,6 +121,8 @@ use std::sync::{Arc, Mutex};
 
 pub mod error;
 pub use error::Error;
+pub mod filter;
+pub use filter::BloomFilterPolicy;
 pub mod options;
 pub use options::{CompressionType, Options, WriteOptions};
 pub(crate) mod coding;
@@ -457,7 +459,8 @@ impl Db {
 
     let (version_set, mem, last_sequence) = if db_exists {
       // ── Existing database: MANIFEST-driven recovery ──────────────────────
-      let mut vs = VersionSet::recover(path, options.paranoid_checks)?;
+      let mut vs =
+        VersionSet::recover(path, options.paranoid_checks, options.filter_policy.clone())?;
       let manifest_last_seq = vs.last_sequence();
       let mem = Arc::new(Memtable::default());
 
@@ -922,7 +925,12 @@ fn write_flush(prep: FlushPrep, opts: &Options) -> Result<FlushResult, Error> {
     .write(true)
     .create_new(true)
     .open(&sst_path)?;
-  let mut builder = TableBuilder::new(file, opts.block_size, opts.block_restart_interval);
+  let mut builder = TableBuilder::new(
+    file,
+    opts.block_size,
+    opts.block_restart_interval,
+    opts.filter_policy.clone(),
+  );
   let mut smallest = Vec::new();
   let mut largest = Vec::new();
   {
@@ -943,7 +951,11 @@ fn write_flush(prep: FlushPrep, opts: &Options) -> Result<FlushResult, Error> {
   let file_size = builder.finish()?;
   drop(old_mem);
   let read_file = std::fs::File::open(&sst_path)?;
-  let table = Arc::new(Table::open(read_file, file_size)?);
+  let table = Arc::new(Table::open(
+    read_file,
+    file_size,
+    opts.filter_policy.clone(),
+  )?);
   Ok(FlushResult {
     file_number: sst_number,
     file_size,
@@ -1088,10 +1100,11 @@ fn finish_compaction_output(
   cur: CompactionOutputFile,
   largest: Vec<u8>,
   outputs: &mut Vec<CompactionOutput>,
+  filter_policy: Option<Arc<dyn crate::filter::FilterPolicy>>,
 ) -> Result<(), Error> {
   let file_size = cur.builder.finish()?;
   let read_file = std::fs::File::open(&cur.path)?;
-  let table = Arc::new(Table::open(read_file, file_size)?);
+  let table = Arc::new(Table::open(read_file, file_size, filter_policy)?);
   outputs.push(CompactionOutput {
     file_number: cur.file_number,
     file_size,
@@ -1115,8 +1128,8 @@ fn finish_compaction_output(
 fn do_compaction(
   path: &std::path::Path,
   state: &Mutex<DbState>,
-  version: &Arc<crate::db::version::Version>,
-  inputs: &[Arc<FileMetaData>],
+  version: &crate::db::version::Version,
+  inputs: &[&FileMetaData],
   oldest_snapshot: u64,
   output_level: usize,
   opts: &Options,
@@ -1182,7 +1195,12 @@ fn do_compaction(
       if let Some(ref cur) = current {
         if cur.builder.file_size() >= opts.max_file_size as u64 {
           let finished = current.take().unwrap();
-          finish_compaction_output(finished, std::mem::take(&mut current_largest), &mut outputs)?;
+          finish_compaction_output(
+            finished,
+            std::mem::take(&mut current_largest),
+            &mut outputs,
+            opts.filter_policy.clone(),
+          )?;
         }
       }
 
@@ -1197,7 +1215,12 @@ fn do_compaction(
           .write(true)
           .create_new(true)
           .open(&sst_path)?;
-        let builder = TableBuilder::new(file, opts.block_size, opts.block_restart_interval);
+        let builder = TableBuilder::new(
+          file,
+          opts.block_size,
+          opts.block_restart_interval,
+          opts.filter_policy.clone(),
+        );
         current = Some(CompactionOutputFile {
           file_number,
           path: sst_path,
@@ -1214,7 +1237,12 @@ fn do_compaction(
 
   // Finalise the last output file (if any).
   if let Some(cur) = current {
-    finish_compaction_output(cur, current_largest, &mut outputs)?;
+    finish_compaction_output(
+      cur,
+      current_largest,
+      &mut outputs,
+      opts.filter_policy.clone(),
+    )?;
   }
 
   Ok(outputs)
@@ -1356,10 +1384,10 @@ fn compact_level_range(
   };
 
   let output_level = level + 1;
-  let inputs: Vec<Arc<FileMetaData>> = level_inputs
+  let inputs: Vec<&FileMetaData> = level_inputs
     .iter()
     .chain(next_inputs.iter())
-    .cloned()
+    .map(Arc::as_ref)
     .collect();
   let deleted: Vec<(i32, u64)> = level_inputs
     .iter()
@@ -1371,8 +1399,8 @@ fn compact_level_range(
   let outputs = do_compaction(
     path,
     state,
-    &version,
-    &inputs,
+    version.as_ref(),
+    inputs.as_slice(),
     oldest_snapshot,
     output_level,
     opts,
@@ -1420,7 +1448,11 @@ fn maybe_compact(path: &std::path::Path, state: &Mutex<DbState>, opts: &Options)
   };
 
   // Build the flat input list (L0 newest-first, then L1) and deleted pairs.
-  let inputs: Vec<Arc<FileMetaData>> = l0_inputs.iter().chain(l1_inputs.iter()).cloned().collect();
+  let inputs: Vec<&FileMetaData> = l0_inputs
+    .iter()
+    .chain(l1_inputs.iter())
+    .map(Arc::as_ref)
+    .collect();
   let deleted: Vec<(i32, u64)> = l0_inputs
     .iter()
     .map(|m| (0i32, m.number))
@@ -1428,7 +1460,15 @@ fn maybe_compact(path: &std::path::Path, state: &Mutex<DbState>, opts: &Options)
     .collect();
 
   // Phase 2: I/O (no lock).
-  let outputs = match do_compaction(path, state, &version, &inputs, oldest_snapshot, 1, opts) {
+  let outputs = match do_compaction(
+    path,
+    state,
+    version.as_ref(),
+    inputs.as_slice(),
+    oldest_snapshot,
+    1,
+    opts,
+  ) {
     Ok(o) => o,
     Err(_) => return,
   };
@@ -2671,5 +2711,79 @@ mod tests {
     assert_eq!(db.get_with_options(&opts1, b"k").unwrap(), b"v1");
     assert_eq!(db.get_with_options(&opts2, b"k").unwrap(), b"v2");
     assert_eq!(db.get(b"k").unwrap(), b"v3");
+  }
+
+  // ── Bloom filter tests ───────────────────────────────────────────────────────
+
+  fn bloom_options() -> Options {
+    Options {
+      create_if_missing: true,
+      write_buffer_size: 512,
+      filter_policy: Some(std::sync::Arc::new(crate::BloomFilterPolicy::new(10))),
+      ..Options::default()
+    }
+  }
+
+  #[test]
+  fn bloom_filter_inserted_key_found() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path(), bloom_options()).unwrap();
+    for i in 0u32..50 {
+      db.put(format!("key{i:04}").as_bytes(), b"val").unwrap();
+    }
+    // All keys must be readable after flush.
+    for i in 0u32..50 {
+      assert_eq!(db.get(format!("key{i:04}").as_bytes()).unwrap(), b"val");
+    }
+  }
+
+  #[test]
+  fn bloom_filter_absent_key_not_found() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path(), bloom_options()).unwrap();
+    for i in 0u32..50 {
+      db.put(format!("key{i:04}").as_bytes(), b"val").unwrap();
+    }
+    // Absent keys must return NotFound (the filter must not cause false negatives).
+    assert!(db.get(b"absent").is_err());
+    assert!(db.get(b"nope").is_err());
+  }
+
+  #[test]
+  fn bloom_filter_survives_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+      let db = Db::open(dir.path(), bloom_options()).unwrap();
+      for i in 0u32..50 {
+        db.put(format!("key{i:04}").as_bytes(), b"val").unwrap();
+      }
+    }
+    // Reopen with the same filter policy — filter blocks should be read back.
+    let db2 = Db::open(dir.path(), bloom_options()).unwrap();
+    for i in 0u32..50 {
+      assert_eq!(db2.get(format!("key{i:04}").as_bytes()).unwrap(), b"val");
+    }
+    assert!(db2.get(b"absent").is_err());
+  }
+
+  #[test]
+  fn bloom_filter_reopen_without_policy_still_works() {
+    // An SSTable written *with* a filter policy must still be readable when
+    // reopened *without* one (the filter is simply ignored).
+    let dir = tempfile::tempdir().unwrap();
+    {
+      let db = Db::open(dir.path(), bloom_options()).unwrap();
+      for i in 0u32..50 {
+        db.put(format!("key{i:04}").as_bytes(), b"val").unwrap();
+      }
+    }
+    let opts_no_filter = Options {
+      create_if_missing: false,
+      ..Options::default()
+    };
+    let db2 = Db::open(dir.path(), opts_no_filter).unwrap();
+    for i in 0u32..50 {
+      assert_eq!(db2.get(format!("key{i:04}").as_bytes()).unwrap(), b"val");
+    }
   }
 }

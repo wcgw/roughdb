@@ -13,6 +13,7 @@
 use crate::db::version::Version;
 use crate::db::version_edit::{FileMetaData, VersionEdit};
 use crate::error::Error;
+use crate::filter::FilterPolicy;
 use crate::log::reader::Reader as LogReader;
 use crate::log::writer::Writer as LogWriter;
 use crate::table::reader::Table;
@@ -101,7 +102,11 @@ impl VersionSet {
   /// Reads `CURRENT`, replays each `VersionEdit` in the MANIFEST log, opens
   /// all live SSTable files, and returns a `VersionSet` ready for
   /// `log_and_apply`.
-  pub(crate) fn recover(path: &Path, paranoid_checks: bool) -> Result<Self, Error> {
+  pub(crate) fn recover(
+    path: &Path,
+    paranoid_checks: bool,
+    filter_policy: Option<Arc<dyn FilterPolicy>>,
+  ) -> Result<Self, Error> {
     let manifest_name = read_current_file(path)?;
     let manifest_path = path.join(&manifest_name);
 
@@ -124,7 +129,7 @@ impl VersionSet {
     let log_number = builder.log_number;
 
     // Open Table for each live file.
-    let files = builder.build(path)?;
+    let files = builder.build(path, filter_policy)?;
 
     // Re-open the MANIFEST for appending (continue after the last record).
     let manifest_file_for_write = OpenOptions::new().append(true).open(&manifest_path)?;
@@ -290,7 +295,11 @@ impl Builder {
   }
 
   /// Open Tables for all live files and assemble the initial `Version`.
-  fn build(self, path: &Path) -> Result<Version, Error> {
+  fn build(
+    self,
+    path: &Path,
+    filter_policy: Option<Arc<dyn FilterPolicy>>,
+  ) -> Result<Version, Error> {
     let mut files: [Vec<Arc<FileMetaData>>; 7] = std::array::from_fn(|_| Vec::new());
 
     // Collect live files per level (stable insertion order for L0).
@@ -313,7 +322,7 @@ impl Builder {
         let file = File::open(&sst_path).map_err(|e| {
           Error::Corruption(format!("cannot open SSTable {:06}.ldb: {e}", meta.number))
         })?;
-        let table = Arc::new(Table::open(file, meta.file_size)?);
+        let table = Arc::new(Table::open(file, meta.file_size, filter_policy.clone())?);
         files[level].push(FileMetaData::with_table(
           meta.number,
           meta.file_size,
@@ -359,13 +368,18 @@ mod tests {
       .open(&sst_path)
       .unwrap();
     let opts = Options::default();
-    let mut builder = TableBuilder::new(file, opts.block_size, opts.block_restart_interval);
+    let mut builder = TableBuilder::new(
+      file,
+      opts.block_size,
+      opts.block_restart_interval,
+      opts.filter_policy.clone(),
+    );
     for &(uk, seq, vt, val) in entries {
       builder.add(&make_internal_key(uk, seq, vt), val).unwrap();
     }
     let size = builder.finish().unwrap();
     let read_file = File::open(&sst_path).unwrap();
-    let table = Arc::new(Table::open(read_file, size).unwrap());
+    let table = Arc::new(Table::open(read_file, size, None).unwrap());
     (file_number, size, table)
   }
 
@@ -398,7 +412,7 @@ mod tests {
 
     // Drop and recover — the file must still appear.
     drop(vs);
-    let vs2 = VersionSet::recover(dir.path(), false).unwrap();
+    let vs2 = VersionSet::recover(dir.path(), false, None).unwrap();
     let cur2 = vs2.current();
     assert_eq!(cur2.files[0].len(), 1);
     assert_eq!(cur2.files[0][0].number, 3);
@@ -416,7 +430,7 @@ mod tests {
     vs.log_and_apply(&mut edit).unwrap();
     drop(vs);
 
-    let vs2 = VersionSet::recover(dir.path(), false).unwrap();
+    let vs2 = VersionSet::recover(dir.path(), false, None).unwrap();
     let cur = vs2.current();
     use crate::table::reader::LookupResult;
     assert!(matches!(cur.get(b"key", 0, false).unwrap(), LookupResult::Value(v) if v == b"val"));
@@ -433,7 +447,7 @@ mod tests {
     vs.log_and_apply(&mut edit).unwrap();
     drop(vs);
 
-    let vs2 = VersionSet::recover(dir.path(), false).unwrap();
+    let vs2 = VersionSet::recover(dir.path(), false, None).unwrap();
     assert_eq!(vs2.last_sequence(), 42);
   }
 }
