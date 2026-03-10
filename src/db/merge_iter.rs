@@ -161,7 +161,13 @@ mod tests {
   fn table_iter(pairs: &[(&[u8], &[u8])]) -> Box<dyn InternalIterator> {
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let file = tmp.reopen().unwrap();
-    let mut builder = TableBuilder::new(file, 4096, 16, None);
+    let mut builder = TableBuilder::new(
+      file,
+      4096,
+      16,
+      None,
+      crate::options::CompressionType::NoCompression,
+    );
     for (seq, &(k, v)) in pairs.iter().enumerate() {
       let ikey = make_internal_key(k, seq as u64 + 1, 1);
       builder.add(&ikey, v).unwrap();

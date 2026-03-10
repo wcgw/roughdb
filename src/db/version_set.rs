@@ -373,6 +373,7 @@ mod tests {
       opts.block_size,
       opts.block_restart_interval,
       opts.filter_policy.clone(),
+      opts.compression,
     );
     for &(uk, seq, vt, val) in entries {
       builder.add(&make_internal_key(uk, seq, vt), val).unwrap();

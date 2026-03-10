@@ -12,6 +12,7 @@
 
 use crate::coding::{crc32c, crc32c_extend, mask_crc, read_varu64, unmask_crc, write_varu64};
 use crate::error::Error;
+use crate::options::CompressionType;
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 
@@ -192,33 +193,85 @@ pub(crate) fn read_block(
   }
 
   let compression_type = buf[n];
-  if compression_type != 0x00 {
-    return Err(Error::NotSupported(format!(
+  match compression_type {
+    0x00 => {
+      // NoCompression — data is already in buf[..n].
+      buf.truncate(n);
+      Ok(BlockContents { data: buf })
+    }
+    0x01 => {
+      // Snappy
+      let decompressed = snap::raw::decompress_len(&buf[..n])
+        .map_err(|e| Error::Corruption(format!("snappy length decode: {e}")))?;
+      let mut out = vec![0u8; decompressed];
+      snap::raw::Decoder::new()
+        .decompress(&buf[..n], &mut out)
+        .map_err(|e| Error::Corruption(format!("snappy decompress: {e}")))?;
+      Ok(BlockContents { data: out })
+    }
+    0x02 => {
+      // Zstd
+      let out = zstd::bulk::decompress(&buf[..n], 16 * 1024 * 1024)
+        .map_err(|e| Error::Corruption(format!("zstd decompress: {e}")))?;
+      Ok(BlockContents { data: out })
+    }
+    _ => Err(Error::NotSupported(format!(
       "SSTable compression type {compression_type} not supported"
-    )));
+    ))),
   }
-
-  buf.truncate(n);
-  Ok(BlockContents { data: buf })
 }
 
 /// Write a block to `dest` (appends data + trailer), returning the `BlockHandle`.
 ///
-/// The trailer is `[type: u8 = 0x00][masked_crc: u32 LE]`.
+/// `compression`: the algorithm to apply.  If the compressed output is not at least 12.5% smaller
+/// than the raw data, the block is written uncompressed (matching LevelDB's heuristic).
+///
+/// The trailer is `[type: u8][masked_crc: u32 LE]`.
 pub(crate) fn write_raw_block(
   dest: &mut impl std::io::Write,
   data: &[u8],
   offset: u64,
+  compression: CompressionType,
 ) -> Result<BlockHandle, Error> {
-  let crc = mask_crc(crc32c_extend(crc32c(data), &[0x00u8]));
+  let (block_data, compression_type_byte): (std::borrow::Cow<[u8]>, u8) = match compression {
+    CompressionType::NoCompression => (std::borrow::Cow::Borrowed(data), 0x00),
+    CompressionType::Snappy => {
+      let mut enc = snap::raw::Encoder::new();
+      let max_len = snap::raw::max_compress_len(data.len());
+      let mut compressed = vec![0u8; max_len];
+      let n = enc
+        .compress(data, &mut compressed)
+        .map_err(|e| Error::from(std::io::Error::other(e.to_string())))?;
+      compressed.truncate(n);
+      // Only use compressed form if it saves at least 12.5%.
+      if n < data.len() - data.len() / 8 {
+        (std::borrow::Cow::Owned(compressed), 0x01)
+      } else {
+        (std::borrow::Cow::Borrowed(data), 0x00)
+      }
+    }
+    CompressionType::Zstd(zstd_level) => {
+      let range = zstd::compression_level_range();
+      let level = zstd_level.clamp(*range.start(), *range.end());
+      let compressed = zstd::bulk::compress(data, level)
+        .map_err(|e| Error::from(std::io::Error::other(e.to_string())))?;
+      if compressed.len() < data.len() - data.len() / 8 {
+        (std::borrow::Cow::Owned(compressed), 0x02)
+      } else {
+        (std::borrow::Cow::Borrowed(data), 0x00)
+      }
+    }
+  };
+
+  let crc = mask_crc(crc32c_extend(crc32c(&block_data), &[compression_type_byte]));
   let mut trailer = [0u8; BLOCK_TRAILER_SIZE];
-  trailer[0] = 0x00; // NoCompression
+  trailer[0] = compression_type_byte;
   trailer[1..].copy_from_slice(&crc.to_le_bytes());
-  dest.write_all(data)?;
+  dest.write_all(&block_data)?;
   dest.write_all(&trailer)?;
   Ok(BlockHandle {
     offset,
-    size: data.len() as u64,
+    size: block_data.len() as u64,
   })
 }
 
@@ -288,5 +341,51 @@ mod tests {
     let mut buf = [0u8; FOOTER_ENCODED_LENGTH];
     buf[40..48].copy_from_slice(&0xdeadbeef_u64.to_le_bytes());
     assert!(matches!(Footer::decode(&buf), Err(Error::Corruption(_))));
+  }
+
+  // ── Compression round-trip tests ─────────────────────────────────────────
+
+  fn roundtrip_block(compression: crate::options::CompressionType) {
+    // Use compressible data (repetitive string) so Snappy/Zstd actually compress it.
+    let data: Vec<u8> = b"hello world! "
+      .iter()
+      .cycle()
+      .take(1024)
+      .copied()
+      .collect();
+    let mut buf: Vec<u8> = Vec::new();
+    let handle = write_raw_block(&mut buf, &data, 0, compression).unwrap();
+
+    // Read it back using a temporary file (read_block requires a File).
+    let mut tmp = tempfile::tempfile().unwrap();
+    std::io::Write::write_all(&mut tmp, &buf).unwrap();
+    let contents = read_block(&tmp, &handle, true).unwrap();
+    assert_eq!(contents.data, data);
+  }
+
+  #[test]
+  fn no_compression_roundtrip() {
+    roundtrip_block(crate::options::CompressionType::NoCompression);
+  }
+
+  #[test]
+  fn snappy_compression_roundtrip() {
+    roundtrip_block(crate::options::CompressionType::Snappy);
+  }
+
+  #[test]
+  fn zstd_compression_roundtrip() {
+    roundtrip_block(crate::options::CompressionType::Zstd(1));
+  }
+
+  #[test]
+  fn snappy_incompressible_falls_back_to_no_compression() {
+    // Random-looking data: Snappy won't achieve 12.5% savings, so block is stored raw.
+    let data: Vec<u8> = (0u8..=255).cycle().take(256).collect();
+    let mut buf: Vec<u8> = Vec::new();
+    let _ = write_raw_block(&mut buf, &data, 0, crate::options::CompressionType::Snappy).unwrap();
+    // Trailer byte should be 0x00 (NoCompression) because the data didn't compress well.
+    let trailer_type = buf[buf.len() - BLOCK_TRAILER_SIZE];
+    assert_eq!(trailer_type, 0x00, "expected fallback to NoCompression");
   }
 }

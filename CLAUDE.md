@@ -305,20 +305,13 @@ what remains is compaction, the full Iterator/Snapshot API, and operational hygi
   block, so a definite-negative skips all I/O and decompression entirely. A `FilterPolicy` trait allows custom
   filters. `Options::filter_policy` wires the chosen policy into flush and compaction.
   See `util/bloom.cc` and `include/leveldb/filter_policy.h`.
-- [ ] **Block compression**: Wire `Options::compression` and `Options::zstd_compression_level` through `TableBuilder`
-  and `Table`.  Currently all blocks are written with type `0x00` (NoCompression) and the reader rejects any other
-  type; both fields are silently ignored.  Required changes:
-  - Add `snappy = "..."` and `zstd = "..."` crate dependencies.
-  - `write_raw_block` in `src/table/format.rs`: compress `data` according to `compression_type` before writing;
-    set trailer byte to `0x01` (Snappy) or `0x02` (Zstd).  Use the uncompressed block if compressed output is
-    larger (LevelDB's `kCompressionRatio` heuristic; threshold ≈ 12.5% saving).
-  - `read_block` in `src/table/format.rs`: decompress based on the trailer byte; remove the current hard error on
-    non-zero compression types.
-  - `TableBuilder::new` (or a new constructor) accepts `CompressionType`; pass it from flush and compaction via
-    `Options`.
-  - `Table::get` and `TwoLevelIterator` call `read_block` — no interface changes needed there.
-  - Default remains `Snappy` (matching LevelDB). `Zstd` uses `Options::zstd_compression_level`.
-  - See `table/table_builder.cc: TableBuilder::WriteBlock`, `table/format.cc: ReadBlock`.
+- [x] **Block compression**: Wire `Options::compression` and `Options::zstd_compression_level` through `TableBuilder`
+  and `Table`.  `write_raw_block` in `src/table/format.rs` compresses data blocks via `snap` (Snappy) or `zstd`
+  crates; falls back to NoCompression when compressed output is not at least 12.5% smaller (LevelDB's
+  `kCompressionRatio` heuristic).  `read_block` decompresses based on the trailer byte (`0x00` = none, `0x01` =
+  Snappy, `0x02` = Zstd).  Filter, metaindex, and index blocks are always written uncompressed (matching LevelDB).
+  `TableBuilder::new` accepts `compression: CompressionType` and `zstd_level: i32`; both are passed from flush and
+  compaction via `Options`.  Default remains `Snappy` (matching LevelDB).
 
 **Options wiring**
 
