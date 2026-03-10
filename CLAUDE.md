@@ -342,11 +342,13 @@ the phases above.*
 - **`ReadOptions::fill_cache`**: Currently ignored — no block cache exists. Once the block cache is implemented,
   `fill_cache = false` should skip inserting blocks into the cache on reads (useful for bulk scans to avoid
   evicting hot data). Wire into `read_block` and the `TwoLevelIterator` block-opener closure.
-- **Table cache**: LRU of `(file_number → Table)` entries replacing the `Arc<Table>` in `FileMetaData`. Bounds open
-  file descriptors and avoids repeated footer parses. See `db/table_cache.h/cc`.
-- **`Options::max_open_files`**: Currently ignored — all SSTable `File` handles stay open unconditionally via
-  `Arc<Table>` in `FileMetaData`. Once the table cache is implemented, pass
-  `max_open_files - kNumNonTableCacheFiles` as its capacity. See `db/db_impl.cc: DBImpl::Open`.
+- **Table cache**: Implemented. LRU `TableCache` (`src/db/table_cache.rs`) — capacity
+  `max_open_files - NUM_NON_TABLE_CACHE_FILES (10)`, internally synchronized via `Arc<Mutex<Inner>>`. `get_or_open`
+  opens on miss and evicts LRU when at capacity; `insert` for newly-built tables; `evict` for compacted-away files.
+  `FileMetaData` no longer holds `Arc<Table>` — tables are opened lazily on first access. `Db` holds
+  `table_cache: Option<TableCache>` (None for in-memory). See `db/table_cache.h/cc`.
+- **`Options::max_open_files`**: Fully wired. Capacity = `max_open_files.saturating_sub(NUM_NON_TABLE_CACHE_FILES).max(1)`.
+  See `db/db_impl.cc: DBImpl::Open`.
 - **`Options::reuse_logs`**: Experimental LevelDB flag — when set, the existing WAL and MANIFEST files are reused
   on `Db::open` rather than creating new ones after recovery, saving an `fsync` of `CURRENT`. Requires MANIFEST
   recovery to detect the reuse case and skip writing a new `CURRENT`. Low priority.

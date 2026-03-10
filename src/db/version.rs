@@ -10,6 +10,7 @@
 //    See the License for the specific language governing permissions and
 //    limitations under the License.
 
+use crate::db::table_cache::TableCache;
 use crate::db::version_edit::FileMetaData;
 use crate::error::Error;
 use crate::table::format::parse_internal_key;
@@ -25,7 +26,7 @@ pub(crate) const NUM_LEVELS: usize = 7;
 /// L1–L6 files are stored sorted by smallest key (for binary search in Phase 6).
 ///
 /// `Version` is reference-counted; it lives until all iterators opened on it
-/// are dropped.
+/// are dropped.  Open file handles are managed by the [`TableCache`], not here.
 #[derive(Clone)]
 pub(crate) struct Version {
   pub files: [Vec<Arc<FileMetaData>>; NUM_LEVELS],
@@ -43,21 +44,18 @@ impl Version {
   /// L0 is scanned newest-first.  L1–L6 are scanned linearly (binary search
   /// deferred to a later phase).
   ///
-  /// `verify_checksums` is forwarded to every `Table::get` call; set it to
-  /// `true` when `ReadOptions::verify_checksums` or `Options::paranoid_checks`
-  /// is active.
+  /// Tables are opened on demand via `tc`; `verify_checksums` is forwarded to
+  /// every `Table::get` call.
   pub(crate) fn get(
     &self,
     user_key: &[u8],
     _sequence: u64,
     verify_checksums: bool,
+    tc: &TableCache,
   ) -> Result<LookupResult, Error> {
     // L0: newest-first scan.
     for meta in &self.files[0] {
-      let table = meta
-        .table
-        .as_ref()
-        .expect("FileMetaData in Version must have an open table");
+      let table = tc.get_or_open(meta.number, meta.file_size)?;
       match table.get(user_key, verify_checksums)? {
         LookupResult::Value(v) => return Ok(LookupResult::Value(v)),
         LookupResult::Deleted => return Ok(LookupResult::Deleted),
@@ -68,10 +66,7 @@ impl Version {
     // L1–L6: linear scan (binary search deferred to a later phase).
     for level in 1..NUM_LEVELS {
       for meta in &self.files[level] {
-        let table = meta
-          .table
-          .as_ref()
-          .expect("FileMetaData in Version must have an open table");
+        let table = tc.get_or_open(meta.number, meta.file_size)?;
         match table.get(user_key, verify_checksums)? {
           LookupResult::Value(v) => return Ok(LookupResult::Value(v)),
           LookupResult::Deleted => return Ok(LookupResult::Deleted),
@@ -92,7 +87,7 @@ impl Version {
   /// sorted by smallest key).
   ///
   /// See `db/version_set.cc: VersionSet::ApproximateOffsetOf`.
-  pub(crate) fn approximate_offset_of(&self, ikey: &[u8]) -> u64 {
+  pub(crate) fn approximate_offset_of(&self, ikey: &[u8], tc: &TableCache) -> u64 {
     use crate::table::format::cmp_internal_keys;
     let mut result = 0u64;
     for level in 0..NUM_LEVELS {
@@ -108,7 +103,7 @@ impl Version {
           }
         } else {
           // ikey falls within this file's range.
-          if let Some(table) = &meta.table {
+          if let Ok(table) = tc.get_or_open(meta.number, meta.file_size) {
             result += table.approximate_offset_of(ikey);
           }
         }
