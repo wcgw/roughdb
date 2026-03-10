@@ -1128,8 +1128,8 @@ fn finish_compaction_output(
 fn do_compaction(
   path: &std::path::Path,
   state: &Mutex<DbState>,
-  version: &Arc<crate::db::version::Version>,
-  inputs: &[Arc<FileMetaData>],
+  version: &crate::db::version::Version,
+  inputs: &[&FileMetaData],
   oldest_snapshot: u64,
   output_level: usize,
   opts: &Options,
@@ -1384,10 +1384,10 @@ fn compact_level_range(
   };
 
   let output_level = level + 1;
-  let inputs: Vec<Arc<FileMetaData>> = level_inputs
+  let inputs: Vec<&FileMetaData> = level_inputs
     .iter()
     .chain(next_inputs.iter())
-    .cloned()
+    .map(Arc::as_ref)
     .collect();
   let deleted: Vec<(i32, u64)> = level_inputs
     .iter()
@@ -1399,8 +1399,8 @@ fn compact_level_range(
   let outputs = do_compaction(
     path,
     state,
-    &version,
-    &inputs,
+    version.as_ref(),
+    inputs.as_slice(),
     oldest_snapshot,
     output_level,
     opts,
@@ -1448,7 +1448,11 @@ fn maybe_compact(path: &std::path::Path, state: &Mutex<DbState>, opts: &Options)
   };
 
   // Build the flat input list (L0 newest-first, then L1) and deleted pairs.
-  let inputs: Vec<Arc<FileMetaData>> = l0_inputs.iter().chain(l1_inputs.iter()).cloned().collect();
+  let inputs: Vec<&FileMetaData> = l0_inputs
+    .iter()
+    .chain(l1_inputs.iter())
+    .map(Arc::as_ref)
+    .collect();
   let deleted: Vec<(i32, u64)> = l0_inputs
     .iter()
     .map(|m| (0i32, m.number))
@@ -1456,7 +1460,15 @@ fn maybe_compact(path: &std::path::Path, state: &Mutex<DbState>, opts: &Options)
     .collect();
 
   // Phase 2: I/O (no lock).
-  let outputs = match do_compaction(path, state, &version, &inputs, oldest_snapshot, 1, opts) {
+  let outputs = match do_compaction(
+    path,
+    state,
+    version.as_ref(),
+    inputs.as_slice(),
+    oldest_snapshot,
+    1,
+    opts,
+  ) {
     Ok(o) => o,
     Err(_) => return,
   };
