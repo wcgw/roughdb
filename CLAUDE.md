@@ -331,37 +331,34 @@ what remains is compaction, the full Iterator/Snapshot API, and operational hygi
 
 ### Post-parity improvements
 
-*Optimisations and secondary features to add once RoughDB has a fully functional database. None are prerequisites for
-the phases above.*
+*Optimisations and secondary features. None are prerequisites for the phases above. Items marked ✅ are done.*
 
+- ✅ **Table cache**: LRU `TableCache` (`src/db/table_cache.rs`) — capacity
+  `max_open_files - NUM_NON_TABLE_CACHE_FILES (10)`, internally synchronized via `Arc<Mutex<Inner>>`. `get_or_open`
+  opens on miss and evicts LRU when at capacity; `insert` for newly-built tables; `evict` for compacted-away files.
+  `FileMetaData` holds only durable metadata; tables opened lazily on first access. `Db` holds
+  `table_cache: Option<TableCache>` (None for in-memory). See `db/table_cache.h/cc`.
+- ✅ **`Options::max_open_files`**: Fully wired via `TableCache`. Capacity =
+  `max_open_files.saturating_sub(NUM_NON_TABLE_CACHE_FILES).max(1)`. See `db/db_impl.cc: DBImpl::Open`.
+- **Block cache**: Sharded LRU (`src/cache/lru.rs`) with two lists per shard (in-use / evictable), custom deleters,
+  capacity-based eviction. Default 8 MB. Required by `Table` reader to cache hot data blocks. See `util/cache.cc`.
+- **`ReadOptions::fill_cache`**: Currently accepted but ignored — no block cache exists. Once implemented,
+  `fill_cache = false` should skip inserting blocks into the cache on reads (useful for bulk scans).
+  Wire into `read_block` and the `TwoLevelIterator` block-opener closure.
 - **Batch-grouped writes**: Multiple concurrent `Db::write` callers are grouped by a leader that writes a single
   combined WAL record and memtable batch, amortising `fsync` cost over many writers. Transparent to callers; the
   current single-writer-at-a-time path is correct. See `db/db_impl.cc: DBImpl::Write`.
-- **Block cache**: Sharded LRU (`src/cache/lru.rs`) with two lists per shard (in-use / evictable), custom deleters,
-  capacity-based eviction. Default 8 MB. Required by `Table` reader to cache hot blocks. See `util/cache.cc`.
-- **`ReadOptions::fill_cache`**: Currently ignored — no block cache exists. Once the block cache is implemented,
-  `fill_cache = false` should skip inserting blocks into the cache on reads (useful for bulk scans to avoid
-  evicting hot data). Wire into `read_block` and the `TwoLevelIterator` block-opener closure.
-- **Table cache**: Implemented. LRU `TableCache` (`src/db/table_cache.rs`) — capacity
-  `max_open_files - NUM_NON_TABLE_CACHE_FILES (10)`, internally synchronized via `Arc<Mutex<Inner>>`. `get_or_open`
-  opens on miss and evicts LRU when at capacity; `insert` for newly-built tables; `evict` for compacted-away files.
-  `FileMetaData` no longer holds `Arc<Table>` — tables are opened lazily on first access. `Db` holds
-  `table_cache: Option<TableCache>` (None for in-memory). See `db/table_cache.h/cc`.
-- **`Options::max_open_files`**: Fully wired. Capacity = `max_open_files.saturating_sub(NUM_NON_TABLE_CACHE_FILES).max(1)`.
-  See `db/db_impl.cc: DBImpl::Open`.
-- **`Options::reuse_logs`**: Experimental LevelDB flag — when set, the existing WAL and MANIFEST files are reused
-  on `Db::open` rather than creating new ones after recovery, saving an `fsync` of `CURRENT`. Requires MANIFEST
-  recovery to detect the reuse case and skip writing a new `CURRENT`. Low priority.
-  See `db/db_impl.cc: DBImpl::Recover`.
 - **Custom comparator**: Wire `Options::comparator` through to all key-comparison sites (skip list, block seek,
   compaction). Currently hardcoded bytewise. Needed to use RoughDB as a sorted map on non-lexicographic keys.
   See `include/leveldb/comparator.h`.
 - **`RepairDB(path, options)`**: Scans the database directory, recovers as many SSTables as possible from a corrupt
   or partial MANIFEST, and rebuilds a valid MANIFEST. See `db/repair.cc`.
+- **`Options::reuse_logs`**: Experimental LevelDB flag — when set, the existing WAL and MANIFEST files are reused
+  on `Db::open` rather than creating new ones after recovery, saving an `fsync` of `CURRENT`. Low priority.
+  See `db/db_impl.cc: DBImpl::Recover`.
 - **`Db::flush_wal(sync: bool)` / `Db::sync_wal()`**: RocksDB-style explicit WAL flush. `flush_wal` pushes buffered
-  data from the `BufWriter` to the OS page cache; `sync = true` also `fsync`s. Useful for amortising `fsync` cost
-  over many `sync=false` writes. Currently `Db::drop` relies on `BufWriter`'s implicit flush-on-drop, which silences
-  I/O errors. See `DB::FlushWAL` / `DB::SyncWAL` in `include/rocksdb/db.h`.
+  data from the `BufWriter` to the OS page cache; `sync = true` also `fsync`s. Currently `Db::drop` relies on
+  `BufWriter`'s implicit flush-on-drop, which silences I/O errors. See `DB::FlushWAL` in `include/rocksdb/db.h`.
 - **WAL file recycling** (RocksDB): Reuse old log files from a pool rather than deleting and recreating them, avoiding
   inode churn on slow filesystems. Uses a 12-byte header (standard 7 bytes + `log_number: u32`) so the reader can
   distinguish recycled files. See `db/log_writer.cc` in RocksDB.

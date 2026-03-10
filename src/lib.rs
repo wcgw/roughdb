@@ -1717,6 +1717,71 @@ fn delete_obsolete_files(path: &std::path::Path, state: &Mutex<DbState>) {
 mod tests {
   use crate::{Db, Error, Options, ReadOptions, WriteOptions};
 
+  // ── parse_db_filename tests (port of LevelDB filename_test.cc: Parse) ─────────
+
+  #[test]
+  fn parse_db_filename_valid_cases() {
+    use super::{parse_db_filename, FileKind};
+
+    let cases: &[(&str, u64, FileKind)] = &[
+      ("100.log", 100, FileKind::Log),
+      ("0.log", 0, FileKind::Log),
+      ("0.ldb", 0, FileKind::Table),
+      ("CURRENT", 0, FileKind::Current),
+      ("LOCK", 0, FileKind::Lock),
+      ("MANIFEST-2", 2, FileKind::Manifest),
+      ("MANIFEST-7", 7, FileKind::Manifest),
+      // u64::MAX
+      (
+        "18446744073709551615.log",
+        18_446_744_073_709_551_615,
+        FileKind::Log,
+      ),
+    ];
+    for &(name, number, ref kind) in cases {
+      let result = parse_db_filename(name);
+      assert!(result.is_some(), "{name}: expected Some, got None");
+      let (n, k) = result.unwrap();
+      assert_eq!(n, number, "{name}: wrong number");
+      assert!(
+        std::mem::discriminant(&k) == std::mem::discriminant(kind),
+        "{name}: wrong kind"
+      );
+    }
+  }
+
+  #[test]
+  fn parse_db_filename_invalid_cases() {
+    use super::parse_db_filename;
+    let errors: &[&str] = &[
+      "",
+      "foo",
+      "foo-dx-100.log",
+      ".log",
+      "manifest",
+      "CURREN",
+      "CURRENTX",
+      "MANIFES",
+      "MANIFEST",
+      "MANIFEST-",
+      "XMANIFEST-3",
+      "MANIFEST-3x",
+      "LOCKx",
+      "100",
+      "100.",
+      "100.lop",
+      // u64 overflow
+      "18446744073709551616.log",
+      "184467440737095516150.log",
+    ];
+    for &name in errors {
+      assert!(
+        parse_db_filename(name).is_none(),
+        "{name}: expected None, got Some"
+      );
+    }
+  }
+
   #[test]
   fn in_memory_round_trip() {
     let db = Db::default();

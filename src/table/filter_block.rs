@@ -212,6 +212,180 @@ mod tests {
     Arc::new(BloomFilterPolicy::new(10))
   }
 
+  // ── Deterministic hash filter (port of LevelDB's TestHashFilter) ────────────
+  //
+  // Stores one 4-byte LE hash per key; lookup does a linear scan.
+  // Unlike Bloom, this is collision-free for our test inputs, making it
+  // suitable for testing the filter-block binary format precisely.
+
+  fn leveldb_hash(data: &[u8], seed: u32) -> u32 {
+    const M: u32 = 0xc6a4a793;
+    const R: u32 = 24;
+    let n = data.len();
+    let mut h = seed ^ (n as u32).wrapping_mul(M);
+    let mut i = 0;
+    while i + 4 <= n {
+      let w = u32::from_le_bytes(data[i..i + 4].try_into().unwrap());
+      h = h.wrapping_add(w).wrapping_mul(M);
+      h ^= h >> 16;
+      i += 4;
+    }
+    match n - i {
+      3 => {
+        h = h.wrapping_add((data[i + 2] as u32) << 16);
+        h = h.wrapping_add((data[i + 1] as u32) << 8);
+        h = h.wrapping_add(data[i] as u32);
+        h = h.wrapping_mul(M);
+        h ^= h >> R;
+      }
+      2 => {
+        h = h.wrapping_add((data[i + 1] as u32) << 8);
+        h = h.wrapping_add(data[i] as u32);
+        h = h.wrapping_mul(M);
+        h ^= h >> R;
+      }
+      1 => {
+        h = h.wrapping_add(data[i] as u32);
+        h = h.wrapping_mul(M);
+        h ^= h >> R;
+      }
+      _ => {}
+    }
+    h
+  }
+
+  struct TestHashFilter;
+
+  impl FilterPolicy for TestHashFilter {
+    fn name(&self) -> &str {
+      "TestHashFilter"
+    }
+
+    fn create_filter(&self, keys: &[&[u8]]) -> Vec<u8> {
+      let mut out = Vec::with_capacity(keys.len() * 4);
+      for &key in keys {
+        out.extend_from_slice(&leveldb_hash(key, 1).to_le_bytes());
+      }
+      out
+    }
+
+    fn key_may_match(&self, key: &[u8], filter: &[u8]) -> bool {
+      let h = leveldb_hash(key, 1);
+      let mut i = 0;
+      while i + 4 <= filter.len() {
+        if u32::from_le_bytes(filter[i..i + 4].try_into().unwrap()) == h {
+          return true;
+        }
+        i += 4;
+      }
+      false
+    }
+  }
+
+  fn hash_policy() -> Arc<dyn FilterPolicy> {
+    Arc::new(TestHashFilter)
+  }
+
+  // Port of LevelDB filter_block_test.cc: EmptyBuilder
+  //
+  // An empty filter block encodes as exactly 5 bytes:
+  //   [u32 LE array_offset=0][u8 base_lg=11]
+  // KeyMayMatch on an empty block must return true (conservative default).
+  #[test]
+  fn empty_builder() {
+    let policy = hash_policy();
+    let w = FilterBlockWriter::new(Arc::clone(&policy));
+    let data = w.finish();
+    assert_eq!(data, [0x00, 0x00, 0x00, 0x00, FILTER_BASE_LG]);
+
+    let r = FilterBlockReader::new(Arc::clone(&policy), data).expect("parse");
+    // num == 0, so all offsets are out-of-range → conservative true.
+    assert!(r.key_may_match(0, b"foo"));
+    assert!(r.key_may_match(100_000, b"foo"));
+  }
+
+  // Port of LevelDB filter_block_test.cc: SingleChunk
+  //
+  // Blocks at offsets 100, 200, 300 all fall within the first 2 KiB interval,
+  // so all keys end up in the same filter (filter 0).
+  #[test]
+  fn single_chunk() {
+    let policy = hash_policy();
+    let mut w = FilterBlockWriter::new(Arc::clone(&policy));
+    w.start_block(100);
+    w.add_key(b"foo");
+    w.add_key(b"bar");
+    w.add_key(b"box");
+    w.start_block(200);
+    w.add_key(b"box");
+    w.start_block(300);
+    w.add_key(b"hello");
+    let data = w.finish();
+
+    let r = FilterBlockReader::new(Arc::clone(&policy), data).expect("parse");
+    assert!(r.key_may_match(100, b"foo"));
+    assert!(r.key_may_match(100, b"bar"));
+    assert!(r.key_may_match(100, b"box"));
+    assert!(r.key_may_match(100, b"hello"));
+    assert!(!r.key_may_match(100, b"missing"));
+    assert!(!r.key_may_match(100, b"other"));
+  }
+
+  // Port of LevelDB filter_block_test.cc: MultiChunk
+  //
+  // Keys span multiple 2 KiB intervals. Verifies that keys are found only in
+  // the filter for their interval, empty intervals return false, and cross-
+  // interval isolation is exact.
+  #[test]
+  fn multi_chunk() {
+    let policy = hash_policy();
+    let mut w = FilterBlockWriter::new(Arc::clone(&policy));
+
+    // First filter (interval 0: offsets 0–2047)
+    w.start_block(0);
+    w.add_key(b"foo");
+    w.start_block(2000);
+    w.add_key(b"bar");
+
+    // Second filter (interval 1: offsets 2048–4095)
+    w.start_block(3100);
+    w.add_key(b"box");
+
+    // Third filter (interval 2) is empty — no start_block between 4096 and 8999
+
+    // Fourth filter (interval 4: offset 9000)
+    w.start_block(9000);
+    w.add_key(b"box");
+    w.add_key(b"hello");
+
+    let data = w.finish();
+    let r = FilterBlockReader::new(Arc::clone(&policy), data).expect("parse");
+
+    // First filter contains "foo" and "bar"
+    assert!(r.key_may_match(0, b"foo"));
+    assert!(r.key_may_match(2000, b"bar"));
+    assert!(!r.key_may_match(0, b"box"));
+    assert!(!r.key_may_match(0, b"hello"));
+
+    // Second filter contains "box"
+    assert!(r.key_may_match(3100, b"box"));
+    assert!(!r.key_may_match(3100, b"foo"));
+    assert!(!r.key_may_match(3100, b"bar"));
+    assert!(!r.key_may_match(3100, b"hello"));
+
+    // Third filter is empty — explicitly returns false
+    assert!(!r.key_may_match(4100, b"foo"));
+    assert!(!r.key_may_match(4100, b"bar"));
+    assert!(!r.key_may_match(4100, b"box"));
+    assert!(!r.key_may_match(4100, b"hello"));
+
+    // Fourth filter contains "box" and "hello"
+    assert!(r.key_may_match(9000, b"box"));
+    assert!(r.key_may_match(9000, b"hello"));
+    assert!(!r.key_may_match(9000, b"foo"));
+    assert!(!r.key_may_match(9000, b"bar"));
+  }
+
   #[test]
   fn round_trip_single_block() {
     let policy = bloom();
