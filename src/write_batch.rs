@@ -327,6 +327,55 @@ mod tests {
     assert!(matches!(b.iterate(&mut r), Err(Error::Corruption(_))));
   }
 
+  // Port of LevelDB write_batch_test.cc: Append
+  //
+  // Verifies sequential appends: empty-to-empty stays empty, each subsequent
+  // append accumulates records from the source batch, and count is maintained.
+  #[test]
+  fn append_multiple_steps() {
+    let mut b1 = WriteBatch::new();
+    let mut b2 = WriteBatch::new();
+    b1.set_sequence(200);
+    b2.set_sequence(300);
+
+    // Append empty b2 to empty b1 → count stays 0.
+    b1.append(&b2);
+    assert_eq!(b1.count(), 0);
+    let mut r = Recording { ops: vec![] };
+    b1.iterate(&mut r).unwrap();
+    assert!(r.ops.is_empty());
+
+    // b2 gets one entry; appending to b1 brings count to 1.
+    b2.put(b"a", b"va");
+    b1.append(&b2);
+    assert_eq!(b1.count(), 1);
+    let mut r = Recording { ops: vec![] };
+    b1.iterate(&mut r).unwrap();
+    assert_eq!(r.ops, vec![Op::Put(b"a".to_vec(), b"va".to_vec())]);
+
+    // b2 cleared, gets one new entry; b1 count reaches 2.
+    b2.clear();
+    b2.put(b"b", b"vb");
+    b1.append(&b2);
+    assert_eq!(b1.count(), 2);
+
+    // b2 gains a delete; appending both entries brings b1 count to 4.
+    b2.delete(b"foo");
+    b1.append(&b2);
+    assert_eq!(b1.count(), 4);
+    let mut r = Recording { ops: vec![] };
+    b1.iterate(&mut r).unwrap();
+    assert_eq!(
+      r.ops,
+      vec![
+        Op::Put(b"a".to_vec(), b"va".to_vec()),
+        Op::Put(b"b".to_vec(), b"vb".to_vec()),
+        Op::Put(b"b".to_vec(), b"vb".to_vec()),
+        Op::Delete(b"foo".to_vec()),
+      ]
+    );
+  }
+
   #[test]
   fn db_write_round_trip() {
     let db = Db::default();

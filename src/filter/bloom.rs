@@ -222,4 +222,76 @@ mod tests {
   fn name_matches_leveldb() {
     assert_eq!(policy().name(), "leveldb.BuiltinBloomFilter2");
   }
+
+  // Port of LevelDB bloom_test.cc: VaryingLengths
+  //
+  // Builds filters at 26 sizes from 1 to 10_000 and checks:
+  //   1. All inserted keys are found (no false negatives).
+  //   2. Filter size ≤ (n * bits_per_key / 8) + 40 bytes.
+  //   3. False-positive rate ≤ 2% for 10_000 absent probes.
+  //   4. "Mediocre" filters (FPR > 1.25%) are outnumbered ≥ 5:1 by good ones.
+  #[test]
+  fn varying_lengths() {
+    fn next_length(n: usize) -> usize {
+      if n < 10 {
+        n + 1
+      } else if n < 100 {
+        n + 10
+      } else if n < 1_000 {
+        n + 100
+      } else {
+        n + 1_000
+      }
+    }
+
+    let p = policy();
+    let mut mediocre = 0u32;
+    let mut good = 0u32;
+    let bits_per_key = 10usize;
+
+    let mut length = 1usize;
+    while length <= 10_000 {
+      // Build a filter over `length` keys: each key is i.to_le_bytes().
+      let keys: Vec<[u8; 4]> = (0..length as u32).map(|i| i.to_le_bytes()).collect();
+      let key_refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
+      let filter = p.create_filter(&key_refs);
+
+      // Size bound: LevelDB guarantees at most (n * bits_per_key / 8) + 40.
+      assert!(
+        filter.len() <= (length * bits_per_key / 8) + 40,
+        "filter too large at length={length}: {} bytes",
+        filter.len()
+      );
+
+      // All inserted keys must match (no false negatives).
+      for (i, key) in keys.iter().enumerate() {
+        assert!(
+          p.key_may_match(key.as_slice(), &filter),
+          "false negative at length={length}, key={i}"
+        );
+      }
+
+      // Measure false-positive rate over 10_000 absent probes.
+      // Absent keys start far above the inserted range (+ 1_000_000_000).
+      let fp: u32 = (0u32..10_000)
+        .filter(|&i| p.key_may_match(&(i + 1_000_000_000u32).to_le_bytes(), &filter))
+        .count() as u32;
+      let rate = fp as f64 / 10_000.0;
+
+      assert!(rate <= 0.02, "FPR {rate:.4} exceeds 2% at length={length}");
+
+      if rate > 0.0125 {
+        mediocre += 1
+      } else {
+        good += 1
+      }
+
+      length = next_length(length);
+    }
+
+    assert!(
+      mediocre <= good / 5,
+      "too many mediocre filters: {mediocre} mediocre, {good} good"
+    );
+  }
 }
