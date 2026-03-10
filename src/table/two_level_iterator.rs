@@ -186,7 +186,14 @@ mod tests {
   fn build_table(pairs: &[(&[u8], &[u8])], block_size: usize) -> (tempfile::NamedTempFile, u64) {
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let file = tmp.reopen().unwrap();
-    let mut builder = TableBuilder::new(file, block_size, 16, None);
+    let mut builder = TableBuilder::new(
+      file,
+      block_size,
+      16,
+      None,
+      crate::options::CompressionType::NoCompression,
+      0,
+    );
     for (seq, &(k, v)) in pairs.iter().enumerate() {
       let ikey = make_internal_key(k, seq as u64 + 1, 1);
       builder.add(&ikey, v).unwrap();
@@ -264,7 +271,14 @@ mod tests {
       .collect();
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let file = tmp.reopen().unwrap();
-    let mut builder = TableBuilder::new(file, 64, 4, None);
+    let mut builder = TableBuilder::new(
+      file,
+      64,
+      4,
+      None,
+      crate::options::CompressionType::NoCompression,
+      0,
+    );
     for (seq, (k, v)) in pairs.iter().enumerate() {
       let ikey = make_internal_key(k, seq as u64 + 1, 1);
       builder.add(&ikey, v).unwrap();
@@ -294,7 +308,14 @@ mod tests {
       .collect();
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let file = tmp.reopen().unwrap();
-    let mut builder = TableBuilder::new(file, 64, 4, None);
+    let mut builder = TableBuilder::new(
+      file,
+      64,
+      4,
+      None,
+      crate::options::CompressionType::NoCompression,
+      0,
+    );
     for (seq, (k, v)) in pairs.iter().enumerate() {
       let ikey = make_internal_key(k, seq as u64 + 1, 1);
       builder.add(&ikey, v).unwrap();

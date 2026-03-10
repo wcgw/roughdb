@@ -12,6 +12,7 @@
 
 use crate::error::Error;
 use crate::filter::FilterPolicy;
+use crate::options::CompressionType;
 use crate::table::block_builder::BlockBuilder;
 use crate::table::filter_block::FilterBlockWriter;
 use crate::table::format::{write_raw_block, BlockHandle, Footer, FOOTER_ENCODED_LENGTH};
@@ -44,6 +45,8 @@ pub(crate) struct TableBuilder {
   filter_writer: Option<FilterBlockWriter>,
   /// Name of the filter policy, for the metaindex key `"filter.<name>"`.
   filter_policy_name: Option<String>,
+  compression: CompressionType,
+  zstd_level: i32,
 }
 
 impl TableBuilder {
@@ -53,11 +56,15 @@ impl TableBuilder {
   /// - `restart_interval`: restart points every N keys for data blocks.
   /// - `filter_policy`: optional filter policy; when `Some`, a filter block is
   ///   written and referenced in the metaindex block.
+  /// - `compression`: algorithm applied to data blocks.
+  /// - `zstd_level`: compression level when `compression` is `Zstd`.
   pub(crate) fn new(
     file: File,
     block_size: usize,
     restart_interval: usize,
     filter_policy: Option<Arc<dyn FilterPolicy>>,
+    compression: CompressionType,
+    zstd_level: i32,
   ) -> Self {
     let (filter_writer, filter_policy_name) = match filter_policy {
       Some(policy) => {
@@ -80,6 +87,8 @@ impl TableBuilder {
       closed: false,
       filter_writer,
       filter_policy_name,
+      compression,
+      zstd_level,
     }
   }
 
@@ -144,9 +153,15 @@ impl TableBuilder {
     let metaindex_handle = if let (Some(fw), Some(filter_key)) =
       (self.filter_writer.take(), self.filter_policy_name.take())
     {
-      // Finalise and write the filter block.
+      // Finalise and write the filter block (always uncompressed — LevelDB does not compress it).
       let filter_data = fw.finish();
-      let filter_handle = write_raw_block(&mut self.dest, &filter_data, self.offset)?;
+      let filter_handle = write_raw_block(
+        &mut self.dest,
+        &filter_data,
+        self.offset,
+        CompressionType::NoCompression,
+        0,
+      )?;
       self.offset += filter_handle.size + 5;
 
       // Write the metaindex block with one entry: "filter.<name>" → BlockHandle.
@@ -155,21 +170,39 @@ impl TableBuilder {
       let n = filter_handle.encode_to(&mut handle_enc);
       meta.add(filter_key.as_bytes(), &handle_enc[..n]);
       let meta_data = meta.finish().to_vec();
-      let mh = write_raw_block(&mut self.dest, &meta_data, self.offset)?;
+      let mh = write_raw_block(
+        &mut self.dest,
+        &meta_data,
+        self.offset,
+        CompressionType::NoCompression,
+        0,
+      )?;
       self.offset += mh.size + 5;
       mh
     } else {
       // No filter — write an empty metaindex block.
       let mut empty_meta = BlockBuilder::new(1);
       let meta_data = empty_meta.finish().to_vec();
-      let mh = write_raw_block(&mut self.dest, &meta_data, self.offset)?;
+      let mh = write_raw_block(
+        &mut self.dest,
+        &meta_data,
+        self.offset,
+        CompressionType::NoCompression,
+        0,
+      )?;
       self.offset += mh.size + 5;
       mh
     };
 
-    // Write index block.
+    // Write index block (uncompressed — LevelDB does not compress index/meta blocks).
     let index_data = self.index_block.finish().to_vec();
-    let index_handle = write_raw_block(&mut self.dest, &index_data, self.offset)?;
+    let index_handle = write_raw_block(
+      &mut self.dest,
+      &index_data,
+      self.offset,
+      CompressionType::NoCompression,
+      0,
+    )?;
     self.offset += index_handle.size + 5;
 
     // Write footer.
@@ -210,7 +243,13 @@ impl TableBuilder {
   fn flush_data_block(&mut self) -> Result<(), Error> {
     debug_assert!(!self.data_block.is_empty());
     let block_data = self.data_block.finish().to_vec();
-    let handle = write_raw_block(&mut self.dest, &block_data, self.offset)?;
+    let handle = write_raw_block(
+      &mut self.dest,
+      &block_data,
+      self.offset,
+      self.compression,
+      self.zstd_level,
+    )?;
     self.offset += handle.size + 5; // data bytes + 5-byte trailer
     self.data_block.reset();
     self.pending_handle = Some(handle);
@@ -235,7 +274,7 @@ mod tests {
   fn build_table(pairs: &[(&[u8], &[u8])]) -> (tempfile::NamedTempFile, u64) {
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let file = tmp.reopen().unwrap();
-    let mut builder = TableBuilder::new(file, 4096, 16, None);
+    let mut builder = TableBuilder::new(file, 4096, 16, None, CompressionType::NoCompression, 0);
     for (seq, &(k, v)) in pairs.iter().enumerate() {
       let ikey = make_internal_key(k, seq as u64 + 1, 1);
       builder.add(&ikey, v).unwrap();
@@ -248,7 +287,7 @@ mod tests {
   fn empty_table_finish() {
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let file = tmp.reopen().unwrap();
-    let builder = TableBuilder::new(file, 4096, 16, None);
+    let builder = TableBuilder::new(file, 4096, 16, None, CompressionType::NoCompression, 0);
     let size = builder.finish().unwrap();
     // Should at least have metaindex block + trailer + index block + trailer + footer.
     assert!(size >= FOOTER_ENCODED_LENGTH as u64);
@@ -290,7 +329,7 @@ mod tests {
       .collect();
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let file = tmp.reopen().unwrap();
-    let mut builder = TableBuilder::new(file, 64, 4, None);
+    let mut builder = TableBuilder::new(file, 64, 4, None, CompressionType::NoCompression, 0);
     for (seq, (k, v)) in pairs.iter().enumerate() {
       let ikey = make_internal_key(k, seq as u64 + 1, 1);
       builder.add(&ikey, v).unwrap();
@@ -298,6 +337,41 @@ mod tests {
     let size = builder.finish().unwrap();
     let file = tmp.reopen().unwrap();
     let table = Table::open(file, size, None).unwrap();
+    for (k, v) in &pairs {
+      assert!(matches!(table.get(k, false).unwrap(), L::Value(ref val) if val == v));
+    }
+  }
+
+  fn build_table_with_compression(
+    pairs: &[(&[u8], &[u8])],
+    compression: CompressionType,
+  ) -> (tempfile::NamedTempFile, u64) {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let file = tmp.reopen().unwrap();
+    let mut builder = TableBuilder::new(file, 4096, 16, None, compression, 1);
+    for (seq, &(k, v)) in pairs.iter().enumerate() {
+      let ikey = make_internal_key(k, seq as u64 + 1, 1);
+      builder.add(&ikey, v).unwrap();
+    }
+    let size = builder.finish().unwrap();
+    (tmp, size)
+  }
+
+  #[test]
+  fn snappy_compression_round_trip() {
+    let pairs: Vec<(&[u8], &[u8])> = vec![(b"foo", b"bar"), (b"key", b"value")];
+    let (tmp, size) = build_table_with_compression(&pairs, CompressionType::Snappy);
+    let table = Table::open(tmp.reopen().unwrap(), size, None).unwrap();
+    for (k, v) in &pairs {
+      assert!(matches!(table.get(k, false).unwrap(), L::Value(ref val) if val == v));
+    }
+  }
+
+  #[test]
+  fn zstd_compression_round_trip() {
+    let pairs: Vec<(&[u8], &[u8])> = vec![(b"alpha", b"one"), (b"beta", b"two")];
+    let (tmp, size) = build_table_with_compression(&pairs, CompressionType::Zstd);
+    let table = Table::open(tmp.reopen().unwrap(), size, None).unwrap();
     for (k, v) in &pairs {
       assert!(matches!(table.get(k, false).unwrap(), L::Value(ref val) if val == v));
     }
