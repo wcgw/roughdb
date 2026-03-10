@@ -283,9 +283,12 @@ what remains is compaction, the full Iterator/Snapshot API, and operational hygi
   `"leveldb.approximate-memory-usage"` (memtable bytes). Returns `None` for unknown properties or invalid level
   numbers. Helpers `num_files`, `level_bytes`, `debug_string` added to `Version`.
   See `db/db_impl.cc: DBImpl::GetProperty`.
-- [ ] **`Db::GetApproximateSizes(ranges)`**: Given a slice of `(start_key, end_key)` ranges, return approximate
+- [x] **`Db::GetApproximateSizes(ranges)`**: Given a slice of `(start_key, end_key)` ranges, return approximate
   on-disk byte count for each range by walking the index blocks of overlapping SSTables. Used by tools to estimate
-  data distribution. See `db/db_impl.cc: DBImpl::GetApproximateSizes`.
+  data distribution. `Version::approximate_offset_of` accumulates `file_size` for files entirely before the key
+  and delegates to `Table::approximate_offset_of` (index-block seek, returns block start offset or `metaindex_offset`
+  as end-of-data proxy) for straddling files. Returns `0` for in-memory databases.
+  See `db/db_impl.cc: DBImpl::GetApproximateSizes`.
 - [x] **`Db::destroy(path)`**: Associated function (no open instance needed). Acquires `LOCK` non-blocking —
   returns `IoError` immediately if another process holds it. Enumerates the directory via `parse_db_filename`,
   deletes every recognised file except `LOCK`, then drops the flock and deletes `LOCK`. Calls `remove_dir`

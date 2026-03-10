@@ -83,6 +83,40 @@ impl Version {
     Ok(LookupResult::NotInTable)
   }
 
+  /// Estimate the cumulative on-disk byte offset of `ikey` across all levels.
+  ///
+  /// For each level, files whose `largest` key is entirely before `ikey` have
+  /// their full `file_size` added.  For the file that straddles the boundary
+  /// (if any), `Table::approximate_offset_of` is used.  Files entirely after
+  /// `ikey` are skipped (and for L1+, the scan stops early because files are
+  /// sorted by smallest key).
+  ///
+  /// See `db/version_set.cc: VersionSet::ApproximateOffsetOf`.
+  pub(crate) fn approximate_offset_of(&self, ikey: &[u8]) -> u64 {
+    use crate::table::format::cmp_internal_keys;
+    let mut result = 0u64;
+    for level in 0..NUM_LEVELS {
+      for meta in &self.files[level] {
+        if cmp_internal_keys(&meta.largest, ikey) <= std::cmp::Ordering::Equal {
+          // Entire file is before ikey.
+          result += meta.file_size;
+        } else if cmp_internal_keys(&meta.smallest, ikey) > std::cmp::Ordering::Equal {
+          // Entire file is after ikey; L1+ files are sorted so no later file
+          // in this level can contain ikey.
+          if level > 0 {
+            break;
+          }
+        } else {
+          // ikey falls within this file's range.
+          if let Some(table) = &meta.table {
+            result += table.approximate_offset_of(ikey);
+          }
+        }
+      }
+    }
+    result
+  }
+
   /// Number of live SSTable files at `level`.
   pub(crate) fn num_files(&self, level: usize) -> usize {
     self.files[level].len()

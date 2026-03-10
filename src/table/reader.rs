@@ -45,6 +45,10 @@ pub(crate) enum LookupResult {
 pub(crate) struct Table {
   file: File,
   index_block: Block,
+  /// Offset of the metaindex block within the file.  Used as the "end of data
+  /// blocks" sentinel in `approximate_offset_of` — the same heuristic that
+  /// LevelDB uses in `Table::ApproximateOffsetOf`.
+  metaindex_offset: u64,
   /// Parsed filter block, present when the SSTable was written with a filter
   /// policy whose name matches the one in the metaindex.
   filter: Option<FilterBlockReader>,
@@ -85,6 +89,7 @@ impl Table {
     Ok(Table {
       file,
       index_block,
+      metaindex_offset: footer.metaindex_handle.offset,
       filter,
     })
   }
@@ -145,6 +150,28 @@ impl Table {
       }
     }
     Ok(LookupResult::NotInTable)
+  }
+
+  /// Estimate the byte offset within the file of the data that would contain
+  /// `ikey` (an SSTable internal key).
+  ///
+  /// - Files (data blocks) that are entirely before `ikey` contribute their
+  ///   full block offset.
+  /// - If `ikey` falls within a block, the block's start offset is returned.
+  /// - If `ikey` is past the last key, `metaindex_offset` is returned as a
+  ///   proxy for "end of data blocks" (matching LevelDB's heuristic).
+  ///
+  /// See `table/table.cc: Table::ApproximateOffsetOf`.
+  pub(crate) fn approximate_offset_of(&self, ikey: &[u8]) -> u64 {
+    let mut idx = self.index_block.iter();
+    idx.seek(ikey);
+    if idx.valid() {
+      BlockHandle::decode_from(idx.value())
+        .map(|(h, _)| h.offset)
+        .unwrap_or(self.metaindex_offset)
+    } else {
+      self.metaindex_offset
+    }
   }
 
   /// Return a `TwoLevelIterator` over all entries in this table.

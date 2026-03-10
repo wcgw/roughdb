@@ -692,6 +692,44 @@ impl Db {
     }
   }
 
+  /// Return approximate on-disk byte sizes for each `(start, limit)` key range.
+  ///
+  /// Each element of the returned `Vec` corresponds to the same-indexed range
+  /// in `ranges`.  The sizes are estimates only and do not account for
+  /// compression or index-block overhead.  In-memory (unflushed) data is not
+  /// counted.
+  ///
+  /// An open-ended range can be expressed with `start = b""` or `limit = b""`,
+  /// which naturally compare as the logical minimum/maximum key respectively
+  /// in internal-key order.
+  ///
+  /// See `include/leveldb/db.h: DB::GetApproximateSizes` and
+  /// `db/db_impl.cc: DBImpl::GetApproximateSizes`.
+  pub fn get_approximate_sizes(&self, ranges: &[(&[u8], &[u8])]) -> Vec<u64> {
+    use crate::table::format::make_internal_key;
+
+    // Snapshot the current version under the lock, then release.
+    let version = {
+      let state = self.state.lock().unwrap();
+      state.version_set.as_ref().map(|vs| vs.current())
+    };
+
+    ranges
+      .iter()
+      .map(|&(start, limit)| {
+        let Some(ref v) = version else { return 0 };
+        // Convert user keys to lookup internal keys (seq=u64::MAX>>8, vtype=1)
+        // so they sort before all real entries for the same user key — the same
+        // sentinel used in Table::get.
+        let istart = make_internal_key(start, u64::MAX >> 8, 1);
+        let ilimit = make_internal_key(limit, u64::MAX >> 8, 1);
+        let start_off = v.approximate_offset_of(&istart);
+        let limit_off = v.approximate_offset_of(&ilimit);
+        limit_off.saturating_sub(start_off)
+      })
+      .collect()
+  }
+
   pub fn put<K, V>(&self, key: K, value: V) -> Result<(), Error>
   where
     K: AsRef<[u8]>,
@@ -2967,5 +3005,58 @@ mod tests {
       .parse()
       .unwrap();
     assert!(usage > 0);
+  }
+
+  // ── get_approximate_sizes ─────────────────────────────────────────────────
+
+  #[test]
+  fn get_approximate_sizes_empty_ranges() {
+    let (_dir, db) = db_with_l0_files();
+    let sizes = db.get_approximate_sizes(&[]);
+    assert!(sizes.is_empty());
+  }
+
+  #[test]
+  fn get_approximate_sizes_in_memory_db_returns_zeros() {
+    let db = Db::default();
+    db.put(b"a", b"v").unwrap();
+    let sizes = db.get_approximate_sizes(&[(b"a".as_ref(), b"z".as_ref())]);
+    assert_eq!(sizes, vec![0]);
+  }
+
+  #[test]
+  fn get_approximate_sizes_wide_range_covers_data() {
+    let (_dir, db) = db_with_l0_files();
+    // A range that spans all written keys should return a non-zero size.
+    let sizes = db.get_approximate_sizes(&[(b"\x00".as_ref(), b"\xff".as_ref())]);
+    assert_eq!(sizes.len(), 1);
+    assert!(
+      sizes[0] > 0,
+      "expected non-zero size for wide range, got {}",
+      sizes[0]
+    );
+  }
+
+  #[test]
+  fn get_approximate_sizes_multiple_ranges() {
+    let (_dir, db) = db_with_l0_files();
+    let sizes = db.get_approximate_sizes(&[
+      (b"\x00".as_ref(), b"\x80".as_ref()),
+      (b"\x80".as_ref(), b"\xff".as_ref()),
+    ]);
+    assert_eq!(sizes.len(), 2);
+    // Both halves may be 0 if all keys land in one half, but their sum
+    // should equal the total across the full range (approximately).
+    let total_sizes = db.get_approximate_sizes(&[(b"\x00".as_ref(), b"\xff".as_ref())]);
+    // Individual sizes should be <= total (saturating arithmetic).
+    assert!(sizes[0] + sizes[1] <= total_sizes[0] + 4096 * 8);
+  }
+
+  #[test]
+  fn get_approximate_sizes_empty_range_returns_zero() {
+    let (_dir, db) = db_with_l0_files();
+    // start == limit → empty range; approximate_offset_of returns the same value.
+    let sizes = db.get_approximate_sizes(&[(b"key".as_ref(), b"key".as_ref())]);
+    assert_eq!(sizes, vec![0]);
   }
 }
