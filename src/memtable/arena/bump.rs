@@ -25,11 +25,9 @@ pub struct Arena {
 }
 
 impl Arena {
-  pub fn new(capacity: usize) -> Self {
-    let bump = Bump::new();
-    bump.set_allocation_limit(Some(capacity));
+  pub fn new() -> Self {
     Arena {
-      arena: bump,
+      arena: Bump::new(),
       bytes_used: AtomicUsize::new(0),
     }
   }
@@ -60,6 +58,6 @@ impl Arena {
 
 impl Default for Arena {
   fn default() -> Self {
-    Self::new(10 << 20) // 10 MB
+    Self::new()
   }
 }

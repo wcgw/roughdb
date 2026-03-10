@@ -60,9 +60,8 @@ The read path checks `mem` → `imm` → each level of SSTables (newest to oldes
   ours, but the outcome is equivalent.
 - **`memory_usage()`**: `Arena` tracks exact bytes used via an explicit `AtomicUsize` counter (bumpalo's
   `allocated_bytes()` returns chunk *capacity* not bytes used). `Memtable::approximate_memory_usage()` delegates to
-  this; `Db::write` compares against `options.write_buffer_size` to trigger L0 flush.
-- **Hardcoded 10 MB cap**: The `Arena::default()` cap of 10 MB is a safety ceiling only; the actual flush threshold
-  is `Options::write_buffer_size` (default 4 MB). The cap should be removed or raised in Phase 9.
+  this; `Db::write` compares against `options.write_buffer_size` to trigger L0 flush.  The arena grows unboundedly
+  (matching LevelDB — no capacity limit); the flush threshold is the sole governing constraint.
 
 ---
 
