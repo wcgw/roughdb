@@ -929,7 +929,7 @@ fn write_flush(prep: FlushPrep, opts: &Options) -> Result<FlushResult, Error> {
     file,
     opts.block_size,
     opts.block_restart_interval,
-    opts.filter_policy.as_ref(),
+    opts.filter_policy.clone(),
   );
   let mut smallest = Vec::new();
   let mut largest = Vec::new();
@@ -1219,7 +1219,7 @@ fn do_compaction(
           file,
           opts.block_size,
           opts.block_restart_interval,
-          opts.filter_policy.as_ref(),
+          opts.filter_policy.clone(),
         );
         current = Some(CompactionOutputFile {
           file_number,

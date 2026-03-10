@@ -372,7 +372,7 @@ mod tests {
       file,
       opts.block_size,
       opts.block_restart_interval,
-      opts.filter_policy.as_ref(),
+      opts.filter_policy.clone(),
     );
     for &(uk, seq, vt, val) in entries {
       builder.add(&make_internal_key(uk, seq, vt), val).unwrap();

@@ -57,13 +57,13 @@ impl TableBuilder {
     file: File,
     block_size: usize,
     restart_interval: usize,
-    filter_policy: Option<&Arc<dyn FilterPolicy>>,
+    filter_policy: Option<Arc<dyn FilterPolicy>>,
   ) -> Self {
     let (filter_writer, filter_policy_name) = match filter_policy {
-      Some(policy) => (
-        Some(FilterBlockWriter::new(Arc::clone(policy))),
-        Some(format!("filter.{}", policy.name())),
-      ),
+      Some(policy) => {
+        let name = format!("filter.{}", policy.name());
+        (Some(FilterBlockWriter::new(policy)), Some(name))
+      }
       None => (None, None),
     };
     Self {
