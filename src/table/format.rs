@@ -232,7 +232,6 @@ pub(crate) fn write_raw_block(
   data: &[u8],
   offset: u64,
   compression: CompressionType,
-  zstd_level: i32,
 ) -> Result<BlockHandle, Error> {
   let (block_data, compression_type_byte): (std::borrow::Cow<[u8]>, u8) = match compression {
     CompressionType::NoCompression => (std::borrow::Cow::Borrowed(data), 0x00),
@@ -251,7 +250,7 @@ pub(crate) fn write_raw_block(
         (std::borrow::Cow::Borrowed(data), 0x00)
       }
     }
-    CompressionType::Zstd => {
+    CompressionType::Zstd(zstd_level) => {
       let range = zstd::compression_level_range();
       let level = zstd_level.clamp(*range.start(), *range.end());
       let compressed = zstd::bulk::compress(data, level)
@@ -355,7 +354,7 @@ mod tests {
       .copied()
       .collect();
     let mut buf: Vec<u8> = Vec::new();
-    let handle = write_raw_block(&mut buf, &data, 0, compression, 1).unwrap();
+    let handle = write_raw_block(&mut buf, &data, 0, compression).unwrap();
 
     // Read it back using a temporary file (read_block requires a File).
     let mut tmp = tempfile::tempfile().unwrap();
@@ -376,7 +375,7 @@ mod tests {
 
   #[test]
   fn zstd_compression_roundtrip() {
-    roundtrip_block(crate::options::CompressionType::Zstd);
+    roundtrip_block(crate::options::CompressionType::Zstd(1));
   }
 
   #[test]
@@ -384,14 +383,7 @@ mod tests {
     // Random-looking data: Snappy won't achieve 12.5% savings, so block is stored raw.
     let data: Vec<u8> = (0u8..=255).cycle().take(256).collect();
     let mut buf: Vec<u8> = Vec::new();
-    let _ = write_raw_block(
-      &mut buf,
-      &data,
-      0,
-      crate::options::CompressionType::Snappy,
-      1,
-    )
-    .unwrap();
+    let _ = write_raw_block(&mut buf, &data, 0, crate::options::CompressionType::Snappy).unwrap();
     // Trailer byte should be 0x00 (NoCompression) because the data didn't compress well.
     let trailer_type = buf[buf.len() - BLOCK_TRAILER_SIZE];
     assert_eq!(trailer_type, 0x00, "expected fallback to NoCompression");

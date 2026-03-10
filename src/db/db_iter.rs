@@ -378,7 +378,6 @@ mod tests {
       16,
       None,
       crate::options::CompressionType::NoCompression,
-      0,
     );
     for &(k, seq, vtype, v) in pairs {
       let ikey = make_internal_key(k, seq, vtype);

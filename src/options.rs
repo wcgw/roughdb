@@ -16,10 +16,11 @@
 /// See `include/leveldb/options.h: CompressionType`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CompressionType {
-  NoCompression = 0x0,
+  NoCompression,
   #[default]
-  Snappy = 0x1,
-  Zstd = 0x2,
+  Snappy,
+  /// Zstd compression with the given level.  Range: `[-5, 22]`; typical default is `1`.
+  Zstd(i32),
 }
 
 /// Options that control the overall behaviour of a database.
@@ -84,19 +85,10 @@ pub struct Options {
 
   /// Compression algorithm applied to SSTable data blocks.
   ///
-  /// **Not yet implemented.** Accepted but ignored — all blocks are currently written
-  /// uncompressed regardless of this setting. Reading compressed blocks written by LevelDB or
-  /// other implementations is also not yet supported.
+  /// Use `CompressionType::Zstd(level)` to enable Zstd at a specific level (`[-5, 22]`).
   ///
   /// Default: `Snappy`.
   pub compression: CompressionType,
-
-  /// Compression level used when `compression` is `Zstd`. Range: `[-5, 22]`.
-  ///
-  /// **Not yet implemented.** Has no effect until `compression` is implemented.
-  ///
-  /// Default: 1.
-  pub zstd_compression_level: i32,
 
   /// Reuse existing MANIFEST and log files on open rather than creating new ones (experimental).
   ///
@@ -137,7 +129,6 @@ impl Default for Options {
       block_restart_interval: 16,
       max_file_size: 2 * 1024 * 1024,
       compression: CompressionType::Snappy,
-      zstd_compression_level: 1,
       reuse_logs: false,
       filter_policy: None,
     }
@@ -156,7 +147,6 @@ impl std::fmt::Debug for Options {
       .field("block_restart_interval", &self.block_restart_interval)
       .field("max_file_size", &self.max_file_size)
       .field("compression", &self.compression)
-      .field("zstd_compression_level", &self.zstd_compression_level)
       .field("reuse_logs", &self.reuse_logs)
       .field(
         "filter_policy",

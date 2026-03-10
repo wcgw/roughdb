@@ -192,7 +192,6 @@ mod tests {
       16,
       None,
       crate::options::CompressionType::NoCompression,
-      0,
     );
     for (seq, &(k, v)) in pairs.iter().enumerate() {
       let ikey = make_internal_key(k, seq as u64 + 1, 1);
@@ -277,7 +276,6 @@ mod tests {
       4,
       None,
       crate::options::CompressionType::NoCompression,
-      0,
     );
     for (seq, (k, v)) in pairs.iter().enumerate() {
       let ikey = make_internal_key(k, seq as u64 + 1, 1);
@@ -314,7 +312,6 @@ mod tests {
       4,
       None,
       crate::options::CompressionType::NoCompression,
-      0,
     );
     for (seq, (k, v)) in pairs.iter().enumerate() {
       let ikey = make_internal_key(k, seq as u64 + 1, 1);
