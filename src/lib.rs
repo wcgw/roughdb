@@ -626,6 +626,72 @@ impl Db {
     Snapshot { db: self, seq }
   }
 
+  /// Return a property value for a named `property`, or `None` if the property
+  /// is unknown.
+  ///
+  /// Supported property names:
+  ///
+  /// | Property | Description |
+  /// |---|---|
+  /// | `"leveldb.num-files-at-level<N>"` | File count at level N (0–6) |
+  /// | `"leveldb.stats"` | Per-level file count and size table |
+  /// | `"leveldb.sstables"` | One line per SSTable across all levels |
+  /// | `"leveldb.approximate-memory-usage"` | Memtable bytes as a decimal string |
+  ///
+  /// See `include/leveldb/db.h: DB::GetProperty`.
+  pub fn get_property(&self, property: &str) -> Option<String> {
+    let prop = property.strip_prefix("leveldb.")?;
+
+    // Snapshot what we need under the lock, then release before formatting.
+    let (version, mem_usage, imm_usage) = {
+      let state = self.state.lock().unwrap();
+      let version = state.version_set.as_ref().map(|vs| vs.current());
+      let mem_usage = state.mem.approximate_memory_usage();
+      let imm_usage = state
+        .imm
+        .as_ref()
+        .map_or(0, |i| i.approximate_memory_usage());
+      (version, mem_usage, imm_usage)
+    };
+
+    if let Some(rest) = prop.strip_prefix("num-files-at-level") {
+      let level: usize = rest.parse().ok()?;
+      if level >= crate::db::version::NUM_LEVELS {
+        return None;
+      }
+      let count = version.as_ref().map_or(0, |v| v.num_files(level));
+      return Some(count.to_string());
+    }
+
+    match prop {
+      "stats" => {
+        let mut out = String::from(
+          "                               Compactions\n\
+           Level  Files Size(MB) Time(sec) Read(MB) Write(MB)\n\
+           --------------------------------------------------\n",
+        );
+        for level in 0..crate::db::version::NUM_LEVELS {
+          let files = version.as_ref().map_or(0, |v| v.num_files(level));
+          let bytes = version.as_ref().map_or(0, |v| v.level_bytes(level));
+          if files > 0 {
+            out.push_str(&format!(
+              "{level:3} {files:8} {mb:8.0}       0.0      0.0       0.0\n",
+              mb = bytes as f64 / 1_048_576.0,
+            ));
+          }
+        }
+        Some(out)
+      }
+      "sstables" => Some(
+        version
+          .as_ref()
+          .map_or_else(String::new, |v| v.debug_string()),
+      ),
+      "approximate-memory-usage" => Some((mem_usage + imm_usage).to_string()),
+      _ => None,
+    }
+  }
+
   pub fn put<K, V>(&self, key: K, value: V) -> Result<(), Error>
   where
     K: AsRef<[u8]>,
@@ -2787,5 +2853,119 @@ mod tests {
     for i in 0u32..50 {
       assert_eq!(db2.get(format!("key{i:04}").as_bytes()).unwrap(), b"val");
     }
+  }
+
+  // ── get_property ─────────────────────────────────────────────────────────
+
+  /// Helper: open a DB, write enough data to trigger at least one L0 flush,
+  /// and return the open database.
+  fn db_with_l0_files() -> (tempfile::TempDir, Db) {
+    let dir = tempfile::tempdir().unwrap();
+    let opts = Options {
+      create_if_missing: true,
+      write_buffer_size: 4096, // tiny buffer → fast flush
+      ..Options::default()
+    };
+    let db = Db::open(dir.path(), opts).unwrap();
+    // Write enough to trigger multiple flushes (200-byte values × 100 keys >> 4 KiB buffer).
+    let val = vec![b'x'; 200];
+    for i in 0u32..100 {
+      db.put(format!("key{i:04}").as_bytes(), &val).unwrap();
+    }
+    (dir, db)
+  }
+
+  #[test]
+  fn get_property_unknown_returns_none() {
+    let (_dir, db) = db_with_l0_files();
+    assert!(db.get_property("leveldb.unknown").is_none());
+    assert!(db.get_property("unknown").is_none());
+    assert!(db.get_property("leveldb.num-files-at-level99").is_none());
+  }
+
+  #[test]
+  fn get_property_num_files_at_level() {
+    let (_dir, db) = db_with_l0_files();
+    // At least one file must exist across all levels (data may have compacted to L1).
+    let total: usize = (0..7)
+      .map(|l| {
+        db.get_property(&format!("leveldb.num-files-at-level{l}"))
+          .unwrap()
+          .parse::<usize>()
+          .unwrap()
+      })
+      .sum();
+    assert!(
+      total >= 1,
+      "expected ≥1 file across all levels, got {total}"
+    );
+    // Level 6 should be empty given the small dataset.
+    let l6: usize = db
+      .get_property("leveldb.num-files-at-level6")
+      .unwrap()
+      .parse()
+      .unwrap();
+    assert_eq!(l6, 0);
+  }
+
+  #[test]
+  fn get_property_approximate_memory_usage() {
+    let (_dir, db) = db_with_l0_files();
+    let usage: usize = db
+      .get_property("leveldb.approximate-memory-usage")
+      .unwrap()
+      .parse()
+      .unwrap();
+    // Should be nonzero (at minimum, the current memtable uses some memory).
+    assert!(usage > 0, "expected nonzero memory usage");
+  }
+
+  #[test]
+  fn get_property_stats_contains_header() {
+    let (_dir, db) = db_with_l0_files();
+    let stats = db.get_property("leveldb.stats").unwrap();
+    assert!(stats.contains("Level"), "stats missing header: {stats}");
+    assert!(
+      stats.contains("Files"),
+      "stats missing Files column: {stats}"
+    );
+  }
+
+  #[test]
+  fn get_property_sstables_lists_files() {
+    let (_dir, db) = db_with_l0_files();
+    let tables = db.get_property("leveldb.sstables").unwrap();
+    // All seven level headers must appear.
+    for level in 0..7 {
+      assert!(
+        tables.contains(&format!("--- level {level} ---")),
+        "sstables missing level {level} header: {tables}"
+      );
+    }
+    // At least one file entry (number:size[...]) should appear.
+    assert!(
+      tables.contains('['),
+      "sstables missing file entries: {tables}"
+    );
+  }
+
+  #[test]
+  fn get_property_in_memory_db_returns_sensible_values() {
+    let db = Db::default();
+    db.put(b"k", b"v").unwrap();
+    // In-memory DB has no VersionSet, so file counts are all 0.
+    let count: usize = db
+      .get_property("leveldb.num-files-at-level0")
+      .unwrap()
+      .parse()
+      .unwrap();
+    assert_eq!(count, 0);
+    // But memory usage should reflect the memtable contents.
+    let usage: usize = db
+      .get_property("leveldb.approximate-memory-usage")
+      .unwrap()
+      .parse()
+      .unwrap();
+    assert!(usage > 0);
   }
 }

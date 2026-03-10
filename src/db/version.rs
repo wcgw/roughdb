@@ -12,6 +12,7 @@
 
 use crate::db::version_edit::FileMetaData;
 use crate::error::Error;
+use crate::table::format::parse_internal_key;
 use crate::table::reader::LookupResult;
 use std::sync::Arc;
 
@@ -81,4 +82,57 @@ impl Version {
 
     Ok(LookupResult::NotInTable)
   }
+
+  /// Number of live SSTable files at `level`.
+  pub(crate) fn num_files(&self, level: usize) -> usize {
+    self.files[level].len()
+  }
+
+  /// Total on-disk size (bytes) of all SSTable files at `level`.
+  pub(crate) fn level_bytes(&self, level: usize) -> u64 {
+    self.files[level].iter().map(|f| f.file_size).sum()
+  }
+
+  /// Human-readable listing of all levels and their files.
+  ///
+  /// Format (matching LevelDB's `Version::DebugString`):
+  /// ```text
+  /// --- level 0 ---
+  ///  3:4096[key1 .. key2]
+  /// --- level 1 ---
+  /// ```
+  /// Internal key bytes are rendered as escaped ASCII (printable bytes shown
+  /// literally; non-printable bytes shown as `\xHH`).  The sequence/type
+  /// suffix is stripped so only the user key is shown.
+  pub(crate) fn debug_string(&self) -> String {
+    let mut out = String::new();
+    for level in 0..NUM_LEVELS {
+      out.push_str(&format!("--- level {level} ---\n"));
+      for f in &self.files[level] {
+        let smallest = format_user_key(&f.smallest);
+        let largest = format_user_key(&f.largest);
+        out.push_str(&format!(
+          " {}:{}[{} .. {}]\n",
+          f.number, f.file_size, smallest, largest
+        ));
+      }
+    }
+    out
+  }
+}
+
+/// Render an internal key as an escaped user-key string.
+fn format_user_key(ikey: &[u8]) -> String {
+  let user_key = parse_internal_key(ikey)
+    .map(|(uk, _, _)| uk)
+    .unwrap_or(ikey);
+  let mut s = String::new();
+  for &b in user_key {
+    if b.is_ascii_graphic() || b == b' ' {
+      s.push(b as char);
+    } else {
+      s.push_str(&format!("\\x{b:02x}"));
+    }
+  }
+  s
 }

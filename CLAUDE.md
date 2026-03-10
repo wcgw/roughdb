@@ -276,10 +276,13 @@ what remains is compaction, the full Iterator/Snapshot API, and operational hygi
 
 **Remaining user-facing API surface** *(in `include/leveldb/db.h`)*
 
-- [ ] **`Db::GetProperty(property)`**: Returns stats strings for well-known property names:
-  `"leveldb.num-files-at-level<N>"`, `"leveldb.stats"` (per-level compaction stats table),
-  `"leveldb.sstables"` (one line per SSTable), `"leveldb.approximate-memory-usage"`. Returns `None` for unknown
-  properties. See `db/db_impl.cc: DBImpl::GetProperty`.
+- [x] **`Db::GetProperty(property)`**: `get_property(&self, property: &str) -> Option<String>`. Supported
+  properties: `"leveldb.num-files-at-level<N>"` (file count at level N), `"leveldb.stats"` (per-level file
+  count and size; time/read/write columns emit `0` since compaction stats are not tracked),
+  `"leveldb.sstables"` (one line per SSTable with file number, size, and escaped user-key range),
+  `"leveldb.approximate-memory-usage"` (memtable bytes). Returns `None` for unknown properties or invalid level
+  numbers. Helpers `num_files`, `level_bytes`, `debug_string` added to `Version`.
+  See `db/db_impl.cc: DBImpl::GetProperty`.
 - [ ] **`Db::GetApproximateSizes(ranges)`**: Given a slice of `(start_key, end_key)` ranges, return approximate
   on-disk byte count for each range by walking the index blocks of overlapping SSTables. Used by tools to estimate
   data distribution. See `db/db_impl.cc: DBImpl::GetApproximateSizes`.
