@@ -3,8 +3,8 @@
 Embedded key-value storage written in Rust — a port of
 [LevelDB](https://github.com/google/leveldb) to Rust.
 
-![Crates.io Version](https://img.shields.io/crates/v/roughdb)
-![docs.rs](https://img.shields.io/docsrs/roughdb)
+[![Crates.io Version](https://img.shields.io/crates/v/roughdb)](https://crates.io/crates/roughdb)
+[![docs.rs](https://img.shields.io/docsrs/roughdb)](https://docs.rs/roughdb/latest/roughdb/)
 
 RoughDB is an LSM-tree key-value store with a LevelDB-compatible on-disk
 format. It supports persistent (WAL + MANIFEST + SSTables) and in-memory
