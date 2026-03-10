@@ -39,34 +39,39 @@ impl Version {
 
   /// Look up `user_key` across all levels, returning the first match.
   ///
-  /// L0 is scanned newest-first.  L1–L6 are scanned linearly (Phase 5;
-  /// binary search is deferred to Phase 6).
+  /// L0 is scanned newest-first.  L1–L6 are scanned linearly (binary search
+  /// deferred to a later phase).
   ///
-  /// The `_sequence` parameter is reserved for snapshot-aware reads (Phase 6).
-  /// `Table::get` already uses the maximum sequence internally, which is
-  /// correct for the current non-snapshot read path.
-  pub(crate) fn get(&self, user_key: &[u8], _sequence: u64) -> Result<LookupResult, Error> {
+  /// `verify_checksums` is forwarded to every `Table::get` call; set it to
+  /// `true` when `ReadOptions::verify_checksums` or `Options::paranoid_checks`
+  /// is active.
+  pub(crate) fn get(
+    &self,
+    user_key: &[u8],
+    _sequence: u64,
+    verify_checksums: bool,
+  ) -> Result<LookupResult, Error> {
     // L0: newest-first scan.
     for meta in &self.files[0] {
       let table = meta
         .table
         .as_ref()
         .expect("FileMetaData in Version must have an open table");
-      match table.get(user_key, false)? {
+      match table.get(user_key, verify_checksums)? {
         LookupResult::Value(v) => return Ok(LookupResult::Value(v)),
         LookupResult::Deleted => return Ok(LookupResult::Deleted),
         LookupResult::NotInTable => {}
       }
     }
 
-    // L1–L6: linear scan (binary search deferred to Phase 6).
+    // L1–L6: linear scan (binary search deferred to a later phase).
     for level in 1..NUM_LEVELS {
       for meta in &self.files[level] {
         let table = meta
           .table
           .as_ref()
           .expect("FileMetaData in Version must have an open table");
-        match table.get(user_key, false)? {
+        match table.get(user_key, verify_checksums)? {
           LookupResult::Value(v) => return Ok(LookupResult::Value(v)),
           LookupResult::Deleted => return Ok(LookupResult::Deleted),
           LookupResult::NotInTable => {}

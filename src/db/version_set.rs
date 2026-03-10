@@ -101,7 +101,7 @@ impl VersionSet {
   /// Reads `CURRENT`, replays each `VersionEdit` in the MANIFEST log, opens
   /// all live SSTable files, and returns a `VersionSet` ready for
   /// `log_and_apply`.
-  pub(crate) fn recover(path: &Path) -> Result<Self, Error> {
+  pub(crate) fn recover(path: &Path, paranoid_checks: bool) -> Result<Self, Error> {
     let manifest_name = read_current_file(path)?;
     let manifest_path = path.join(&manifest_name);
 
@@ -110,7 +110,7 @@ impl VersionSet {
 
     // Replay all VersionEdits from the MANIFEST.
     let manifest_file_for_read = File::open(&manifest_path)?;
-    let mut reader = LogReader::new(manifest_file_for_read, None, true, 0);
+    let mut reader = LogReader::new(manifest_file_for_read, None, paranoid_checks, 0);
 
     let mut builder = Builder::new();
     while let Some(record) = reader.read_record() {
@@ -398,7 +398,7 @@ mod tests {
 
     // Drop and recover — the file must still appear.
     drop(vs);
-    let vs2 = VersionSet::recover(dir.path()).unwrap();
+    let vs2 = VersionSet::recover(dir.path(), false).unwrap();
     let cur2 = vs2.current();
     assert_eq!(cur2.files[0].len(), 1);
     assert_eq!(cur2.files[0][0].number, 3);
@@ -416,10 +416,10 @@ mod tests {
     vs.log_and_apply(&mut edit).unwrap();
     drop(vs);
 
-    let vs2 = VersionSet::recover(dir.path()).unwrap();
+    let vs2 = VersionSet::recover(dir.path(), false).unwrap();
     let cur = vs2.current();
     use crate::table::reader::LookupResult;
-    assert!(matches!(cur.get(b"key", 0).unwrap(), LookupResult::Value(v) if v == b"val"));
+    assert!(matches!(cur.get(b"key", 0, false).unwrap(), LookupResult::Value(v) if v == b"val"));
   }
 
   #[test]
@@ -433,7 +433,7 @@ mod tests {
     vs.log_and_apply(&mut edit).unwrap();
     drop(vs);
 
-    let vs2 = VersionSet::recover(dir.path()).unwrap();
+    let vs2 = VersionSet::recover(dir.path(), false).unwrap();
     assert_eq!(vs2.last_sequence(), 42);
   }
 }

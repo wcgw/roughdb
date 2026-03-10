@@ -168,7 +168,7 @@ mod tests {
     }
     let size = builder.finish().unwrap();
     let table = Table::open(tmp.reopen().unwrap(), size).unwrap();
-    Box::new(table.new_iterator().unwrap())
+    Box::new(table.new_iterator(false).unwrap())
   }
 
   /// Build a simple vec iterator from (ikey, value) pairs.
