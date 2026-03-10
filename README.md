@@ -138,11 +138,27 @@ cargo bench      # Criterion benchmarks (benches/db.rs)
 ## Status
 
 RoughDB is in active development. The on-disk format is LevelDB-compatible.
-The following are not yet implemented:
 
-- Compression (Snappy, Zstd) — all blocks written uncompressed
-- `Db::get_property` / `Db::get_approximate_sizes`
-- Block cache, table cache, Bloom filters
+**Implemented:**
+
+- WAL + MANIFEST + SSTable flush and crash-safe recovery
+- Multi-level compaction (L0→L1, `compact_range`) with snapshot-aware pruning and tombstone elision
+- Bidirectional iteration (`seek_to_first`, `seek_to_last`, `seek`, `next`, `prev`)
+- Snapshots (`get_snapshot` / `release_snapshot`)
+- Bloom filter support (`Options::filter_policy`)
+- Block compression: Snappy (default) and Zstd (`Options::compression`)
+- `get_property` — `leveldb.num-files-at-level<N>`, `leveldb.stats`, `leveldb.sstables`,
+  `leveldb.approximate-memory-usage`
+- `get_approximate_sizes` — byte-range estimation via index-block seeks
+- `destroy` — safely removes a database directory
+- `LOCK` file — prevents concurrent opens by multiple processes
+- Table cache — LRU open-file-handle cache bounded by `Options::max_open_files`
+
+**Not yet implemented:**
+
+- Block cache (`ReadOptions::fill_cache` is accepted but ignored)
+- Batch-grouped writes (writes are serialised one at a time)
+- Custom comparators
 
 ## License
 
