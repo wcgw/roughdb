@@ -345,7 +345,12 @@ mod tests {
 
   fn make_tc(dir: &Path) -> TableCache {
     let opts = Options::default();
-    TableCache::new(dir, opts.max_open_files - NUM_NON_TABLE_CACHE_FILES, None)
+    TableCache::new(
+      dir,
+      opts.max_open_files - NUM_NON_TABLE_CACHE_FILES,
+      None,
+      None,
+    )
   }
 
   /// Write a minimal SSTable at `path/NNNNNN.ldb` and return (file_number, file_size).
@@ -425,7 +430,7 @@ mod tests {
     let cur = vs2.current();
     use crate::table::reader::LookupResult;
     assert!(matches!(
-      cur.get(b"key", 0, false, &tc2).unwrap(),
+      cur.get(b"key", 0, false, true, &tc2).unwrap(),
       LookupResult::Value(v) if v == b"val"
     ));
   }

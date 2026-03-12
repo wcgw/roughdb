@@ -10,6 +10,7 @@
 //    See the License for the specific language governing permissions and
 //    limitations under the License.
 
+use crate::cache::BlockCache;
 use crate::error::Error;
 use crate::filter::FilterPolicy;
 use crate::table::reader::Table;
@@ -26,6 +27,7 @@ pub(crate) const NUM_NON_TABLE_CACHE_FILES: usize = 10;
 struct Inner {
   path: PathBuf,
   filter_policy: Option<Arc<dyn FilterPolicy>>,
+  block_cache: Option<Arc<BlockCache>>,
   /// Maximum number of open `Table` handles the cache will hold at once.
   capacity: usize,
   /// LRU order: front = least-recently used, back = most-recently used.
@@ -57,7 +59,12 @@ impl Inner {
     let sst_path = self.path.join(format!("{number:06}.ldb"));
     let file = File::open(&sst_path)
       .map_err(|e| Error::Corruption(format!("cannot open SSTable {number:06}.ldb: {e}")))?;
-    let table = Arc::new(Table::open(file, file_size, self.filter_policy.clone())?);
+    let table = Arc::new(Table::open(
+      file,
+      file_size,
+      self.filter_policy.clone(),
+      self.block_cache.clone(),
+    )?);
 
     self.order.push_back(number);
     self.map.insert(number, Arc::clone(&table));
@@ -116,10 +123,12 @@ impl TableCache {
     path: &Path,
     capacity: usize,
     filter_policy: Option<Arc<dyn FilterPolicy>>,
+    block_cache: Option<Arc<BlockCache>>,
   ) -> Self {
     TableCache(Arc::new(Mutex::new(Inner {
       path: path.to_owned(),
       filter_policy,
+      block_cache,
       capacity: capacity.max(1),
       order: VecDeque::new(),
       map: HashMap::new(),
@@ -165,10 +174,12 @@ mod tests {
   fn get_or_open_opens_sst() {
     let dir = tempfile::tempdir().unwrap();
     let size = write_sst(dir.path(), 3, &[(b"hello", b"world")]);
-    let tc = TableCache::new(dir.path(), 10, None);
+    let tc = TableCache::new(dir.path(), 10, None, None);
     let table = tc.get_or_open(3, size).unwrap();
     use crate::table::reader::LookupResult;
-    assert!(matches!(table.get(b"hello", false).unwrap(), LookupResult::Value(v) if v == b"world"));
+    assert!(
+      matches!(table.get(b"hello", false, true).unwrap(), LookupResult::Value(v) if v == b"world")
+    );
   }
 
   #[test]
@@ -177,8 +188,8 @@ mod tests {
     let size = write_sst(dir.path(), 3, &[(b"k", b"v")]);
     // Open manually, then insert — cache should return the same Arc.
     let file = File::open(dir.path().join("000003.ldb")).unwrap();
-    let table = Arc::new(Table::open(file, size, None).unwrap());
-    let tc = TableCache::new(dir.path(), 10, None);
+    let table = Arc::new(Table::open(file, size, None, None).unwrap());
+    let tc = TableCache::new(dir.path(), 10, None, None);
     tc.insert(3, Arc::clone(&table));
     let got = tc.get_or_open(3, size).unwrap();
     // Same underlying pointer.
@@ -189,7 +200,7 @@ mod tests {
   fn evict_removes_entry() {
     let dir = tempfile::tempdir().unwrap();
     let size = write_sst(dir.path(), 3, &[(b"k", b"v")]);
-    let tc = TableCache::new(dir.path(), 10, None);
+    let tc = TableCache::new(dir.path(), 10, None, None);
     tc.get_or_open(3, size).unwrap();
     tc.evict(3);
     // After eviction, get_or_open re-opens from disk (still works).
@@ -203,7 +214,7 @@ mod tests {
     let s3 = write_sst(dir.path(), 3, &[(b"a", b"1")]);
     let s4 = write_sst(dir.path(), 4, &[(b"b", b"2")]);
     let s5 = write_sst(dir.path(), 5, &[(b"c", b"3")]);
-    let tc = TableCache::new(dir.path(), 2, None);
+    let tc = TableCache::new(dir.path(), 2, None, None);
     tc.get_or_open(3, s3).unwrap(); // cache: [3]
     tc.get_or_open(4, s4).unwrap(); // cache: [3, 4]
     tc.get_or_open(5, s5).unwrap(); // capacity exceeded → evict 3; cache: [4, 5]

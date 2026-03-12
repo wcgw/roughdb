@@ -284,10 +284,10 @@ mod tests {
   fn single_entry_round_trip() {
     let (tmp, size) = build_table(&[(b"hello", b"world")]);
     let file = tmp.reopen().unwrap();
-    let table = Table::open(file, size, None).unwrap();
-    assert!(matches!(table.get(b"hello", false).unwrap(), L::Value(v) if v == b"world"));
+    let table = Table::open(file, size, None, None).unwrap();
+    assert!(matches!(table.get(b"hello", false, true).unwrap(), L::Value(v) if v == b"world"));
     assert!(matches!(
-      table.get(b"missing", false).unwrap(),
+      table.get(b"missing", false, true).unwrap(),
       L::NotInTable
     ));
   }
@@ -297,9 +297,9 @@ mod tests {
     let pairs: Vec<(&[u8], &[u8])> = vec![(b"a", b"1"), (b"b", b"2"), (b"c", b"3"), (b"d", b"4")];
     let (tmp, size) = build_table(&pairs);
     let file = tmp.reopen().unwrap();
-    let table = Table::open(file, size, None).unwrap();
+    let table = Table::open(file, size, None, None).unwrap();
     for (k, v) in &pairs {
-      assert!(matches!(table.get(k, false).unwrap(), L::Value(ref val) if val == v));
+      assert!(matches!(table.get(k, false, true).unwrap(), L::Value(ref val) if val == v));
     }
   }
 
@@ -323,9 +323,9 @@ mod tests {
     }
     let size = builder.finish().unwrap();
     let file = tmp.reopen().unwrap();
-    let table = Table::open(file, size, None).unwrap();
+    let table = Table::open(file, size, None, None).unwrap();
     for (k, v) in &pairs {
-      assert!(matches!(table.get(k, false).unwrap(), L::Value(ref val) if val == v));
+      assert!(matches!(table.get(k, false, true).unwrap(), L::Value(ref val) if val == v));
     }
   }
 
@@ -348,9 +348,9 @@ mod tests {
   fn snappy_compression_round_trip() {
     let pairs: Vec<(&[u8], &[u8])> = vec![(b"foo", b"bar"), (b"key", b"value")];
     let (tmp, size) = build_table_with_compression(&pairs, CompressionType::Snappy);
-    let table = Table::open(tmp.reopen().unwrap(), size, None).unwrap();
+    let table = Table::open(tmp.reopen().unwrap(), size, None, None).unwrap();
     for (k, v) in &pairs {
-      assert!(matches!(table.get(k, false).unwrap(), L::Value(ref val) if val == v));
+      assert!(matches!(table.get(k, false, true).unwrap(), L::Value(ref val) if val == v));
     }
   }
 
@@ -358,9 +358,9 @@ mod tests {
   fn zstd_compression_round_trip() {
     let pairs: Vec<(&[u8], &[u8])> = vec![(b"alpha", b"one"), (b"beta", b"two")];
     let (tmp, size) = build_table_with_compression(&pairs, CompressionType::Zstd(1));
-    let table = Table::open(tmp.reopen().unwrap(), size, None).unwrap();
+    let table = Table::open(tmp.reopen().unwrap(), size, None, None).unwrap();
     for (k, v) in &pairs {
-      assert!(matches!(table.get(k, false).unwrap(), L::Value(ref val) if val == v));
+      assert!(matches!(table.get(k, false, true).unwrap(), L::Value(ref val) if val == v));
     }
   }
 }

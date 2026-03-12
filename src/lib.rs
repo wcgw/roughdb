@@ -120,6 +120,8 @@ use crate::table::reader::{LookupResult, Table};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+pub mod cache;
+pub use cache::BlockCache;
 pub mod error;
 pub use error::Error;
 pub mod filter;
@@ -176,10 +178,9 @@ pub struct ReadOptions<'snap> {
   pub verify_checksums: bool,
 
   /// Cache blocks read during this operation in the block cache.
-  /// Set to `false` for bulk scans to avoid polluting the cache.
   ///
-  /// **Not yet implemented.** Accepted but ignored — there is no block cache yet, so all block
-  /// reads bypass caching unconditionally.
+  /// Set to `false` for bulk scans to avoid polluting the cache with data that
+  /// is unlikely to be re-read soon (e.g. `DbIter` full-table scans).
   ///
   /// Default: true.
   pub fill_cache: bool,
@@ -467,8 +468,12 @@ impl Db {
       .max_open_files
       .saturating_sub(crate::db::table_cache::NUM_NON_TABLE_CACHE_FILES)
       .max(1);
-    let table_cache =
-      crate::db::table_cache::TableCache::new(path, cache_capacity, options.filter_policy.clone());
+    let table_cache = crate::db::table_cache::TableCache::new(
+      path,
+      cache_capacity,
+      options.filter_policy.clone(),
+      options.block_cache.clone(),
+    );
 
     let (version_set, mem, last_sequence) = if db_exists {
       // ── Existing database: MANIFEST-driven recovery ──────────────────────
@@ -599,6 +604,7 @@ impl Db {
     };
 
     let verify_checksums = opts.verify_checksums || self.options.paranoid_checks;
+    let fill_cache = opts.fill_cache;
 
     match mem.get(key, sequence) {
       MemtableResult::Hit(v) => return Ok(v),
@@ -616,7 +622,13 @@ impl Db {
 
     if let Some(version) = version {
       if let Some(persistence) = &self.persistence {
-        match version.get(key, sequence, verify_checksums, &persistence.table_cache)? {
+        match version.get(
+          key,
+          sequence,
+          verify_checksums,
+          fill_cache,
+          &persistence.table_cache,
+        )? {
           LookupResult::Value(v) => return Ok(v),
           LookupResult::Deleted => return Err(Error::NotFound),
           LookupResult::NotInTable => {}
@@ -793,6 +805,7 @@ impl Db {
     };
 
     let verify_checksums = opts.verify_checksums || self.options.paranoid_checks;
+    let fill_cache = opts.fill_cache;
 
     let mut children: Vec<Box<dyn crate::iter::InternalIterator>> = Vec::new();
 
@@ -811,7 +824,7 @@ impl Db {
           let table = persistence
             .table_cache
             .get_or_open(meta.number, meta.file_size)?;
-          children.push(Box::new(table.new_iterator(verify_checksums)?));
+          children.push(Box::new(table.new_iterator(verify_checksums, fill_cache)?));
         }
       }
     }
@@ -1087,6 +1100,7 @@ fn write_flush(prep: FlushPrep, opts: &Options) -> Result<FlushResult, Error> {
     read_file,
     file_size,
     opts.filter_policy.clone(),
+    opts.block_cache.clone(),
   )?);
   Ok(FlushResult {
     file_number: sst_number,
@@ -1238,10 +1252,16 @@ fn finish_compaction_output(
   largest: Vec<u8>,
   outputs: &mut Vec<CompactionOutput>,
   filter_policy: Option<Arc<dyn crate::filter::FilterPolicy>>,
+  block_cache: Option<Arc<BlockCache>>,
 ) -> Result<(), Error> {
   let file_size = cur.builder.finish()?;
   let read_file = std::fs::File::open(&cur.path)?;
-  let table = Arc::new(Table::open(read_file, file_size, filter_policy)?);
+  let table = Arc::new(Table::open(
+    read_file,
+    file_size,
+    filter_policy,
+    block_cache,
+  )?);
   outputs.push(CompactionOutput {
     file_number: cur.file_number,
     file_size,
@@ -1279,7 +1299,8 @@ fn do_compaction(
   let mut children: Vec<Box<dyn InternalIterator>> = Vec::new();
   for meta in inputs {
     let table = tc.get_or_open(meta.number, meta.file_size)?;
-    children.push(Box::new(table.new_iterator(opts.paranoid_checks)?));
+    // Compaction is a bulk scan — don't pollute the block cache.
+    children.push(Box::new(table.new_iterator(opts.paranoid_checks, false)?));
   }
 
   let mut merger = MergingIterator::new(children);
@@ -1336,6 +1357,7 @@ fn do_compaction(
             std::mem::take(&mut current_largest),
             &mut outputs,
             opts.filter_policy.clone(),
+            opts.block_cache.clone(),
           )?;
         }
       }
@@ -1379,6 +1401,7 @@ fn do_compaction(
       current_largest,
       &mut outputs,
       opts.filter_policy.clone(),
+      opts.block_cache.clone(),
     )?;
   }
 

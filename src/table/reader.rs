@@ -10,6 +10,7 @@
 //    See the License for the specific language governing permissions and
 //    limitations under the License.
 
+use crate::cache::BlockCache;
 use crate::error::Error;
 use crate::filter::FilterPolicy;
 use crate::iter::InternalIterator;
@@ -52,6 +53,10 @@ pub(crate) struct Table {
   /// Parsed filter block, present when the SSTable was written with a filter
   /// policy whose name matches the one in the metaindex.
   filter: Option<FilterBlockReader>,
+  /// Unique ID assigned by the block cache; used as the high half of the cache key.
+  cache_id: u64,
+  /// Shared block cache, if configured via `Options::block_cache`.
+  block_cache: Option<Arc<BlockCache>>,
 }
 
 impl Table {
@@ -64,6 +69,7 @@ impl Table {
     file: File,
     file_size: u64,
     filter_policy: Option<Arc<dyn FilterPolicy>>,
+    block_cache: Option<Arc<BlockCache>>,
   ) -> Result<Self, Error> {
     if file_size < FOOTER_ENCODED_LENGTH as u64 {
       return Err(Error::Corruption("SSTable file too small".to_owned()));
@@ -86,18 +92,61 @@ impl Table {
         .flatten()
     });
 
+    // Claim a unique cache ID from the block cache (0 = no cache).
+    let cache_id = block_cache.as_ref().map(|c| c.new_id()).unwrap_or(0);
+
     Ok(Table {
       file,
       index_block,
       metaindex_offset: footer.metaindex_handle.offset,
       filter,
+      cache_id,
+      block_cache,
     })
+  }
+
+  /// Read (or retrieve from cache) the data block at `handle`.
+  ///
+  /// - Cache hit: returns a clone of the cached `Block` without any I/O.
+  /// - Cache miss: reads from disk, then inserts into the cache when `fill_cache` is `true`.
+  /// - No cache: reads from disk unconditionally.
+  fn read_data_block(
+    &self,
+    handle: &BlockHandle,
+    verify: bool,
+    fill_cache: bool,
+  ) -> Result<Block, Error> {
+    // Check the block cache first.
+    if let Some(cache) = &self.block_cache {
+      if let Some(block) = cache.get(self.cache_id, handle.offset) {
+        return Ok(block);
+      }
+    }
+
+    // Cache miss (or no cache): read from disk.
+    let contents = read_block(&self.file, handle, verify)?;
+    let block = Block::new(contents.data);
+
+    // Insert into the cache unless the caller asked us not to (e.g. bulk scan).
+    if fill_cache {
+      if let Some(cache) = &self.block_cache {
+        cache.insert(self.cache_id, handle.offset, block.clone());
+      }
+    }
+
+    Ok(block)
   }
 
   /// Look up `user_key` in the table, returning a [`LookupResult`].
   ///
   /// `verify_checksums`: when `true`, CRC32c is verified on every block read.
-  pub(crate) fn get(&self, user_key: &[u8], verify_checksums: bool) -> Result<LookupResult, Error> {
+  /// `fill_cache`: when `false`, a cache miss is not inserted into the block cache.
+  pub(crate) fn get(
+    &self,
+    user_key: &[u8],
+    verify_checksums: bool,
+    fill_cache: bool,
+  ) -> Result<LookupResult, Error> {
     use crate::table::format::{make_internal_key, parse_internal_key};
 
     // Construct a lookup internal key: user_key + tag(seq=u64::MAX >> 8, vtype=1).
@@ -123,9 +172,8 @@ impl Table {
       }
     }
 
-    // Read and scan the data block.
-    let contents = read_block(&self.file, &handle, verify_checksums)?;
-    let data_block = Block::new(contents.data);
+    // Read (or fetch from cache) the data block.
+    let data_block = self.read_data_block(&handle, verify_checksums, fill_cache)?;
     let mut it = data_block.iter();
     it.seek(&lookup_key);
 
@@ -178,14 +226,40 @@ impl Table {
   ///
   /// The iterator clones the file handle (cheap `dup(2)`) so it can read data
   /// blocks on demand without holding a reference to `self`.
-  pub(crate) fn new_iterator(&self, verify_checksums: bool) -> Result<TwoLevelIterator, Error> {
+  ///
+  /// `fill_cache`: when `false`, data blocks read by this iterator are not inserted
+  /// into the block cache (useful for bulk scans such as compaction).
+  pub(crate) fn new_iterator(
+    &self,
+    verify_checksums: bool,
+    fill_cache: bool,
+  ) -> Result<TwoLevelIterator, Error> {
     use crate::table::two_level_iterator::BlockFn;
     let file = self.file.try_clone()?;
+    let block_cache = self.block_cache.clone();
+    let cache_id = self.cache_id;
     let index_iter: Box<dyn InternalIterator> = Box::new(self.index_block.iter());
     let block_fn: BlockFn = Box::new(move |handle_value: &[u8]| {
       let (handle, _) = BlockHandle::decode_from(handle_value)?;
+
+      // Check block cache first.
+      if let Some(cache) = &block_cache {
+        if let Some(block) = cache.get(cache_id, handle.offset) {
+          return Ok(Box::new(block.iter()) as Box<dyn InternalIterator>);
+        }
+      }
+
+      // Read from disk.
       let contents = read_block(&file, &handle, verify_checksums)?;
-      Ok(Box::new(Block::new(contents.data).iter()) as Box<dyn InternalIterator>)
+      let block = Block::new(contents.data);
+
+      if fill_cache {
+        if let Some(cache) = &block_cache {
+          cache.insert(cache_id, handle.offset, block.clone());
+        }
+      }
+
+      Ok(Box::new(block.iter()) as Box<dyn InternalIterator>)
     });
     Ok(TwoLevelIterator::new(index_iter, block_fn))
   }
@@ -285,16 +359,18 @@ mod tests {
   #[test]
   fn open_and_get_user_key() {
     let (tmp, size) = write_table_internal(&[(b"hello", 1, 1, b"world")]);
-    let table = Table::open(tmp.reopen().unwrap(), size, None).unwrap();
-    assert!(matches!(table.get(b"hello", false).unwrap(), LookupResult::Value(v) if v == b"world"));
+    let table = Table::open(tmp.reopen().unwrap(), size, None, None).unwrap();
+    assert!(
+      matches!(table.get(b"hello", false, true).unwrap(), LookupResult::Value(v) if v == b"world")
+    );
   }
 
   #[test]
   fn get_missing_key() {
     let (tmp, size) = write_table_internal(&[(b"a", 1, 1, b"1")]);
-    let table = Table::open(tmp.reopen().unwrap(), size, None).unwrap();
+    let table = Table::open(tmp.reopen().unwrap(), size, None, None).unwrap();
     assert!(matches!(
-      table.get(b"z", false).unwrap(),
+      table.get(b"z", false, true).unwrap(),
       LookupResult::NotInTable
     ));
   }
@@ -303,9 +379,9 @@ mod tests {
   fn get_tombstone_returns_deleted() {
     // vtype=0 is a deletion tombstone — must return Deleted, not NotInTable.
     let (tmp, size) = write_table_internal(&[(b"gone", 1, 0, b"")]);
-    let table = Table::open(tmp.reopen().unwrap(), size, None).unwrap();
+    let table = Table::open(tmp.reopen().unwrap(), size, None, None).unwrap();
     assert!(matches!(
-      table.get(b"gone", false).unwrap(),
+      table.get(b"gone", false, true).unwrap(),
       LookupResult::Deleted
     ));
   }
@@ -313,16 +389,18 @@ mod tests {
   #[test]
   fn get_newest_version_wins() {
     let (tmp, size) = write_table_internal(&[(b"key", 10, 1, b"new"), (b"key", 5, 1, b"old")]);
-    let table = Table::open(tmp.reopen().unwrap(), size, None).unwrap();
-    assert!(matches!(table.get(b"key", false).unwrap(), LookupResult::Value(v) if v == b"new"));
+    let table = Table::open(tmp.reopen().unwrap(), size, None, None).unwrap();
+    assert!(
+      matches!(table.get(b"key", false, true).unwrap(), LookupResult::Value(v) if v == b"new")
+    );
   }
 
   #[test]
   fn verify_checksums_passes_on_valid_block() {
     let (tmp, size) = write_table_internal(&[(b"k", 1, 1, b"v")]);
-    let table = Table::open(tmp.reopen().unwrap(), size, None).unwrap();
+    let table = Table::open(tmp.reopen().unwrap(), size, None, None).unwrap();
     assert!(matches!(
-      table.get(b"k", true).unwrap(),
+      table.get(b"k", true, true).unwrap(),
       LookupResult::Value(_)
     ));
   }
@@ -332,7 +410,7 @@ mod tests {
     let tmp = tempfile::NamedTempFile::new().unwrap();
     std::io::Write::write_all(&mut tmp.reopen().unwrap(), &[0u8; 10]).unwrap();
     assert!(matches!(
-      Table::open(tmp.reopen().unwrap(), 10, None),
+      Table::open(tmp.reopen().unwrap(), 10, None, None),
       Err(Error::Corruption(_))
     ));
   }

@@ -51,12 +51,13 @@ impl Version {
     user_key: &[u8],
     _sequence: u64,
     verify_checksums: bool,
+    fill_cache: bool,
     tc: &TableCache,
   ) -> Result<LookupResult, Error> {
     // L0: newest-first scan.
     for meta in &self.files[0] {
       let table = tc.get_or_open(meta.number, meta.file_size)?;
-      match table.get(user_key, verify_checksums)? {
+      match table.get(user_key, verify_checksums, fill_cache)? {
         LookupResult::Value(v) => return Ok(LookupResult::Value(v)),
         LookupResult::Deleted => return Ok(LookupResult::Deleted),
         LookupResult::NotInTable => {}
@@ -67,7 +68,7 @@ impl Version {
     for level in 1..NUM_LEVELS {
       for meta in &self.files[level] {
         let table = tc.get_or_open(meta.number, meta.file_size)?;
-        match table.get(user_key, verify_checksums)? {
+        match table.get(user_key, verify_checksums, fill_cache)? {
           LookupResult::Value(v) => return Ok(LookupResult::Value(v)),
           LookupResult::Deleted => return Ok(LookupResult::Deleted),
           LookupResult::NotInTable => {}

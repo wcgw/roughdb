@@ -21,6 +21,7 @@ use std::sync::Arc;
 /// The raw `data` slice holds the serialised entries followed by the restart
 /// point array and a 4-byte count.  `Block::iter()` returns a `BlockIter`
 /// that decodes entries on the fly.  See `table/block.h/cc`.
+#[derive(Clone)]
 pub(crate) struct Block {
   /// Block data shared with iterators via `Arc` (zero-copy `iter()`).
   data: Arc<Vec<u8>>,
@@ -49,6 +50,11 @@ impl Block {
       restarts_offset,
       num_restarts,
     }
+  }
+
+  /// Return the raw block data bytes (used by the block cache for charge accounting).
+  pub(crate) fn data(&self) -> &[u8] {
+    &self.data
   }
 
   /// Return an iterator over this block's entries.

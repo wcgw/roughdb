@@ -62,8 +62,8 @@ pub struct Options {
 
   /// Maximum number of simultaneously open file descriptors.
   ///
-  /// **Not yet implemented.** Accepted but ignored — there is no table cache yet, so all SSTable
-  /// file handles stay open for the lifetime of the database regardless of this value.
+  /// Controls the capacity of the table cache: `max_open_files - 10` SSTable file handles
+  /// are kept open at once (LRU eviction when at capacity).
   ///
   /// Default: 1 000.
   pub max_open_files: usize,
@@ -115,6 +115,20 @@ pub struct Options {
   ///
   /// Default: `None` (no filter).
   pub filter_policy: Option<std::sync::Arc<dyn crate::filter::FilterPolicy>>,
+
+  // ── Cache ────────────────────────────────────────────────────────────────
+  /// Shared LRU block cache for decompressed SSTable data blocks.
+  ///
+  /// Hot data blocks are cached here so repeated reads of the same block
+  /// avoid repeated decompression and disk I/O.  The cache is shared across
+  /// all SSTable files opened by this database.
+  ///
+  /// Set to `None` to disable the block cache entirely (useful when the
+  /// working set does not fit in memory and caching would just churn).
+  ///
+  /// Default: 8 MiB.  Call [`BlockCache::new`](crate::BlockCache::new) to
+  /// create one with a custom capacity, or share a cache across databases.
+  pub block_cache: Option<std::sync::Arc<crate::cache::BlockCache>>,
 }
 
 impl Default for Options {
@@ -131,6 +145,9 @@ impl Default for Options {
       compression: CompressionType::Snappy,
       reuse_logs: false,
       filter_policy: None,
+      block_cache: Some(std::sync::Arc::new(crate::cache::BlockCache::new(
+        crate::cache::DEFAULT_BLOCK_CACHE_CAPACITY,
+      ))),
     }
   }
 }
@@ -151,6 +168,10 @@ impl std::fmt::Debug for Options {
       .field(
         "filter_policy",
         &self.filter_policy.as_ref().map(|p| p.name()),
+      )
+      .field(
+        "block_cache",
+        &self.block_cache.as_ref().map(|_| "<BlockCache>"),
       )
       .finish()
   }

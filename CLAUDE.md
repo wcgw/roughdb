@@ -340,11 +340,14 @@ what remains is compaction, the full Iterator/Snapshot API, and operational hygi
   `table_cache: Option<TableCache>` (None for in-memory). See `db/table_cache.h/cc`.
 - ✅ **`Options::max_open_files`**: Fully wired via `TableCache`. Capacity =
   `max_open_files.saturating_sub(NUM_NON_TABLE_CACHE_FILES).max(1)`. See `db/db_impl.cc: DBImpl::Open`.
-- **Block cache**: Sharded LRU (`src/cache/lru.rs`) with two lists per shard (in-use / evictable), custom deleters,
-  capacity-based eviction. Default 8 MB. Required by `Table` reader to cache hot data blocks. See `util/cache.cc`.
-- **`ReadOptions::fill_cache`**: Currently accepted but ignored — no block cache exists. Once implemented,
-  `fill_cache = false` should skip inserting blocks into the cache on reads (useful for bulk scans).
-  Wire into `read_block` and the `TwoLevelIterator` block-opener closure.
+- ✅ **Block cache**: Simple LRU `BlockCache` (`src/cache/mod.rs`) keyed by `(cache_id, block_offset)`. Per-table
+  `cache_id` from `AtomicU64` prevents cross-file collisions. `Block` is `Clone` (wraps `Arc<Vec<u8>>`), so cache
+  hits return a cheap clone. `Table` holds `cache_id: u64` + `Option<Arc<BlockCache>>`; `read_data_block` checks
+  cache on hit, reads from disk on miss, inserts when `fill_cache = true`. `new_iterator` block-opener closure
+  similarly checks/inserts the cache. Default: 8 MiB (`Options::block_cache`). See `util/cache.cc`.
+- ✅ **`ReadOptions::fill_cache`**: Fully wired. `fill_cache = false` skips inserting blocks into the block cache
+  (used by `do_compaction` to avoid polluting the cache with bulk-scan data). Threaded through `Db::get_with_options`,
+  `Db::new_iterator`, `Version::get`, `Table::get`, and `Table::new_iterator`.
 - **Batch-grouped writes**: Multiple concurrent `Db::write` callers are grouped by a leader that writes a single
   combined WAL record and memtable batch, amortising `fsync` cost over many writers. Transparent to callers; the
   current single-writer-at-a-time path is correct. See `db/db_impl.cc: DBImpl::Write`.
