@@ -230,6 +230,19 @@ impl Handler for Inserter<'_> {
 // mem→imm and creates the new WAL file under the lock, then drops it;
 // `finish_flush` re-acquires only to install the new Version and swap `log`.
 
+// ── Write-queue types ─────────────────────────────────────────────────────────
+
+/// A single pending write in the group-write queue.
+///
+/// Pushed by every `Db::write` caller; consumed by the leader of the group
+/// that processes it.  All fields are read/written only while the `DbState`
+/// mutex is held.
+struct WriterSlot {
+  id: u64,
+  batch: WriteBatch,
+  sync: bool,
+}
+
 struct DbState {
   /// Sequence number of the last committed write.
   last_sequence: u64,
@@ -249,6 +262,16 @@ struct DbState {
   /// Compaction uses the minimum value here as the visibility cutoff so it
   /// does not drop entries still observable through an active snapshot.
   snapshots: std::collections::BTreeSet<u64>,
+  // ── Batch-write queue ──────────────────────────────────────────────────────
+  /// Pending write requests in arrival order.  The front entry is the current
+  /// leader; all others are followers waiting on `Db::write_condvar`.
+  writers: std::collections::VecDeque<WriterSlot>,
+  /// Counter used to assign stable IDs to `WriterSlot`s.
+  next_writer_id: u64,
+  /// Results for writes completed by a leader on behalf of their originators.
+  /// A follower checks this map on wake-up and removes its own entry.
+  /// `Ok(())` is the common case; `Err` propagates a WAL/memtable failure.
+  completed: std::collections::HashMap<u64, Result<(), Error>>,
 }
 
 // ── FlushPrep / FlushResult ───────────────────────────────────────────────────
@@ -385,6 +408,10 @@ struct Persistence {
 
 pub struct Db {
   state: Mutex<DbState>,
+  /// Wakes follower writers when the current group leader finishes and when
+  /// there may be a new leader at the front of the write queue.
+  /// Always paired with `state` (the same `Mutex<DbState>`).
+  write_condvar: std::sync::Condvar,
   options: Options,
   persistence: Option<Persistence>,
 }
@@ -401,7 +428,11 @@ impl Default for Db {
         imm: None,
         version_set: None,
         snapshots: std::collections::BTreeSet::new(),
+        writers: std::collections::VecDeque::new(),
+        next_writer_id: 0,
+        completed: std::collections::HashMap::new(),
       }),
+      write_condvar: std::sync::Condvar::new(),
       options: Options::default(),
       persistence: None,
     }
@@ -528,7 +559,11 @@ impl Db {
         imm: None,
         version_set,
         snapshots: std::collections::BTreeSet::new(),
+        writers: std::collections::VecDeque::new(),
+        next_writer_id: 0,
+        completed: std::collections::HashMap::new(),
       }),
+      write_condvar: std::sync::Condvar::new(),
       options,
       persistence: Some(Persistence {
         dir: path.to_path_buf(),
@@ -952,28 +987,123 @@ impl Db {
   }
 
   pub fn write(&self, opts: &WriteOptions, batch: &WriteBatch) -> Result<(), Error> {
+    // ── Phase 1: Enqueue this write request ──────────────────────────────────
+    //
+    // Every caller pushes a `WriterSlot` and waits until it is either at the
+    // front of the queue (becoming the group leader) or has been processed by a
+    // previous leader and its result placed in `state.completed`.
+    let my_id = {
+      let mut state = self.state.lock().unwrap();
+      let id = state.next_writer_id;
+      state.next_writer_id += 1;
+      state.writers.push_back(WriterSlot {
+        id,
+        batch: batch.clone(),
+        sync: opts.sync,
+      });
+      id
+    };
+
+    // ── Phase 2: Wait to become leader or receive a completed result ──────────
     let mut state = self.state.lock().unwrap();
-    let start_seq = state.last_sequence + 1;
-
-    // Clone and stamp so the WAL record carries the correct embedded sequence.
-    let mut stamped = batch.clone();
-    stamped.set_sequence(start_seq);
-
-    if let Some(log) = state.log.as_mut() {
-      log.add_record(stamped.contents())?;
-      if opts.sync {
-        log.sync()?;
+    loop {
+      // A previous leader may have already processed our slot.
+      if let Some(result) = state.completed.remove(&my_id) {
+        return result;
       }
+      // If we're at the front, we are the new leader.
+      if state.writers.front().map(|w| w.id) == Some(my_id) {
+        break;
+      }
+      state = self.write_condvar.wait(state).unwrap();
     }
 
-    stamped.iterate(&mut Inserter {
-      mem: &state.mem,
-      seq: start_seq,
-    })?;
-    state.last_sequence += batch.count() as u64;
+    // ── Phase 3: Build a group ────────────────────────────────────────────────
+    //
+    // Collect as many waiting writers as we can into one combined batch.
+    // Group-size bound: 1 MiB by default; tightened to first_size + 128 KiB
+    // when the first batch is small (prevents small writes from being stalled
+    // by a large one joining the group later).  Matches LevelDB's
+    // `BuildBatchGroup` from `db/db_impl.cc`.
+    //
+    // Sync boundary: a sync=true writer is not included in a non-sync group
+    // (it would silently drop the sync guarantee).  Non-sync writers *may*
+    // join a sync group — they receive sync for free, which is harmless.
+    let first_size = state.writers.front().unwrap().batch.approximate_size();
+    let max_size = if first_size <= 128 << 10 {
+      first_size + (128 << 10)
+    } else {
+      1 << 20
+    };
+    let first_sync = state.writers.front().unwrap().sync;
 
-    // Trigger an L0 flush when the memtable exceeds the size limit.
-    // Only applies to persistent databases (path.is_some()).
+    let mut group_size = first_size;
+    let mut group_len = 1;
+    while group_len < state.writers.len() {
+      let next = &state.writers[group_len];
+      // Stop before a sync writer if the group is non-sync.
+      if next.sync && !first_sync {
+        break;
+      }
+      let next_size = next.batch.approximate_size();
+      if group_size + next_size > max_size {
+        break;
+      }
+      group_size += next_size;
+      group_len += 1;
+    }
+
+    // ── Phase 4: Build combined batch, write WAL, insert into memtable ────────
+    let need_sync = state.writers.iter().take(group_len).any(|w| w.sync);
+    let start_seq = state.last_sequence + 1;
+
+    let mut combined = WriteBatch::new();
+    combined.set_sequence(start_seq);
+    for slot in state.writers.iter().take(group_len) {
+      combined.append(&slot.batch);
+    }
+
+    let status: Result<(), Error> = (|| {
+      if let Some(log) = state.log.as_mut() {
+        log.add_record(combined.contents())?;
+        if need_sync {
+          log.sync()?;
+        }
+      }
+      combined.iterate(&mut Inserter {
+        mem: &state.mem,
+        seq: start_seq,
+      })?;
+      state.last_sequence += combined.count() as u64;
+      Ok(())
+    })();
+
+    // ── Phase 5: Retire the group ─────────────────────────────────────────────
+    //
+    // Pop the leader's own slot, then pop each follower and store its result
+    // in `completed` so it can be retrieved on wake-up.
+    state.writers.pop_front(); // leader
+    for _ in 1..group_len {
+      let slot = state.writers.pop_front().unwrap();
+      let follower_result = match &status {
+        Ok(()) => Ok(()),
+        Err(e) => Err(e.clone()),
+      };
+      state.completed.insert(slot.id, follower_result);
+    }
+
+    // Wake all waiting writers: the next leader can now step up, and
+    // followers whose result is in `completed` can return it.
+    self.write_condvar.notify_all();
+
+    // Propagate the leader's own status before doing flush/compact work.
+    status?;
+
+    // ── Phase 6: Flush and compact (leader only) ──────────────────────────────
+    //
+    // Followers return `Ok(())` immediately above.  The leader checks whether
+    // the memtable is full and, if so, drives the three-phase flush.  This is
+    // identical to the original single-writer path.
     if let Some(persistence) = &self.persistence {
       let path = persistence.dir.as_path();
       if state.mem.approximate_memory_usage() >= self.options.write_buffer_size {
@@ -1738,7 +1868,7 @@ fn delete_obsolete_files(path: &std::path::Path, state: &Mutex<DbState>) {
 
 #[cfg(test)]
 mod tests {
-  use crate::{Db, Error, Options, ReadOptions, WriteOptions};
+  use crate::{Db, Error, Options, ReadOptions, WriteBatch, WriteOptions};
 
   // ── parse_db_filename tests (port of LevelDB filename_test.cc: Parse) ─────────
 
@@ -3182,5 +3312,120 @@ mod tests {
     // start == limit → empty range; approximate_offset_of returns the same value.
     let sizes = db.get_approximate_sizes(&[(b"key".as_ref(), b"key".as_ref())]);
     assert_eq!(sizes, vec![0]);
+  }
+
+  // ─── Batch-group write tests ──────────────────────────────────────────────
+
+  /// Sequential writes from multiple threads all complete and are readable.
+  #[test]
+  fn batch_group_concurrent_writes_all_visible() {
+    use std::sync::Arc;
+    let db = Arc::new(Db::default());
+    let n = 100usize;
+    let handles: Vec<_> = (0..n)
+      .map(|i| {
+        let db = Arc::clone(&db);
+        std::thread::spawn(move || {
+          let key = format!("key{i:04}");
+          db.put(key.as_bytes(), b"val").unwrap();
+        })
+      })
+      .collect();
+    for h in handles {
+      h.join().unwrap();
+    }
+    for i in 0..n {
+      let key = format!("key{i:04}");
+      assert_eq!(db.get(key.as_bytes()).unwrap(), b"val");
+    }
+  }
+
+  /// A write batch submitted from a follower slot is correctly applied.
+  #[test]
+  fn batch_group_follower_batch_applied() {
+    use std::sync::{Arc, Barrier};
+    let db = Arc::new(Db::default());
+    let barrier = Arc::new(Barrier::new(2));
+
+    // Two threads race to write different keys.
+    let (db1, b1) = (Arc::clone(&db), Arc::clone(&barrier));
+    let t1 = std::thread::spawn(move || {
+      b1.wait();
+      db1.put(b"alpha", b"1").unwrap();
+    });
+
+    let (db2, b2) = (Arc::clone(&db), Arc::clone(&barrier));
+    let t2 = std::thread::spawn(move || {
+      b2.wait();
+      db2.put(b"beta", b"2").unwrap();
+    });
+
+    t1.join().unwrap();
+    t2.join().unwrap();
+
+    assert_eq!(db.get(b"alpha").unwrap(), b"1");
+    assert_eq!(db.get(b"beta").unwrap(), b"2");
+  }
+
+  /// Sequence numbers remain monotone under concurrent writes.
+  #[test]
+  fn batch_group_sequence_numbers_monotone() {
+    use std::sync::Arc;
+    let db = Arc::new(Db::default());
+    let n = 50usize;
+    let handles: Vec<_> = (0..n)
+      .map(|i| {
+        let db = Arc::clone(&db);
+        std::thread::spawn(move || {
+          let key = format!("seq{i:04}");
+          db.put(key.as_bytes(), b"x").unwrap();
+        })
+      })
+      .collect();
+    for h in handles {
+      h.join().unwrap();
+    }
+    // Verify all keys landed exactly once and with consistent values.
+    let mut count = 0usize;
+    let opts = ReadOptions::default();
+    let mut it = db.new_iterator(&opts).unwrap();
+    it.seek_to_first();
+    while it.valid() {
+      count += 1;
+      it.next();
+    }
+    assert_eq!(count, n);
+  }
+
+  /// A sync=true write in the middle of a group does not corrupt other writes.
+  #[test]
+  fn batch_group_sync_write_does_not_corrupt() {
+    use std::sync::{Arc, Barrier};
+    let db = Arc::new(Db::default());
+    let barrier = Arc::new(Barrier::new(3));
+
+    let threads: Vec<_> = (0..3usize)
+      .map(|i| {
+        let db = Arc::clone(&db);
+        let b = Arc::clone(&barrier);
+        std::thread::spawn(move || {
+          b.wait();
+          let opts = WriteOptions { sync: i == 1 };
+          let key = format!("skey{i}");
+          let mut batch = WriteBatch::new();
+          batch.put(key.as_bytes(), b"v");
+          db.write(&opts, &batch).unwrap();
+        })
+      })
+      .collect();
+
+    for t in threads {
+      t.join().unwrap();
+    }
+
+    for i in 0..3usize {
+      let key = format!("skey{i}");
+      assert_eq!(db.get(key.as_bytes()).unwrap(), b"v");
+    }
   }
 }

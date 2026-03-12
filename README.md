@@ -157,10 +157,10 @@ RoughDB is in active development. The on-disk format is LevelDB-compatible.
 - `LOCK` file — prevents concurrent opens by multiple processes
 - Table cache — LRU open-file-handle cache bounded by `Options::max_open_files`
 - Block cache
+- Batch-grouped writes
 
 **Not yet implemented:**
 
-- Batch-grouped writes (writes are serialised one at a time)
 - Custom comparators
 
 ## License

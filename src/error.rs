@@ -54,3 +54,16 @@ impl From<std::io::Error> for Error {
     Error::IoError(e)
   }
 }
+
+impl Clone for Error {
+  fn clone(&self) -> Self {
+    match self {
+      Error::NotFound => Error::NotFound,
+      Error::Corruption(s) => Error::Corruption(s.clone()),
+      Error::InvalidArgument(s) => Error::InvalidArgument(s.clone()),
+      Error::NotSupported(s) => Error::NotSupported(s.clone()),
+      // `std::io::Error` isn't Clone; preserve kind + message.
+      Error::IoError(e) => Error::IoError(std::io::Error::new(e.kind(), e.to_string())),
+    }
+  }
+}

@@ -348,9 +348,14 @@ what remains is compaction, the full Iterator/Snapshot API, and operational hygi
 - ✅ **`ReadOptions::fill_cache`**: Fully wired. `fill_cache = false` skips inserting blocks into the block cache
   (used by `do_compaction` to avoid polluting the cache with bulk-scan data). Threaded through `Db::get_with_options`,
   `Db::new_iterator`, `Version::get`, `Table::get`, and `Table::new_iterator`.
-- **Batch-grouped writes**: Multiple concurrent `Db::write` callers are grouped by a leader that writes a single
-  combined WAL record and memtable batch, amortising `fsync` cost over many writers. Transparent to callers; the
-  current single-writer-at-a-time path is correct. See `db/db_impl.cc: DBImpl::Write`.
+- ✅ **Batch-grouped writes**: Multiple concurrent `Db::write` callers are grouped by a leader that writes a single
+  combined WAL record and memtable batch, amortising `fsync` cost over many writers. `DbState` holds
+  `writers: VecDeque<WriterSlot>`, `next_writer_id: u64`, and `completed: HashMap<u64, Result<(), Error>>`;
+  `Db` holds `write_condvar: Condvar` (paired with `Mutex<DbState>`). Group bounds match LevelDB's
+  `BuildBatchGroup`: max 1 MiB; tightened to `first_size + 128 KiB` when the first batch is ≤ 128 KiB; a
+  `sync=true` writer won't join a non-sync group. Leader pops followers, stores results in `completed`, calls
+  `notify_all`; followers retrieve their result by `id` and return. Leader handles flush/compaction after.
+  See `db/db_impl.cc: DBImpl::Write`.
 - **Custom comparator**: Wire `Options::comparator` through to all key-comparison sites (skip list, block seek,
   compaction). Currently hardcoded bytewise. Needed to use RoughDB as a sorted map on non-lexicographic keys.
   See `include/leveldb/comparator.h`.
