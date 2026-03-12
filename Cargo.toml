@@ -2,10 +2,12 @@
 name = "roughdb"
 description = "Embedded persistent key-value store — a LevelDB port to Rust with a compatible on-disk format"
 license = "Apache-2.0"
-version = "0.2.0"
+version = "0.3.0"
 edition = '2021'
 repository = "https://github.com/wcgw/roughdb/"
 authors = ["Alex Snaps <alex@wcgw.dev>"]
+categories = ["database-implementations"]
+keywords = ["database", "levelDB", "persistence"]
 
 [dependencies]
 bumpalo = "3.20.2"
