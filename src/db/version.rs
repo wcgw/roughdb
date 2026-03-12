@@ -30,12 +30,19 @@ pub(crate) const NUM_LEVELS: usize = 7;
 #[derive(Clone)]
 pub(crate) struct Version {
   pub files: [Vec<Arc<FileMetaData>>; NUM_LEVELS],
+  /// Best compaction score across all levels.  -1.0 before `finalize` is called.
+  /// Score ≥ 1.0 means this level should be compacted.
+  pub compaction_score: f64,
+  /// Level with the highest compaction score.  -1 before `finalize` is called.
+  pub compaction_level: i32,
 }
 
 impl Version {
   pub(crate) fn new() -> Self {
     Version {
       files: std::array::from_fn(|_| Vec::new()),
+      compaction_score: -1.0,
+      compaction_level: -1,
     }
   }
 
@@ -149,6 +156,49 @@ impl Version {
     }
     out
   }
+}
+
+// ── Compaction score helpers ──────────────────────────────────────────────────
+
+/// Maximum total bytes allowed at a given level (L1+).
+///
+/// L1 = 10 MiB, L2 = 100 MiB, L3 = 1 GiB, …  (×10 per level).
+/// L0 uses a file-count threshold, not byte size.
+pub(crate) fn max_bytes_for_level(level: usize) -> f64 {
+  let mut result = 10.0 * 1_048_576.0_f64; // 10 MiB
+  let mut l = level;
+  while l > 1 {
+    result *= 10.0;
+    l -= 1;
+  }
+  result
+}
+
+/// Compute and store the highest compaction score across all levels in `version`.
+///
+/// Must be called on an owned `Version` before it is wrapped in `Arc`.
+///
+/// `l0_trigger` is the L0 file-count threshold (matches `L0_COMPACTION_TRIGGER`
+/// in `src/lib.rs`).
+pub(crate) fn finalize(version: &mut Version, l0_trigger: usize) {
+  let mut best_level = -1i32;
+  let mut best_score = -1.0f64;
+
+  for level in 0..(NUM_LEVELS - 1) {
+    let score = if level == 0 {
+      version.files[0].len() as f64 / l0_trigger as f64
+    } else {
+      let bytes: u64 = version.files[level].iter().map(|f| f.file_size).sum();
+      bytes as f64 / max_bytes_for_level(level)
+    };
+    if score > best_score {
+      best_score = score;
+      best_level = level as i32;
+    }
+  }
+
+  version.compaction_score = best_score;
+  version.compaction_level = best_level;
 }
 
 /// Render an internal key as an escaped user-key string.

@@ -1119,17 +1119,18 @@ impl Db {
         drop(state);
         // Phase 4: delete obsolete files (lock released; best-effort).
         delete_obsolete_files(path, &self.state);
-        // Phase 5: compact L0 → L1 if we've hit the trigger.  Loop so that a
-        // burst of flushes that accumulates more than one compaction's worth of
-        // L0 files still gets drained before returning to the caller.
+        // Phase 5: compact any level that needs it.  Loop so that a burst of
+        // flushes that accumulates more than one compaction's worth of files at
+        // a level still gets drained before returning to the caller.
         for _ in 0..32 {
-          let l0 = {
+          let (needs, l0) = {
             let g = self.state.lock().unwrap();
-            g.version_set
-              .as_ref()
-              .map_or(0, |vs| vs.current().files[0].len())
+            let version = g.version_set.as_ref().map(|vs| vs.current());
+            let needs = version.as_ref().is_some_and(|v| needs_compaction(v));
+            let l0 = version.as_ref().map_or(0, |v| v.files[0].len());
+            (needs, l0)
           };
-          if l0 < L0_COMPACTION_TRIGGER {
+          if !needs {
             break;
           }
           // Slow-write throttle: yield briefly when L0 is piling up but hasn't
@@ -1290,6 +1291,10 @@ fn finish_flush(
 // Tombstone elision: deletion markers are dropped when there is definitely no
 // data for that key below the output level (L2+).
 
+// L0_COMPACTION_TRIGGER is referenced in tests and as a documentation anchor;
+// `needs_compaction` uses `compaction_score` so the constant itself is only
+// used in tests.
+#[allow(dead_code)]
 const L0_COMPACTION_TRIGGER: usize = 4;
 const L0_SLOWDOWN_WRITES_TRIGGER: usize = 8;
 
@@ -1306,6 +1311,241 @@ fn ikey_user_key(ikey: &[u8]) -> &[u8] {
 /// True if the user-key ranges [a_s..a_l] and [b_s..b_l] overlap.
 fn key_ranges_overlap(a_s: &[u8], a_l: &[u8], b_s: &[u8], b_l: &[u8]) -> bool {
   ikey_user_key(a_s) <= ikey_user_key(b_l) && ikey_user_key(b_s) <= ikey_user_key(a_l)
+}
+
+// ── Geometry helpers ──────────────────────────────────────────────────────────
+
+/// User-key range union of a non-empty slice of files.
+///
+/// Returns `(smallest_internal_key, largest_internal_key)` spanning all files.
+fn get_range(files: &[Arc<FileMetaData>]) -> (Vec<u8>, Vec<u8>) {
+  debug_assert!(!files.is_empty());
+  let mut smallest = files[0].smallest.clone();
+  let mut largest = files[0].largest.clone();
+  for f in files.iter().skip(1) {
+    if ikey_user_key(&f.smallest) < ikey_user_key(&smallest) {
+      smallest = f.smallest.clone();
+    }
+    if ikey_user_key(&f.largest) > ikey_user_key(&largest) {
+      largest = f.largest.clone();
+    }
+  }
+  (smallest, largest)
+}
+
+/// Union of the key ranges of two slices of files (either may be empty).
+fn get_range2(a: &[Arc<FileMetaData>], b: &[Arc<FileMetaData>]) -> (Vec<u8>, Vec<u8>) {
+  if b.is_empty() {
+    return get_range(a);
+  }
+  if a.is_empty() {
+    return get_range(b);
+  }
+  let (s1, l1) = get_range(a);
+  let (s2, l2) = get_range(b);
+  let smallest = if ikey_user_key(&s1) <= ikey_user_key(&s2) {
+    s1
+  } else {
+    s2
+  };
+  let largest = if ikey_user_key(&l1) >= ikey_user_key(&l2) {
+    l1
+  } else {
+    l2
+  };
+  (smallest, largest)
+}
+
+/// Total on-disk bytes across a slice of files.
+fn total_file_size(files: &[Arc<FileMetaData>]) -> u64 {
+  files.iter().map(|f| f.file_size).sum()
+}
+
+/// Files at `level` whose user-key range overlaps `[begin_uk, end_uk]`.
+///
+/// For L0, the result may expand the input range (L0 files can overlap each
+/// other), so the scan repeats until stable.  For L1+, files are
+/// non-overlapping and sorted, so a single linear pass suffices.
+///
+/// `begin_uk` and `end_uk` are bare user keys (no internal key suffix).
+fn get_overlapping_inputs(
+  version: &crate::db::version::Version,
+  level: usize,
+  begin_uk: &[u8],
+  end_uk: &[u8],
+) -> Vec<Arc<FileMetaData>> {
+  let mut result: Vec<Arc<FileMetaData>> = Vec::new();
+  let mut lo = begin_uk.to_vec();
+  let mut hi = end_uk.to_vec();
+
+  loop {
+    result.clear();
+    let prev_lo = lo.clone();
+    let prev_hi = hi.clone();
+    for f in &version.files[level] {
+      let f_lo = ikey_user_key(&f.smallest);
+      let f_hi = ikey_user_key(&f.largest);
+      if f_hi < lo.as_slice() || f_lo > hi.as_slice() {
+        continue; // no overlap
+      }
+      result.push(Arc::clone(f));
+      if level == 0 {
+        // Expand range to cover this file.
+        if f_lo < lo.as_slice() {
+          lo = f_lo.to_vec();
+        }
+        if f_hi > hi.as_slice() {
+          hi = f_hi.to_vec();
+        }
+      }
+    }
+    if level > 0 || (lo == prev_lo && hi == prev_hi) {
+      break;
+    }
+  }
+  result
+}
+
+/// Extend `compaction_files` with any file in `version.files[level]` that
+/// shares a user key with the current largest key in `compaction_files` (at a
+/// different sequence number).
+///
+/// This prevents a compaction from splitting entries for the same user key
+/// across two output SSTables.  Port of LevelDB's `AddBoundaryInputs`.
+fn add_boundary_inputs(
+  version: &crate::db::version::Version,
+  level: usize,
+  compaction_files: &mut Vec<Arc<FileMetaData>>,
+) {
+  use crate::table::format::cmp_internal_keys;
+
+  loop {
+    // Find the largest internal key in the current compaction set.
+    let largest = match compaction_files
+      .iter()
+      .max_by(|a, b| cmp_internal_keys(&a.largest, &b.largest))
+    {
+      Some(f) => f.largest.clone(),
+      None => return,
+    };
+    let largest_uk = ikey_user_key(&largest).to_vec();
+
+    // Find the smallest file in version.files[level] whose smallest key has
+    // the same user key as `largest_uk` but a strictly greater internal key
+    // (i.e., same user key, lower sequence number), and isn't already in the
+    // compaction set.
+    let boundary = version.files[level]
+      .iter()
+      .filter(|f| {
+        let f_uk = ikey_user_key(&f.smallest);
+        f_uk == largest_uk.as_slice()
+          && cmp_internal_keys(&f.smallest, &largest) == std::cmp::Ordering::Greater
+          && !compaction_files.iter().any(|c| c.number == f.number)
+      })
+      .min_by(|a, b| cmp_internal_keys(&a.smallest, &b.smallest));
+
+    match boundary {
+      Some(f) => compaction_files.push(Arc::clone(f)),
+      None => return,
+    }
+  }
+}
+
+// ── CompactionSpec ────────────────────────────────────────────────────────────
+
+/// Everything needed to execute one compaction pass.
+struct CompactionSpec {
+  /// Level being compacted; inputs come from `level` and `level+1`.
+  level: usize,
+  /// `inputs[0]` = files at `level`; `inputs[1]` = files at `level+1`.
+  inputs: [Vec<Arc<FileMetaData>>; 2],
+  /// Files at `level+2` overlapping the full input range (for Gap 4).
+  grandparents: Vec<Arc<FileMetaData>>,
+  /// Version snapshot used to build this spec.
+  input_version: Arc<crate::db::version::Version>,
+  /// VersionEdit carrying the compact_pointer update (filled by setup_other_inputs).
+  edit: VersionEdit,
+}
+
+impl CompactionSpec {
+  fn new(level: usize, input_version: Arc<crate::db::version::Version>) -> Self {
+    CompactionSpec {
+      level,
+      inputs: [Vec::new(), Vec::new()],
+      grandparents: Vec::new(),
+      input_version,
+      edit: VersionEdit::new(),
+    }
+  }
+
+  fn all_input_files(&self) -> impl Iterator<Item = &Arc<FileMetaData>> {
+    self.inputs[0].iter().chain(self.inputs[1].iter())
+  }
+}
+
+// ── setup_other_inputs ────────────────────────────────────────────────────────
+
+/// Populate `spec.inputs[1]` (level+1 files), try to expand inputs[0] without
+/// pulling in more level+1 files, populate grandparents, and record the
+/// compact-pointer update in `spec.edit`.
+///
+/// Port of LevelDB's `VersionSet::SetupOtherInputs`.
+fn setup_other_inputs(
+  spec: &mut CompactionSpec,
+  version: &Arc<crate::db::version::Version>,
+  _compact_pointer: &[Vec<u8>; crate::db::version::NUM_LEVELS],
+  opts: &Options,
+) {
+  use crate::db::version::NUM_LEVELS;
+
+  let level = spec.level;
+  add_boundary_inputs(version, level, &mut spec.inputs[0]);
+
+  let (smallest, largest) = get_range(&spec.inputs[0]);
+  let smallest_uk = ikey_user_key(&smallest).to_vec();
+  let largest_uk = ikey_user_key(&largest).to_vec();
+
+  spec.inputs[1] = get_overlapping_inputs(version, level + 1, &smallest_uk, &largest_uk);
+  add_boundary_inputs(version, level + 1, &mut spec.inputs[1]);
+
+  let (all_start, all_limit) = get_range2(&spec.inputs[0], &spec.inputs[1]);
+  let all_start_uk = ikey_user_key(&all_start).to_vec();
+  let all_limit_uk = ikey_user_key(&all_limit).to_vec();
+
+  // Try to expand inputs[0] without expanding inputs[1].
+  if !spec.inputs[1].is_empty() {
+    let mut expanded0 = get_overlapping_inputs(version, level, &all_start_uk, &all_limit_uk);
+    add_boundary_inputs(version, level, &mut expanded0);
+
+    let inputs1_size = total_file_size(&spec.inputs[1]);
+    let expanded0_size = total_file_size(&expanded0);
+    let expand_limit = 25 * opts.max_file_size as u64;
+
+    if expanded0.len() > spec.inputs[0].len() && inputs1_size + expanded0_size < expand_limit {
+      let (exp_start, exp_limit) = get_range(&expanded0);
+      let exp_start_uk = ikey_user_key(&exp_start).to_vec();
+      let exp_limit_uk = ikey_user_key(&exp_limit).to_vec();
+      let expanded1 = get_overlapping_inputs(version, level + 1, &exp_start_uk, &exp_limit_uk);
+      // Only accept the expansion if it doesn't pull in more L+1 files.
+      if expanded1.len() == spec.inputs[1].len() {
+        spec.inputs[0] = expanded0;
+        spec.inputs[1] = expanded1;
+      }
+    }
+  }
+
+  // Populate grandparents (level+2 files overlapping the compaction range).
+  if level + 2 < NUM_LEVELS {
+    let (final_start, final_limit) = get_range2(&spec.inputs[0], &spec.inputs[1]);
+    let final_start_uk = ikey_user_key(&final_start).to_vec();
+    let final_limit_uk = ikey_user_key(&final_limit).to_vec();
+    spec.grandparents =
+      get_overlapping_inputs(version, level + 2, &final_start_uk, &final_limit_uk);
+  }
+
+  // Update compact_pointer: advance past largest key of inputs[0].
+  let (_, new_largest) = get_range(&spec.inputs[0]);
+  spec.edit.compact_pointers.push((level as i32, new_largest));
 }
 
 /// True if `user_key` is definitely absent from all files at level ≥ `from_level`.
@@ -1325,39 +1565,62 @@ fn is_base_level(version: &crate::db::version::Version, uk: &[u8], from_level: u
   true
 }
 
-/// Select files for the next L0→L1 compaction.
-///
-/// Returns `None` if L0 has fewer than `L0_COMPACTION_TRIGGER` files.  Otherwise
-/// returns `(l0_inputs, l1_inputs)` where `l1_inputs` are the L1 files whose key
-/// range overlaps with the union key range of all L0 files.
-type CompactionInputs = (Vec<Arc<FileMetaData>>, Vec<Arc<FileMetaData>>);
+/// True if `version` has a level that needs compaction (score ≥ 1.0).
+fn needs_compaction(version: &crate::db::version::Version) -> bool {
+  version.compaction_score >= 1.0
+}
 
-fn pick_compaction(version: &crate::db::version::Version) -> Option<CompactionInputs> {
-  if version.files[0].len() < L0_COMPACTION_TRIGGER {
+/// Select the next compaction to run, based on level scores and compact-pointer
+/// round-robin.
+///
+/// Returns `None` if no level needs compaction (`score < 1.0` at all levels).
+fn pick_compaction(
+  version: &Arc<crate::db::version::Version>,
+  compact_pointer: &[Vec<u8>; crate::db::version::NUM_LEVELS],
+  opts: &Options,
+) -> Option<CompactionSpec> {
+  if !needs_compaction(version) {
     return None;
   }
-  let l0_inputs: Vec<Arc<FileMetaData>> = version.files[0].to_vec();
 
-  // Union key range of all L0 files.
-  let mut range_small = l0_inputs[0].smallest.clone();
-  let mut range_large = l0_inputs[0].largest.clone();
-  for m in l0_inputs.iter().skip(1) {
-    if ikey_user_key(&m.smallest) < ikey_user_key(&range_small) {
-      range_small = m.smallest.clone();
-    }
-    if ikey_user_key(&m.largest) > ikey_user_key(&range_large) {
-      range_large = m.largest.clone();
-    }
+  let level = version.compaction_level as usize;
+  let mut spec = CompactionSpec::new(level, Arc::clone(version));
+
+  if level == 0 {
+    // For L0, seed with the first file past compact_pointer[0], then expand to
+    // all overlapping L0 files (L0 files can overlap each other).
+    let seed = version.files[0]
+      .iter()
+      .find(|f| {
+        compact_pointer[0].is_empty()
+          || ikey_user_key(&f.largest) > ikey_user_key(&compact_pointer[0])
+      })
+      .or_else(|| version.files[0].first())
+      .cloned()?;
+
+    let seed_lo = ikey_user_key(&seed.smallest).to_vec();
+    let seed_hi = ikey_user_key(&seed.largest).to_vec();
+    spec.inputs[0] = get_overlapping_inputs(version, 0, &seed_lo, &seed_hi);
+  } else {
+    // L1+: pick the first file whose largest key is past compact_pointer[level].
+    let file = version.files[level]
+      .iter()
+      .find(|f| {
+        compact_pointer[level].is_empty()
+          || ikey_user_key(&f.largest) > ikey_user_key(&compact_pointer[level])
+      })
+      .or_else(|| version.files[level].first())
+      .cloned()?;
+    spec.inputs[0].push(file);
   }
 
-  let l1_inputs: Vec<Arc<FileMetaData>> = version.files[1]
-    .iter()
-    .filter(|m| key_ranges_overlap(&m.smallest, &m.largest, &range_small, &range_large))
-    .cloned()
-    .collect();
-
-  Some((l0_inputs, l1_inputs))
+  setup_other_inputs(&mut spec, version, compact_pointer, opts);
+  Some(spec)
 }
+
+/// Alias for a plain (level_inputs, next_level_inputs) pair returned by
+/// `pick_range_compaction`.  Used only internally by `compact_level_range`.
+type CompactionInputs = (Vec<Arc<FileMetaData>>, Vec<Arc<FileMetaData>>);
 
 /// A completed compaction output SSTable.
 struct CompactionOutput {
@@ -1409,25 +1672,25 @@ fn finish_compaction_output(
 /// Tombstone elision: a deletion marker is dropped when there is provably no
 /// data for that key at levels > `output_level`.
 ///
-/// `inputs` should be ordered so that newer files (by file number) appear
-/// before older ones for the same level, allowing `MergingIterator` to resolve
-/// same-key ties in favour of the newer version via the lower child index.
-#[allow(clippy::too_many_arguments)]
+/// L0 inputs are already newest-first in `spec.inputs[0]` (Version stores them
+/// that way), so `MergingIterator` resolves same-key ties in favour of the
+/// newer version via the lower child index.
 fn do_compaction(
   path: &std::path::Path,
   state: &Mutex<DbState>,
-  version: &crate::db::version::Version,
-  inputs: &[&FileMetaData],
+  spec: &CompactionSpec,
   oldest_snapshot: u64,
-  output_level: usize,
   opts: &Options,
   tc: &crate::db::table_cache::TableCache,
 ) -> Result<Vec<CompactionOutput>, Error> {
   use crate::db::merge_iter::MergingIterator;
   use crate::iter::InternalIterator;
 
+  let output_level = spec.level + 1;
+  let version = spec.input_version.as_ref();
+
   let mut children: Vec<Box<dyn InternalIterator>> = Vec::new();
-  for meta in inputs {
+  for meta in spec.all_input_files() {
     let table = tc.get_or_open(meta.number, meta.file_size)?;
     // Compaction is a bulk scan — don't pollute the block cache.
     children.push(Box::new(table.new_iterator(opts.paranoid_checks, false)?));
@@ -1541,28 +1804,35 @@ fn do_compaction(
 /// Phase 3 (under lock): record deleted input files and new output files in a
 /// single `VersionEdit`, then call `log_and_apply`.
 ///
-/// `deleted` is a list of `(level, file_number)` pairs for all input files.
-/// `output_level` is the level the output SSTables are placed at.
+/// Also persists the compact-pointer update from `spec.edit` so the MANIFEST
+/// records the round-robin cursor advance.
 fn install_compaction(
   state: &mut DbState,
-  deleted: &[(i32, u64)],
+  spec: &CompactionSpec,
   outputs: Vec<CompactionOutput>,
-  output_level: i32,
   tc: &crate::db::table_cache::TableCache,
 ) -> Result<(), Error> {
   let vs = state
     .version_set
     .as_mut()
     .expect("install_compaction: no VersionSet");
+  let output_level = (spec.level + 1) as i32;
   let mut edit = VersionEdit::new();
-  for &(level, number) in deleted {
-    edit.deleted_files.push((level, number));
+  for f in &spec.inputs[0] {
+    edit.deleted_files.push((spec.level as i32, f.number));
+  }
+  for f in &spec.inputs[1] {
+    edit.deleted_files.push((spec.level as i32 + 1, f.number));
   }
   for out in outputs {
     // Register the output table in the cache before installing the version.
     tc.insert(out.file_number, out.table);
     let meta = FileMetaData::new(out.file_number, out.file_size, out.smallest, out.largest);
     edit.new_files.push((output_level, meta));
+  }
+  // Persist the compact-pointer update so it survives a reopen.
+  for (lvl, key) in &spec.edit.compact_pointers {
+    edit.compact_pointers.push((*lvl, key.clone()));
   }
   vs.set_last_sequence(state.last_sequence);
   vs.log_and_apply(&mut edit, tc)?;
@@ -1671,41 +1941,32 @@ fn compact_level_range(
     None => return Ok(false),
   };
 
-  let output_level = level + 1;
-  let inputs: Vec<&FileMetaData> = level_inputs
-    .iter()
-    .chain(next_inputs.iter())
-    .map(Arc::as_ref)
-    .collect();
-  let deleted: Vec<(i32, u64)> = level_inputs
-    .iter()
-    .map(|m| (level as i32, m.number))
-    .chain(next_inputs.iter().map(|m| (output_level as i32, m.number)))
-    .collect();
+  // Build a CompactionSpec from the range-compaction inputs.
+  let mut spec = CompactionSpec::new(level, Arc::clone(&version));
+  spec.inputs[0] = level_inputs;
+  spec.inputs[1] = next_inputs;
+  // No compact-pointer update for manual range compactions.
+  // Populate grandparents if level+2 < NUM_LEVELS.
+  if level + 2 < crate::db::version::NUM_LEVELS {
+    let (s, l) = get_range2(&spec.inputs[0], &spec.inputs[1]);
+    spec.grandparents =
+      get_overlapping_inputs(&version, level + 2, ikey_user_key(&s), ikey_user_key(&l));
+  }
 
   // Phase 2: I/O (no lock).
-  let outputs = do_compaction(
-    path,
-    state,
-    version.as_ref(),
-    inputs.as_slice(),
-    oldest_snapshot,
-    output_level,
-    opts,
-    tc,
-  )?;
+  let outputs = do_compaction(path, state, &spec, oldest_snapshot, opts, tc)?;
 
   // Phase 3: install.
   {
     let mut g = state.lock().unwrap();
-    install_compaction(&mut g, &deleted, outputs, output_level as i32, tc)?;
+    install_compaction(&mut g, &spec, outputs, tc)?;
   }
 
   delete_obsolete_files(path, state);
   Ok(true)
 }
 
-/// Run a synchronous L0→L1 compaction if L0 has reached the trigger.
+/// Run synchronous compaction for any level that needs it (score ≥ 1.0).
 ///
 /// Uses the same three-phase lock protocol as flush:
 ///   1. Snapshot current version under lock.
@@ -1713,7 +1974,7 @@ fn compact_level_range(
 ///   3. Install the result (VersionEdit + log_and_apply) under the lock.
 ///
 /// Errors are silently ignored — a failed compaction does not affect
-/// correctness; L0 will simply accumulate more files and be retried.
+/// correctness; the triggering level will be retried on the next call.
 fn maybe_compact(
   path: &std::path::Path,
   state: &Mutex<DbState>,
@@ -1721,7 +1982,7 @@ fn maybe_compact(
   tc: &crate::db::table_cache::TableCache,
 ) {
   // Phase 1: snapshot.
-  let (version, oldest_snapshot) = {
+  let (version, oldest_snapshot, compact_pointer) = {
     let g = state.lock().unwrap();
     let vs = match &g.version_set {
       Some(vs) => vs,
@@ -1733,37 +1994,20 @@ fn maybe_compact(
       .next()
       .copied()
       .unwrap_or(g.last_sequence);
-    (vs.current(), oldest)
+    (vs.current(), oldest, vs.compact_pointer().clone())
   };
 
-  let (l0_inputs, l1_inputs) = match pick_compaction(&version) {
-    Some(p) => p,
+  if !needs_compaction(&version) {
+    return;
+  }
+
+  let spec = match pick_compaction(&version, &compact_pointer, opts) {
+    Some(s) => s,
     None => return,
   };
 
-  // Build the flat input list (L0 newest-first, then L1) and deleted pairs.
-  let inputs: Vec<&FileMetaData> = l0_inputs
-    .iter()
-    .chain(l1_inputs.iter())
-    .map(Arc::as_ref)
-    .collect();
-  let deleted: Vec<(i32, u64)> = l0_inputs
-    .iter()
-    .map(|m| (0i32, m.number))
-    .chain(l1_inputs.iter().map(|m| (1i32, m.number)))
-    .collect();
-
   // Phase 2: I/O (no lock).
-  let outputs = match do_compaction(
-    path,
-    state,
-    version.as_ref(),
-    inputs.as_slice(),
-    oldest_snapshot,
-    1,
-    opts,
-    tc,
-  ) {
+  let outputs = match do_compaction(path, state, &spec, oldest_snapshot, opts, tc) {
     Ok(o) => o,
     Err(_) => return,
   };
@@ -1771,7 +2015,7 @@ fn maybe_compact(
   // Phase 3: install.
   {
     let mut g = state.lock().unwrap();
-    if install_compaction(&mut g, &deleted, outputs, 1, tc).is_err() {
+    if install_compaction(&mut g, &spec, outputs, tc).is_err() {
       return;
     }
   }
@@ -3426,6 +3670,189 @@ mod tests {
     for i in 0..3usize {
       let key = format!("skey{i}");
       assert_eq!(db.get(key.as_bytes()).unwrap(), b"v");
+    }
+  }
+
+  // ── Gap 1: level-score-based compaction tests ─────────────────────────────
+
+  /// Build a bare `Version` (no Arc) with controlled file sizes at each level.
+  fn version_with_files(level_sizes: &[(usize, u64)]) -> crate::db::version::Version {
+    use crate::db::version_edit::FileMetaData;
+    use crate::table::format::make_internal_key;
+
+    let mut v = crate::db::version::Version::new();
+    let mut file_number = 10u64;
+    for &(level, size) in level_sizes {
+      let ikey = make_internal_key(format!("a{file_number}").as_bytes(), file_number, 1);
+      let meta = FileMetaData::new(file_number, size, ikey.clone(), ikey);
+      v.files[level].push(meta);
+      file_number += 1;
+    }
+    v
+  }
+
+  #[test]
+  fn finalize_l0_score_from_file_count() {
+    // 4 L0 files / L0_COMPACTION_TRIGGER (4) = score 1.0.
+    let mut v = version_with_files(&[(0, 0), (0, 0), (0, 0), (0, 0)]);
+    crate::db::version::finalize(&mut v, 4);
+    assert!(
+      (v.compaction_score - 1.0).abs() < 1e-9,
+      "expected score 1.0, got {}",
+      v.compaction_score
+    );
+    assert_eq!(v.compaction_level, 0);
+  }
+
+  #[test]
+  fn finalize_l1_score_from_bytes() {
+    // 10 MiB at L1 = score exactly 1.0.
+    let ten_mib = 10 * 1_048_576u64;
+    let mut v = version_with_files(&[(1, ten_mib)]);
+    crate::db::version::finalize(&mut v, 4);
+    assert!(
+      (v.compaction_score - 1.0).abs() < 1e-9,
+      "expected score 1.0, got {}",
+      v.compaction_score
+    );
+    assert_eq!(v.compaction_level, 1);
+  }
+
+  #[test]
+  fn finalize_picks_best_level() {
+    // L1 half full (score 0.5), L0 double trigger (score 2.0) → best is L0.
+    let five_mib = 5 * 1_048_576u64;
+    let mut v = version_with_files(&[
+      (0, 0),
+      (0, 0),
+      (0, 0),
+      (0, 0),
+      (0, 0),
+      (0, 0),
+      (0, 0),
+      (0, 0), // 8 L0 files → score 2.0
+      (1, five_mib),
+    ]);
+    crate::db::version::finalize(&mut v, 4);
+    assert!(v.compaction_score >= 2.0 - 1e-9);
+    assert_eq!(v.compaction_level, 0);
+  }
+
+  #[test]
+  fn add_boundary_inputs_includes_same_user_key() {
+    use crate::db::version::Version;
+    use crate::db::version_edit::FileMetaData;
+    use crate::table::format::make_internal_key;
+    use std::sync::Arc;
+
+    // Two files at L1 with the same user key "k" but different sequence numbers.
+    // File A: smallest=("k", seq=5), largest=("k", seq=5)
+    // File B: smallest=("k", seq=2), largest=("k", seq=2)
+    // (higher seq sorts before lower seq in internal key order)
+    let ikey_high = make_internal_key(b"k", 5, 1);
+    let ikey_low = make_internal_key(b"k", 2, 1);
+
+    let file_a = FileMetaData::new(10, 100, ikey_high.clone(), ikey_high.clone());
+    let file_b = FileMetaData::new(11, 100, ikey_low.clone(), ikey_low.clone());
+
+    let mut v = Version::new();
+    // L1 sorted by smallest: file_a (seq=5) sorts BEFORE file_b (seq=2) because
+    // higher seq means lower internal key value (tag sorts descending).
+    v.files[1].push(Arc::clone(&file_a));
+    v.files[1].push(Arc::clone(&file_b));
+
+    // Start compaction with only file_a; boundary check should add file_b.
+    let mut compaction_files = vec![Arc::clone(&file_a)];
+    crate::add_boundary_inputs(&v, 1, &mut compaction_files);
+
+    assert_eq!(
+      compaction_files.len(),
+      2,
+      "add_boundary_inputs should have added file_b (same user key, lower seq)"
+    );
+    assert!(compaction_files.iter().any(|f| f.number == 11));
+  }
+
+  #[test]
+  fn compact_pointer_persists_across_reopen() {
+    // Run a compaction that should set a compact_pointer, then reopen and verify
+    // the pointer is restored from the MANIFEST.
+    let dir = tempfile::tempdir().unwrap();
+    {
+      let db = Db::open(dir.path(), tiny_options()).unwrap();
+      // Write enough to trigger flush + compaction.
+      for i in 0u32..300 {
+        db.put(
+          format!("key{i:05}").as_bytes(),
+          format!("val{i:05}").as_bytes(),
+        )
+        .unwrap();
+      }
+    }
+
+    // Reopen: the MANIFEST should contain compact_pointer records.
+    let vs = crate::db::version_set::VersionSet::recover(dir.path(), false).unwrap();
+    // At least one level should have a non-empty compact_pointer (L0 or L1).
+    let has_pointer = vs.compact_pointer().iter().any(|p| !p.is_empty());
+    assert!(
+      has_pointer,
+      "at least one compact_pointer should be set after compaction"
+    );
+  }
+
+  #[test]
+  fn multilevel_compaction_l1_to_l2() {
+    // Write enough data so that L1 exceeds 10 MiB, triggering L1→L2 compaction.
+    //
+    // Use a large value (~1 KiB) per key so data accumulates quickly at L1.
+    // write_buffer_size = 32 KiB → each flush produces ~32 entries.
+    // max_file_size = 64 KiB → L1 files are ~64 KiB each.
+    // After ~160 flushes and corresponding L0→L1 compactions, L1 total bytes
+    // exceeds 10 MiB and an automatic L1→L2 compaction fires.
+    let dir = tempfile::tempdir().unwrap();
+    let value_size = 1024usize; // 1 KiB per value
+    let opts = Options {
+      create_if_missing: true,
+      write_buffer_size: 32 * 1024,
+      max_file_size: 64 * 1024,
+      // Disable block cache and filter to avoid interference.
+      block_cache: None,
+      filter_policy: None,
+      ..Options::default()
+    };
+    let db = Db::open(dir.path(), opts).unwrap();
+
+    // Write enough keys to produce > 10 MiB at L1.
+    // Use pseudo-random bytes so Snappy compression doesn't shrink them to nothing.
+    let large_val: Vec<u8> = (0..value_size).map(|i| (i * 7 + 13) as u8).collect();
+    for i in 0u32..75_000 {
+      // Mix the index into each value so all values differ (avoids any dedup).
+      let mut val = large_val.clone();
+      let bytes = i.to_le_bytes();
+      val[..4].copy_from_slice(&bytes);
+      db.put(format!("key{i:07}").as_bytes(), &val).unwrap();
+    }
+
+    let (l1_bytes, l2_files) = {
+      let g = db.state.lock().unwrap();
+      let cur = g.version_set.as_ref().unwrap().current();
+      let l1b: u64 = cur.files[1].iter().map(|f| f.file_size).sum();
+      (l1b, cur.files[2].len())
+    };
+    // L2 should have received at least one file from an L1→L2 compaction.
+    assert!(
+      l2_files > 0,
+      "L2 should have files after L1→L2 compaction; L1_bytes={l1_bytes} L2_files={l2_files}"
+    );
+    // Spot-check: a handful of keys must still be readable.
+    // (Full scan would be too slow; check every 2000th key.)
+    let large_val: Vec<u8> = (0..value_size).map(|i| (i * 7 + 13) as u8).collect();
+    for i in (0u32..75_000).step_by(2000) {
+      let mut expected = large_val.clone();
+      let bytes = i.to_le_bytes();
+      expected[..4].copy_from_slice(&bytes);
+      let val = db.get(format!("key{i:07}").as_bytes()).unwrap();
+      assert_eq!(val, expected.as_slice());
     }
   }
 }

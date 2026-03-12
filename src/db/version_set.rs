@@ -61,6 +61,9 @@ pub(crate) struct VersionSet {
   /// File number of the MANIFEST file (used to update CURRENT on rotation in Phase 6).
   #[allow(dead_code)]
   pub(crate) manifest_number: u64,
+  /// Round-robin compaction cursor per level: the largest internal key last compacted.
+  /// Empty vec = not yet set.  Persisted to MANIFEST via TAG_COMPACT_POINTER.
+  compact_pointer: [Vec<u8>; crate::db::version::NUM_LEVELS],
 }
 
 impl VersionSet {
@@ -93,6 +96,7 @@ impl VersionSet {
       log_number: 1,
       manifest_log,
       manifest_number,
+      compact_pointer: std::array::from_fn(|_| Vec::new()),
     })
   }
 
@@ -123,8 +127,13 @@ impl VersionSet {
     let next_file_number = builder.next_file_number;
     let last_sequence = builder.last_sequence;
     let log_number = builder.log_number;
+    // Clone compact_pointer before builder is consumed by build().
+    let compact_pointer: [Vec<u8>; crate::db::version::NUM_LEVELS] =
+      std::array::from_fn(|i| builder.compact_pointer[i].clone());
 
-    let files = builder.build();
+    let mut files = builder.build();
+    // Compute compaction scores on the recovered version.
+    crate::db::version::finalize(&mut files, 4); // 4 = L0_COMPACTION_TRIGGER
 
     // Re-open the MANIFEST for appending (continue after the last record).
     let manifest_file_for_write = OpenOptions::new().append(true).open(&manifest_path)?;
@@ -138,6 +147,7 @@ impl VersionSet {
       log_number,
       manifest_log,
       manifest_number,
+      compact_pointer,
     })
   }
 
@@ -195,7 +205,18 @@ impl VersionSet {
       });
     }
 
-    self.current = Arc::new(Version { files: new_files });
+    // Apply compact-pointer updates from this edit.
+    for (level, key) in &edit.compact_pointers {
+      self.compact_pointer[*level as usize] = key.clone();
+    }
+
+    let mut v = Version {
+      files: new_files,
+      compaction_score: -1.0,
+      compaction_level: -1,
+    };
+    crate::db::version::finalize(&mut v, 4); // 4 = L0_COMPACTION_TRIGGER
+    self.current = Arc::new(v);
     Ok(())
   }
 
@@ -226,6 +247,11 @@ impl VersionSet {
 
   pub(crate) fn current(&self) -> Arc<Version> {
     Arc::clone(&self.current)
+  }
+
+  /// Read-only access to the compact-pointer array (one entry per level).
+  pub(crate) fn compact_pointer(&self) -> &[Vec<u8>; crate::db::version::NUM_LEVELS] {
+    &self.compact_pointer
   }
 
   pub(crate) fn manifest_number(&self) -> u64 {
@@ -259,6 +285,8 @@ struct Builder {
   next_file_number: u64,
   last_sequence: u64,
   log_number: u64,
+  /// Round-robin compaction cursor accumulated from compact-pointer edits.
+  compact_pointer: [Vec<u8>; crate::db::version::NUM_LEVELS],
 }
 
 impl Builder {
@@ -269,6 +297,7 @@ impl Builder {
       next_file_number: 3,
       last_sequence: 0,
       log_number: 1,
+      compact_pointer: std::array::from_fn(|_| Vec::new()),
     }
   }
 
@@ -290,6 +319,9 @@ impl Builder {
       let key = (*level, meta.number);
       self.deleted.remove(&key);
       self.added.insert(key, Arc::clone(meta));
+    }
+    for (level, key) in &edit.compact_pointers {
+      self.compact_pointer[*level as usize] = key.clone();
     }
   }
 
@@ -320,7 +352,11 @@ impl Builder {
       }
     }
 
-    Version { files }
+    Version {
+      files,
+      compaction_score: -1.0,
+      compaction_level: -1,
+    }
   }
 }
 

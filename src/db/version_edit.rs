@@ -19,6 +19,7 @@ const TAG_COMPARATOR: u64 = 1;
 const TAG_LOG_NUMBER: u64 = 2;
 const TAG_NEXT_FILE_NUMBER: u64 = 3;
 const TAG_LAST_SEQUENCE: u64 = 4;
+const TAG_COMPACT_POINTER: u64 = 5;
 const TAG_DELETED_FILE: u64 = 6;
 const TAG_NEW_FILE: u64 = 7;
 const TAG_PREV_LOG_NUMBER: u64 = 9;
@@ -62,6 +63,8 @@ pub(crate) struct VersionEdit {
   pub new_files: Vec<(i32, Arc<FileMetaData>)>,
   /// Files removed: `(level, file_number)`.
   pub deleted_files: Vec<(i32, u64)>,
+  /// Compact pointers: `(level, largest_internal_key)` — round-robin compaction cursor.
+  pub compact_pointers: Vec<(i32, Vec<u8>)>,
 }
 
 impl VersionEdit {
@@ -73,6 +76,7 @@ impl VersionEdit {
       last_sequence: None,
       new_files: Vec::new(),
       deleted_files: Vec::new(),
+      compact_pointers: Vec::new(),
     }
   }
 
@@ -106,6 +110,11 @@ impl VersionEdit {
     if let Some(v) = self.last_sequence {
       push_varint!(TAG_LAST_SEQUENCE);
       push_varint!(v);
+    }
+    for (level, key) in &self.compact_pointers {
+      push_varint!(TAG_COMPACT_POINTER);
+      push_varint!(*level as u64);
+      encode_bytes(&mut buf, key);
     }
     for &(level, number) in &self.deleted_files {
       push_varint!(TAG_DELETED_FILE);
@@ -210,6 +219,16 @@ impl VersionEdit {
             level as i32,
             FileMetaData::new(number, file_size, smallest, largest),
           ));
+        }
+        TAG_COMPACT_POINTER => {
+          let (level, n) = read_varu64(&data[pos..]);
+          if n == 0 {
+            return Err(trunc("compact_pointer level"));
+          }
+          pos += n;
+          let (key, n) = decode_bytes(&data[pos..])?;
+          pos += n;
+          edit.compact_pointers.push((level as i32, key));
         }
         TAG_COMPARATOR => {
           // Skip comparator name (length-prefixed bytes).

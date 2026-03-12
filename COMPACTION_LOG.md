@@ -6,7 +6,7 @@ Tracks the plan and progress for closing the compaction gap between RoughDB and 
 
 | Gap | Description | Status |
 |-----|-------------|--------|
-| 1 | Level-score-based compaction | ⬜ Not started |
+| 1 | Level-score-based compaction | ✅ Done |
 | 2 | Flush placement (`PickLevelForMemTableOutput`) | ⬜ Not started |
 | 3 | Trivial-move optimisation | ⬜ Not started |
 | 4 | Grandparent-overlap output limiting | ⬜ Not started |
@@ -431,3 +431,4 @@ internal key to extract the user key, counts how many files' ranges it overlaps.
 | Date | Event |
 |------|-------|
 | 2026-03-12 | Plan written |
+| 2026-03-12 | Gap 1 implemented: level-score-based multi-level compaction. 245 tests passing. |
