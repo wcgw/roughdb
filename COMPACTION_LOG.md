@@ -9,7 +9,7 @@ Tracks the plan and progress for closing the compaction gap between RoughDB and 
 | 1 | Level-score-based compaction | ✅ Done |
 | 2 | Flush placement (`PickLevelForMemTableOutput`) | ✅ Done |
 | 3 | Trivial-move optimisation | ✅ Done |
-| 4 | Grandparent-overlap output limiting | ⬜ Not started |
+| 4 | Grandparent-overlap output limiting | ✅ Done |
 | 5 | Seek-based compaction | ⬜ Not started |
 
 ---
@@ -434,3 +434,4 @@ internal key to extract the user key, counts how many files' ranges it overlaps.
 | 2026-03-12 | Gap 1 implemented: level-score-based multi-level compaction. 245 tests passing. |
 | 2026-03-18 | Gap 2 implemented: flush placement (`pick_level_for_memtable_output`). 247 tests passing. |
 | 2026-03-18 | Gap 3 implemented: trivial-move optimisation (`is_trivial_move`, `install_trivial_move`). 250 tests passing. |
+| 2026-03-18 | Gap 4 implemented: grandparent-overlap output limiting (`should_stop_before`, `is_base_level_for_key`). 253 tests passing. |

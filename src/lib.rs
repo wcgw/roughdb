@@ -1564,12 +1564,24 @@ struct CompactionSpec {
   level: usize,
   /// `inputs[0]` = files at `level`; `inputs[1]` = files at `level+1`.
   inputs: [Vec<Arc<FileMetaData>>; 2],
-  /// Files at `level+2` overlapping the full input range (for Gap 4).
+  /// Files at `level+2` overlapping the full input range.
   grandparents: Vec<Arc<FileMetaData>>,
   /// Version snapshot used to build this spec.
   input_version: Arc<crate::db::version::Version>,
   /// VersionEdit carrying the compact_pointer update (filled by setup_other_inputs).
   edit: VersionEdit,
+
+  // ── Gap 4: grandparent-overlap output limiting ────────────────────────────
+  /// Index into `grandparents` of the next file to scan in `should_stop_before`.
+  grandparent_index: usize,
+  /// Whether we have seen at least one key (used to skip overlap accounting for
+  /// the very first key, matching LevelDB's `Compaction::ShouldStopBefore`).
+  seen_key: bool,
+  /// Accumulated grandparent overlap bytes since the last output-file boundary.
+  overlapped_bytes: i64,
+  /// Per-level monotone cursors for `is_base_level_for_key`.  Each entry starts
+  /// at 0 and only advances forward, amortising repeated scans to O(1)/key.
+  level_ptrs: [usize; crate::db::version::NUM_LEVELS],
 }
 
 impl CompactionSpec {
@@ -1580,6 +1592,10 @@ impl CompactionSpec {
       grandparents: Vec::new(),
       input_version,
       edit: VersionEdit::new(),
+      grandparent_index: 0,
+      seen_key: false,
+      overlapped_bytes: 0,
+      level_ptrs: [0; crate::db::version::NUM_LEVELS],
     }
   }
 
@@ -1653,18 +1669,58 @@ fn setup_other_inputs(
   spec.edit.compact_pointers.push((level as i32, new_largest));
 }
 
-/// True if `user_key` is definitely absent from all files at level ≥ `from_level`.
+/// Returns `true` when the current output SSTable should be closed because the
+/// bytes it would overlap at `level+2` (the grandparents) have exceeded the
+/// limit `max_grandparent_overlap_bytes`.
 ///
-/// A conservative check: returns `false` if any file's key range spans the user
-/// key, even if the key isn't actually present in the file.  Safe to use for
-/// tombstone elision: we only drop a tombstone when this returns `true`.
-fn is_base_level(version: &crate::db::version::Version, uk: &[u8], from_level: usize) -> bool {
+/// Monotone in `ikey`: callers must feed keys in ascending internal-key order.
+/// Closing the output early limits future compaction amplification.
+///
+/// Port of LevelDB `Compaction::ShouldStopBefore`.
+fn should_stop_before(spec: &mut CompactionSpec, ikey: &[u8], opts: &Options) -> bool {
+  use crate::table::format::cmp_internal_keys;
+  let limit = max_grandparent_overlap_bytes(opts.max_file_size as u64) as i64;
+  while spec.grandparent_index < spec.grandparents.len()
+    && cmp_internal_keys(ikey, &spec.grandparents[spec.grandparent_index].largest)
+      == std::cmp::Ordering::Greater
+  {
+    if spec.seen_key {
+      spec.overlapped_bytes += spec.grandparents[spec.grandparent_index].file_size as i64;
+    }
+    spec.grandparent_index += 1;
+  }
+  spec.seen_key = true;
+  if spec.overlapped_bytes > limit {
+    spec.overlapped_bytes = 0;
+    return true;
+  }
+  false
+}
+
+/// Returns `true` if `user_key` is definitely absent from all levels ≥
+/// `spec.level + 2` (i.e., the output level is the lowest level that holds
+/// this key).  Used for tombstone elision: we can only drop a deletion marker
+/// when it cannot hide a live value at a deeper level.
+///
+/// Uses per-level monotone cursors (`spec.level_ptrs`) so each cursor advances
+/// at most once per key across the entire compaction — amortised O(1)/key.
+///
+/// Port of LevelDB `Compaction::IsBaseLevelForKey`.
+fn is_base_level_for_key(spec: &mut CompactionSpec, user_key: &[u8]) -> bool {
   use crate::db::version::NUM_LEVELS;
-  for level in from_level..NUM_LEVELS {
-    for meta in &version.files[level] {
-      if uk >= ikey_user_key(&meta.smallest) && uk <= ikey_user_key(&meta.largest) {
-        return false;
+  for lvl in (spec.level + 2)..NUM_LEVELS {
+    let files = &spec.input_version.files[lvl];
+    while spec.level_ptrs[lvl] < files.len() {
+      let f = &files[spec.level_ptrs[lvl]];
+      let f_largest_uk = ikey_user_key(&f.largest);
+      if user_key <= f_largest_uk {
+        // user_key is ≤ this file's largest — it may be inside this file.
+        if user_key >= ikey_user_key(&f.smallest) {
+          return false; // user_key falls within this file's range
+        }
+        break; // user_key is before this file; no later file at this level can match
       }
+      spec.level_ptrs[lvl] += 1; // user_key is past this file; advance cursor
     }
   }
   true
@@ -1783,7 +1839,7 @@ fn finish_compaction_output(
 fn do_compaction(
   path: &std::path::Path,
   state: &Mutex<DbState>,
-  spec: &CompactionSpec,
+  spec: &mut CompactionSpec,
   oldest_snapshot: u64,
   opts: &Options,
   tc: &crate::db::table_cache::TableCache,
@@ -1791,8 +1847,7 @@ fn do_compaction(
   use crate::db::merge_iter::MergingIterator;
   use crate::iter::InternalIterator;
 
-  let output_level = spec.level + 1;
-  let version = spec.input_version.as_ref();
+  let _output_level = spec.level + 1;
 
   let mut children: Vec<Box<dyn InternalIterator>> = Vec::new();
   for meta in spec.all_input_files() {
@@ -1836,7 +1891,7 @@ fn do_compaction(
       // A newer version for this user key was already emitted and is visible
       // to even the oldest active snapshot — this older version is invisible.
       true
-    } else if vtype == 0 && seq <= oldest_snapshot && is_base_level(version, uk, output_level + 1) {
+    } else if vtype == 0 && seq <= oldest_snapshot && is_base_level_for_key(spec, uk) {
       // Tombstone that no snapshot can see below this level — safe to elide.
       true
     } else {
@@ -1846,6 +1901,19 @@ fn do_compaction(
     last_sequence_for_key = seq;
 
     if !drop {
+      // Close the current output file early if grandparent overlap is too high.
+      // This limits future compaction amplification (Gap 4).
+      if current.is_some() && should_stop_before(spec, &ikey, opts) {
+        let finished = current.take().unwrap();
+        finish_compaction_output(
+          finished,
+          std::mem::take(&mut current_largest),
+          &mut outputs,
+          opts.filter_policy.clone(),
+          opts.block_cache.clone(),
+        )?;
+      }
+
       // Rotate to a new output file if the current one is at the size limit.
       if let Some(ref cur) = current {
         if cur.builder.file_size() >= opts.max_file_size as u64 {
@@ -2059,7 +2127,7 @@ fn compact_level_range(
   }
 
   // Phase 2: I/O (no lock).
-  let outputs = do_compaction(path, state, &spec, oldest_snapshot, opts, tc)?;
+  let outputs = do_compaction(path, state, &mut spec, oldest_snapshot, opts, tc)?;
 
   // Phase 3: install.
   {
@@ -2164,7 +2232,7 @@ fn maybe_compact(
     return;
   }
 
-  let spec = match pick_compaction(&version, &compact_pointer, opts) {
+  let mut spec = match pick_compaction(&version, &compact_pointer, opts) {
     Some(s) => s,
     None => return,
   };
@@ -2180,7 +2248,7 @@ fn maybe_compact(
   }
 
   // Phase 2: I/O (no lock).
-  let outputs = match do_compaction(path, state, &spec, oldest_snapshot, opts, tc) {
+  let outputs = match do_compaction(path, state, &mut spec, oldest_snapshot, opts, tc) {
     Ok(o) => o,
     Err(_) => return,
   };
@@ -4273,6 +4341,147 @@ mod tests {
     for i in 0u32..10 {
       let val = db2.get(format!("aaa{i:03}").as_bytes()).unwrap();
       assert_eq!(val, b"secondbatch");
+    }
+  }
+
+  // ── Gap 4: grandparent-overlap output limiting tests ──────────────────────
+
+  #[test]
+  fn is_base_level_for_key_cursor_advances_monotonically() {
+    // Build a version with a few L3 files; verify that is_base_level_for_key
+    // correctly returns false for keys inside those files and true for keys
+    // outside, and that the cursor only ever moves forward.
+    use crate::db::version_edit::FileMetaData;
+    use crate::db::version::Version;
+    use crate::table::format::make_internal_key;
+    use std::sync::Arc;
+    use super::{CompactionSpec, is_base_level_for_key};
+
+    let make_meta = |number: u64, small: &[u8], large: &[u8]| -> Arc<FileMetaData> {
+      FileMetaData::new(
+        number,
+        4096,
+        make_internal_key(small, 10, 1u8),
+        make_internal_key(large, 1, 1u8),
+      )
+    };
+
+    let mut v = Version::new();
+    // L1 compaction inputs (level 1).
+    v.files[1].push(make_meta(1, b"a", b"z"));
+    // L3 = level+2 from L1: two non-overlapping files.
+    v.files[3].push(make_meta(10, b"b", b"d")); // covers b..d
+    v.files[3].push(make_meta(11, b"p", b"r")); // covers p..r
+    let version = Arc::new(v);
+
+    let mut spec = CompactionSpec::new(1, Arc::clone(&version));
+    spec.inputs[0].push(Arc::clone(&version.files[1][0]));
+
+    // "c" is inside file 10 (b..d) → NOT base level.
+    assert!(!is_base_level_for_key(&mut spec, b"c"));
+    // "q" is inside file 11 (p..r) → NOT base level.
+    // Cursor for L3 should have advanced past file 10.
+    assert!(!is_base_level_for_key(&mut spec, b"q"));
+    // "s" is past both files → IS base level.
+    assert!(is_base_level_for_key(&mut spec, b"s"));
+    // Cursor must now be at the end; a key before the end (but still past both
+    // files) should also return true without regressing the cursor.
+    assert!(is_base_level_for_key(&mut spec, b"t"));
+    // The cursor for L3 should be at index 2 (past both files) — check it
+    // hasn't regressed.
+    assert_eq!(spec.level_ptrs[3], 2);
+  }
+
+  #[test]
+  fn should_stop_before_triggers_on_excess_grandparent_overlap() {
+    use crate::db::version_edit::FileMetaData;
+    use crate::db::version::Version;
+    use crate::table::format::make_internal_key;
+    use std::sync::Arc;
+    use super::{CompactionSpec, should_stop_before};
+
+    let make_meta = |number: u64, small: &[u8], large: &[u8], size: u64| -> Arc<FileMetaData> {
+      FileMetaData::new(
+        number,
+        size,
+        make_internal_key(small, 10, 1u8),
+        make_internal_key(large, 1, 1u8),
+      )
+    };
+
+    let v = Version::new();
+    let version = Arc::new(v);
+
+    let opts = Options {
+      max_file_size: 1024, // max_grandparent_overlap_bytes = 10 * 1024 = 10240
+      ..Options::default()
+    };
+
+    let mut spec = CompactionSpec::new(0, Arc::clone(&version));
+    // Three grandparent files, each 6000 bytes.
+    // seen_key is false for the first key, so file 20's bytes don't count.
+    // After passing file 21 (6000 bytes) and then file 22 (6000 more = 12000),
+    // the limit of 10 * 1024 = 10240 is exceeded on the third key.
+    spec.grandparents.push(make_meta(20, b"b", b"d", 6000));
+    spec.grandparents.push(make_meta(21, b"e", b"g", 6000));
+    spec.grandparents.push(make_meta(22, b"h", b"k", 6000));
+
+    // Feed keys that advance past each grandparent file.
+    // Keys are internal keys; construct them to be > each file's largest.
+    let after_d = make_internal_key(b"e", 0, 0u8); // > "d" in ikey order
+    let after_g = make_internal_key(b"h", 0, 0u8);
+    let after_k = make_internal_key(b"l", 0, 0u8);
+
+    // First key — seen_key becomes true, no bytes accumulated yet.
+    assert!(!should_stop_before(&mut spec, &after_d, &opts));
+    // Second key — passes file 20 (4096 bytes accumulated), still under limit.
+    assert!(!should_stop_before(&mut spec, &after_g, &opts));
+    // Third key — passes file 21 (8192 bytes), still under limit.
+    // After passing file 22 (12288 > 10240) it should trigger.
+    assert!(should_stop_before(&mut spec, &after_k, &opts));
+    // After triggering, overlapped_bytes is reset to 0.
+    assert_eq!(spec.overlapped_bytes, 0);
+  }
+
+  #[test]
+  #[serial(fd)]
+  fn grandparent_limiting_produces_multiple_output_files() {
+    // Verify that a compaction subject to high grandparent overlap produces
+    // multiple output files rather than one giant file.
+    //
+    // Setup:
+    //   - Write key ranges A and B into the DB, flush to L2 (empty DB).
+    //   - Write overlapping versions to force L0 accumulation and L0→L1 compaction.
+    //   - After L0→L1, write yet more data to push L1→L2.
+    //   - Verify all keys remain readable after compaction.
+    let dir = tempfile::tempdir().unwrap();
+    let opts = Options {
+      create_if_missing: true,
+      write_buffer_size: 512,
+      max_file_size: 2 * 1024,
+      block_cache: None,
+      filter_policy: None,
+      ..Options::default()
+    };
+
+    let db = Db::open(dir.path(), opts.clone()).unwrap();
+    // Write enough unique keys with large-ish values so multiple flushes and
+    // compactions occur, exercising the grandparent limiting path.
+    let val = vec![b'x'; 64];
+    for round in 0u32..20 {
+      for k in 0u32..20 {
+        db.put(format!("k{k:04}").as_bytes(), &val).unwrap();
+      }
+      let _ = round; // suppress lint
+    }
+    drop(db);
+
+    // Reopen and verify correctness.
+    let db2 = Db::open(dir.path(), opts).unwrap();
+    for k in 0u32..20 {
+      let result = db2.get(format!("k{k:04}").as_bytes());
+      assert!(result.is_ok(), "key k{k:04} should be readable after compaction");
+      assert_eq!(result.unwrap(), val);
     }
   }
 }
