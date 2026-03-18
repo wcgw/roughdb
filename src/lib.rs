@@ -118,6 +118,7 @@ use crate::memtable::{ArcMemTableIter, Memtable, MemtableResult};
 use crate::table::builder::TableBuilder;
 use crate::table::reader::{LookupResult, Table};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub mod cache;
@@ -151,7 +152,14 @@ pub struct Snapshot<'db> {
 
 impl Drop for Snapshot<'_> {
   fn drop(&mut self) {
-    self.db.state.lock().unwrap().snapshots.remove(&self.seq);
+    self
+      .db
+      .inner
+      .state
+      .lock()
+      .unwrap()
+      .snapshots
+      .remove(&self.seq);
   }
 }
 
@@ -280,6 +288,16 @@ struct DbState {
   /// Set to `true` when `seek_compact_file` is first populated, so the next
   /// `Db::write` compaction loop runs even without a preceding flush.
   compaction_needed: bool,
+  // ── Background thread coordination ─────────────────────────────────────────
+  /// `true` while the background thread has been notified and hasn't yet
+  /// finished one cycle.  Prevents redundant notifications.
+  background_scheduled: bool,
+  /// Sticky error set by the background thread on flush/compaction failure.
+  /// Returned to writers on their next call; clears only on reopen.
+  background_error: Option<Error>,
+  /// `FlushPrep` produced by `begin_flush` under the write lock; consumed by
+  /// the background thread via `write_flush` + `finish_flush`.
+  pending_flush: Option<FlushPrep>,
 }
 
 // ── FlushPrep / FlushResult ───────────────────────────────────────────────────
@@ -290,10 +308,13 @@ struct FlushPrep {
   sst_number: u64,
   sst_path: std::path::PathBuf,
   old_mem: Arc<Memtable>,
-  /// File number of the new WAL created under the write lock.
+  /// File number of the new WAL that was activated in `begin_flush`.
+  /// `finish_flush` records this in the MANIFEST via `vs.set_log_number`.
   new_log_number: u64,
-  /// Open writer for the new WAL (empty at this point).
-  new_log: LogWriter,
+  /// Sequence number at the time of the flush rotation.  `finish_flush`
+  /// records this as `last_sequence` in the MANIFEST so WAL replay correctly
+  /// replays entries written to the new WAL after the rotation.
+  last_sequence_at_rotation: u64,
   /// Path of the old WAL to delete after `log_and_apply` succeeds.
   old_log_path: std::path::PathBuf,
 }
@@ -312,8 +333,12 @@ struct FlushResult {
   /// User-key extracted from `largest` (for `pick_level_for_memtable_output`).
   largest_user_key: Vec<u8>,
   table: Arc<Table>,
+  /// New WAL file number (already active; just needs to be committed to MANIFEST).
   new_log_number: u64,
-  new_log: LogWriter,
+  /// Sequence number captured at rotation time; used as `last_sequence` in the
+  /// MANIFEST so WAL replay correctly replays entries written after the rotation.
+  last_sequence_at_rotation: u64,
+  /// Path of the old WAL, deleted by `finish_flush` after `log_and_apply`.
   old_log_path: std::path::PathBuf,
 }
 
@@ -418,16 +443,26 @@ struct Persistence {
   _lock: std::fs::File,
 }
 
-// ── Db ───────────────────────────────────────────────────────────────────────
+// ── DbInner / Db ─────────────────────────────────────────────────────────────
 
-pub struct Db {
-  state: Mutex<DbState>,
+/// Shared state owned by both the foreground `Db` handle and the background
+/// compaction/flush thread.  Always accessed through an `Arc`.
+pub(crate) struct DbInner {
+  pub(crate) state: Mutex<DbState>,
   /// Wakes follower writers when the current group leader finishes and when
   /// there may be a new leader at the front of the write queue.
-  /// Always paired with `state` (the same `Mutex<DbState>`).
   write_condvar: std::sync::Condvar,
-  options: Options,
-  persistence: Option<Persistence>,
+  /// Wakes the background thread when work is available (flush / compact).
+  bg_condvar: std::sync::Condvar,
+  pub(crate) options: Options,
+  pub(crate) persistence: Option<Persistence>,
+  /// Set to `true` on `Db::drop` to tell the background thread to exit.
+  shutting_down: AtomicBool,
+}
+
+pub struct Db {
+  pub(crate) inner: Arc<DbInner>,
+  bg_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Default for Db {
@@ -435,22 +470,42 @@ impl Default for Db {
   /// Intended for tests and ephemeral use.
   fn default() -> Self {
     Self {
-      state: Mutex::new(DbState {
-        last_sequence: 0,
-        log: None,
-        mem: Arc::new(Memtable::default()),
-        imm: None,
-        version_set: None,
-        snapshots: std::collections::BTreeSet::new(),
-        writers: std::collections::VecDeque::new(),
-        next_writer_id: 0,
-        completed: std::collections::HashMap::new(),
-        seek_compact_file: None,
-        compaction_needed: false,
+      inner: Arc::new(DbInner {
+        state: Mutex::new(DbState {
+          last_sequence: 0,
+          log: None,
+          mem: Arc::new(Memtable::default()),
+          imm: None,
+          version_set: None,
+          snapshots: std::collections::BTreeSet::new(),
+          writers: std::collections::VecDeque::new(),
+          next_writer_id: 0,
+          completed: std::collections::HashMap::new(),
+          seek_compact_file: None,
+          compaction_needed: false,
+          background_scheduled: false,
+          background_error: None,
+          pending_flush: None,
+        }),
+        write_condvar: std::sync::Condvar::new(),
+        bg_condvar: std::sync::Condvar::new(),
+        options: Options::default(),
+        persistence: None,
+        shutting_down: AtomicBool::new(false),
       }),
-      write_condvar: std::sync::Condvar::new(),
-      options: Options::default(),
-      persistence: None,
+      bg_thread: None,
+    }
+  }
+}
+
+impl Drop for Db {
+  fn drop(&mut self) {
+    if self.inner.persistence.is_some() {
+      self.inner.shutting_down.store(true, Ordering::Release);
+      self.inner.bg_condvar.notify_one();
+      if let Some(t) = self.bg_thread.take() {
+        t.join().ok();
+      }
     }
   }
 }
@@ -567,7 +622,7 @@ impl Db {
     let file_len = log_file.metadata()?.len();
     let log_writer = LogWriter::new(log_file, file_len);
 
-    Ok(Self {
+    let inner = Arc::new(DbInner {
       state: Mutex::new(DbState {
         last_sequence,
         log: Some(log_writer),
@@ -580,14 +635,25 @@ impl Db {
         completed: std::collections::HashMap::new(),
         seek_compact_file: None,
         compaction_needed: false,
+        background_scheduled: false,
+        background_error: None,
+        pending_flush: None,
       }),
       write_condvar: std::sync::Condvar::new(),
+      bg_condvar: std::sync::Condvar::new(),
       options,
       persistence: Some(Persistence {
         dir: path.to_path_buf(),
         table_cache,
         _lock: lock_file,
       }),
+      shutting_down: AtomicBool::new(false),
+    });
+    let bg_inner = Arc::clone(&inner);
+    let bg_thread = std::thread::spawn(move || bg_worker(bg_inner));
+    Ok(Self {
+      inner,
+      bg_thread: Some(bg_thread),
     })
   }
 
@@ -647,7 +713,7 @@ impl Db {
     // the current memtable refs and sequence number, then release before doing
     // any I/O (memtable reads are lock-free; SSTable reads go to disk).
     let (sequence, mem, imm, version) = {
-      let state = self.state.lock().unwrap();
+      let state = self.inner.state.lock().unwrap();
       (
         opts.snapshot.map(|s| s.seq).unwrap_or(state.last_sequence),
         Arc::clone(&state.mem),
@@ -656,7 +722,7 @@ impl Db {
       )
     };
 
-    let verify_checksums = opts.verify_checksums || self.options.paranoid_checks;
+    let verify_checksums = opts.verify_checksums || self.inner.options.paranoid_checks;
     let fill_cache = opts.fill_cache;
 
     match mem.get(key, sequence) {
@@ -674,7 +740,7 @@ impl Db {
     }
 
     if let Some(version) = version {
-      if let Some(persistence) = &self.persistence {
+      if let Some(persistence) = &self.inner.persistence {
         let (result, stats) = version.get(
           key,
           sequence,
@@ -684,8 +750,9 @@ impl Db {
         )?;
         // Update seek stats under the lock (re-acquire briefly).
         if stats.seek_file.is_some() {
-          let mut g = self.state.lock().unwrap();
+          let mut g = self.inner.state.lock().unwrap();
           update_stats(&mut g, &stats);
+          maybe_schedule_compaction(&self.inner, &mut g);
         }
         match result {
           LookupResult::Value(v) => return Ok(v),
@@ -709,7 +776,7 @@ impl Db {
   ///
   /// See `include/leveldb/db.h: DB::GetSnapshot`.
   pub fn get_snapshot(&self) -> Snapshot<'_> {
-    let mut state = self.state.lock().unwrap();
+    let mut state = self.inner.state.lock().unwrap();
     let seq = state.last_sequence;
     state.snapshots.insert(seq);
     Snapshot { db: self, seq }
@@ -733,7 +800,7 @@ impl Db {
 
     // Snapshot what we need under the lock, then release before formatting.
     let (version, mem_usage, imm_usage) = {
-      let state = self.state.lock().unwrap();
+      let state = self.inner.state.lock().unwrap();
       let version = state.version_set.as_ref().map(|vs| vs.current());
       let mem_usage = state.mem.approximate_memory_usage();
       let imm_usage = state
@@ -799,14 +866,14 @@ impl Db {
 
     // Snapshot the current version under the lock, then release.
     let version = {
-      let state = self.state.lock().unwrap();
+      let state = self.inner.state.lock().unwrap();
       state.version_set.as_ref().map(|vs| vs.current())
     };
 
     ranges
       .iter()
       .map(|&(start, limit)| {
-        let (Some(ref v), Some(ref tc)) = (&version, &self.persistence) else {
+        let (Some(ref v), Some(ref tc)) = (&version, &self.inner.persistence) else {
           return 0;
         };
         // Convert user keys to lookup internal keys (seq=u64::MAX>>8, vtype=1)
@@ -854,7 +921,7 @@ impl Db {
     // Snapshot Arc refs under the lock, then release before constructing the
     // iterator (matching LevelDB's NewInternalIterator pattern).
     let (sequence, mem, imm, version) = {
-      let state = self.state.lock().unwrap();
+      let state = self.inner.state.lock().unwrap();
       (
         opts.snapshot.map(|s| s.seq).unwrap_or(state.last_sequence),
         Arc::clone(&state.mem),
@@ -863,7 +930,7 @@ impl Db {
       )
     };
 
-    let verify_checksums = opts.verify_checksums || self.options.paranoid_checks;
+    let verify_checksums = opts.verify_checksums || self.inner.options.paranoid_checks;
     let fill_cache = opts.fill_cache;
 
     let mut children: Vec<Box<dyn crate::iter::InternalIterator>> = Vec::new();
@@ -877,7 +944,7 @@ impl Db {
     }
 
     // SSTable files from the current Version, level by level (L0 first).
-    if let (Some(version), Some(persistence)) = (version, &self.persistence) {
+    if let (Some(version), Some(persistence)) = (version, &self.inner.persistence) {
       for level_files in &version.files {
         for meta in level_files {
           let table = persistence
@@ -959,7 +1026,7 @@ impl Db {
   pub fn compact_range(&self, begin: Option<&[u8]>, end: Option<&[u8]>) -> Result<(), Error> {
     use crate::db::version::NUM_LEVELS;
 
-    let persistence = match &self.persistence {
+    let persistence = match &self.inner.persistence {
       Some(p) => p,
       None => return Ok(()),
     };
@@ -968,7 +1035,7 @@ impl Db {
 
     // Find the deepest level that currently has files overlapping [begin, end].
     let max_level = {
-      let g = self.state.lock().unwrap();
+      let g = self.inner.state.lock().unwrap();
       let vs = match &g.version_set {
         Some(vs) => vs,
         None => return Ok(()),
@@ -998,8 +1065,8 @@ impl Db {
     for level in 0..stop {
       compact_level_range(
         path,
-        &self.state,
-        &self.options,
+        &self.inner.state,
+        &self.inner.options,
         &persistence.table_cache,
         level,
         begin,
@@ -1017,7 +1084,7 @@ impl Db {
     // front of the queue (becoming the group leader) or has been processed by a
     // previous leader and its result placed in `state.completed`.
     let my_id = {
-      let mut state = self.state.lock().unwrap();
+      let mut state = self.inner.state.lock().unwrap();
       let id = state.next_writer_id;
       state.next_writer_id += 1;
       state.writers.push_back(WriterSlot {
@@ -1029,7 +1096,7 @@ impl Db {
     };
 
     // ── Phase 2: Wait to become leader or receive a completed result ──────────
-    let mut state = self.state.lock().unwrap();
+    let mut state = self.inner.state.lock().unwrap();
     loop {
       // A previous leader may have already processed our slot.
       if let Some(result) = state.completed.remove(&my_id) {
@@ -1039,8 +1106,11 @@ impl Db {
       if state.writers.front().map(|w| w.id) == Some(my_id) {
         break;
       }
-      state = self.write_condvar.wait(state).unwrap();
+      state = self.inner.write_condvar.wait(state).unwrap();
     }
+
+    // ── Phase 2.5: Ensure there is room in the memtable ──────────────────────
+    state = make_room_for_write(&self.inner, state)?;
 
     // ── Phase 3: Build a group ────────────────────────────────────────────────
     //
@@ -1118,58 +1188,205 @@ impl Db {
 
     // Wake all waiting writers: the next leader can now step up, and
     // followers whose result is in `completed` can return it.
-    self.write_condvar.notify_all();
+    self.inner.write_condvar.notify_all();
 
-    // Propagate the leader's own status before doing flush/compact work.
+    // Propagate the leader's own status.
     status?;
 
-    // ── Phase 6: Flush and compact (leader only) ──────────────────────────────
+    // ── Phase 6: Schedule background work if needed ───────────────────────────
     //
-    // Followers return `Ok(())` immediately above.  The leader checks whether
-    // the memtable is full and, if so, drives the three-phase flush.  This is
-    // identical to the original single-writer path.
-    if let Some(persistence) = &self.persistence {
-      let path = persistence.dir.as_path();
-      if state.mem.approximate_memory_usage() >= self.options.write_buffer_size {
-        // Phase 1: rotate mem → imm, allocate new WAL file (write lock held).
-        let prep = begin_flush(path, &mut state)?;
-        // Release the write lock before doing any I/O.
-        drop(state);
-        // Phase 2: write the SSTable (no lock held — reads proceed freely).
-        let result = write_flush(prep, &self.options)?;
-        // Phase 3: install the new Version, swap WAL, clear imm (lock held).
-        let mut state = self.state.lock().unwrap();
-        finish_flush(&mut state, result, &self.options, &persistence.table_cache)?;
-        drop(state);
-        // Phase 4: delete obsolete files (lock released; best-effort).
-        delete_obsolete_files(path, &self.state);
-        // Phase 5: compact any level that needs it.  Loop so that a burst of
-        // flushes that accumulates more than one compaction's worth of files at
-        // a level still gets drained before returning to the caller.
-        for _ in 0..32 {
-          let (needs, l0) = {
-            let g = self.state.lock().unwrap();
-            let version = g.version_set.as_ref().map(|vs| vs.current());
-            let needs = version
-              .as_ref()
-              .is_some_and(|v| needs_compaction(v, g.compaction_needed));
-            let l0 = version.as_ref().map_or(0, |v| v.files[0].len());
-            (needs, l0)
-          };
-          if !needs {
-            break;
+    // If the write filled the memtable and no flush is already pending, rotate
+    // mem → imm now so the background thread can flush it.  Then wait for the
+    // flush to complete before returning, preserving the invariant that all
+    // data written before a `put` returns is durable and readable.
+    if let Some(ref persistence) = self.inner.persistence {
+      let triggered_flush = if state.imm.is_none()
+        && state.pending_flush.is_none()
+        && state.mem.approximate_memory_usage() >= self.inner.options.write_buffer_size
+      {
+        let path = persistence.dir.as_path();
+        match begin_flush(path, &mut state) {
+          Ok(prep) => {
+            state.imm = Some(Arc::clone(&prep.old_mem));
+            state.pending_flush = Some(prep);
+            true
           }
-          // Slow-write throttle: yield briefly when L0 is piling up but hasn't
-          // hit the stop threshold.  This matches LevelDB's MakeRoomForWrite.
-          if l0 >= L0_SLOWDOWN_WRITES_TRIGGER {
-            std::thread::sleep(std::time::Duration::from_millis(1));
-          }
-          maybe_compact(path, &self.state, &self.options, &persistence.table_cache);
+          Err(_) => false,
+        }
+      } else {
+        false
+      };
+      maybe_schedule_compaction(&self.inner, &mut state);
+      // If we triggered a flush, wait for the background thread to complete it.
+      // This preserves the original synchronous-flush behaviour seen by callers.
+      if triggered_flush {
+        while state.imm.is_some() || state.pending_flush.is_some() {
+          state = self.inner.write_condvar.wait(state).unwrap();
         }
       }
     }
+    drop(state);
 
     Ok(())
+  }
+}
+
+// ── Background scheduling helpers ────────────────────────────────────────────
+
+/// Notify the background thread if there is work to do and no notification is
+/// already outstanding.  Call while holding the `DbState` lock.
+fn maybe_schedule_compaction(inner: &Arc<DbInner>, g: &mut DbState) {
+  if inner.shutting_down.load(Ordering::Relaxed) {
+    return;
+  }
+  if g.background_error.is_some() {
+    return;
+  }
+  if g.background_scheduled {
+    return;
+  }
+  let has_imm = g.imm.is_some() || g.pending_flush.is_some();
+  let needs = has_imm || {
+    let v = g.version_set.as_ref().map(|vs| vs.current());
+    v.as_ref()
+      .is_some_and(|v| needs_compaction(v, g.compaction_needed))
+  };
+  if !needs {
+    return;
+  }
+  g.background_scheduled = true;
+  inner.bg_condvar.notify_one();
+}
+
+/// Called by the write leader (while holding the lock) to ensure there is room
+/// in the memtable.  May sleep or wait on `write_condvar` if the system is
+/// under write pressure.  Returns the (possibly re-acquired) lock guard.
+fn make_room_for_write<'a>(
+  inner: &'a Arc<DbInner>,
+  mut g: std::sync::MutexGuard<'a, DbState>,
+) -> Result<std::sync::MutexGuard<'a, DbState>, Error> {
+  let mut allow_delay = true;
+  loop {
+    if let Some(ref e) = g.background_error {
+      return Err(e.clone());
+    }
+    if inner.persistence.is_none() {
+      // In-memory: no flush needed.
+      break;
+    }
+    let l0 = g
+      .version_set
+      .as_ref()
+      .map_or(0, |vs| vs.current().files[0].len());
+    if allow_delay && l0 >= L0_SLOWDOWN_WRITES_TRIGGER {
+      // Slow down at most once per write call.
+      allow_delay = false;
+      drop(g);
+      std::thread::sleep(std::time::Duration::from_millis(1));
+      g = inner.state.lock().unwrap();
+    } else if g.mem.approximate_memory_usage() < inner.options.write_buffer_size {
+      break; // There is room in the current memtable.
+    } else if g.imm.is_some() || g.pending_flush.is_some() {
+      // A flush is already in progress; wait for the background thread.
+      g = inner.write_condvar.wait(g).unwrap();
+    } else if l0 >= L0_STOP_WRITES_TRIGGER {
+      // Too many L0 files; wait for the background thread to drain them.
+      g = inner.write_condvar.wait(g).unwrap();
+    } else {
+      // Rotate mem → imm, schedule background flush.
+      let path = inner.persistence.as_ref().unwrap().dir.as_path();
+      let prep = begin_flush(path, &mut g)?;
+      g.imm = Some(Arc::clone(&prep.old_mem));
+      g.pending_flush = Some(prep);
+      maybe_schedule_compaction(inner, &mut g);
+    }
+  }
+  Ok(g)
+}
+
+/// Background worker: sleeps on `bg_condvar`, wakes to perform flush or
+/// compaction, then re-checks.
+fn bg_worker(inner: Arc<DbInner>) {
+  let mut g = inner.state.lock().unwrap();
+  loop {
+    // Sleep until scheduled or shutting down.
+    while !g.background_scheduled && !inner.shutting_down.load(Ordering::Relaxed) {
+      g = inner.bg_condvar.wait(g).unwrap();
+    }
+    g.background_scheduled = false;
+
+    // On shutdown: flush any pending memtable, then exit.
+    let shutting_down = inner.shutting_down.load(Ordering::Relaxed);
+
+    if g.background_error.is_some() {
+      inner.write_condvar.notify_all();
+      if shutting_down {
+        return;
+      }
+      continue;
+    }
+
+    let Some(ref p) = inner.persistence else {
+      inner.write_condvar.notify_all();
+      if shutting_down {
+        return;
+      }
+      continue;
+    };
+    let path = p.dir.clone();
+    let tc = p.table_cache.clone();
+
+    // ── Flush if pending ──────────────────────────────────────────────────────
+    if let Some(prep) = g.pending_flush.take() {
+      drop(g);
+      let result = write_flush(prep, &inner.options);
+      g = inner.state.lock().unwrap();
+      match result {
+        Ok(res) => {
+          if let Err(e) = finish_flush(&mut g, res, &inner.options, &tc) {
+            g.background_error = Some(e);
+          }
+        }
+        Err(e) => {
+          g.background_error = Some(e);
+        }
+      }
+      inner.write_condvar.notify_all();
+      drop(g);
+      delete_obsolete_files(&path, &inner.state);
+      g = inner.state.lock().unwrap();
+    } else if !shutting_down {
+      // ── Compaction (skipped on shutdown path) ────────────────────────────
+      drop(g);
+      maybe_compact(&path, &inner.state, &inner.options, &tc);
+      inner.write_condvar.notify_all();
+      delete_obsolete_files(&path, &inner.state);
+      g = inner.state.lock().unwrap();
+    }
+
+    // After processing, check whether to exit (shutdown) or reschedule.
+    let shutting_down = inner.shutting_down.load(Ordering::Relaxed);
+    let has_pending = g.imm.is_some() || g.pending_flush.is_some();
+    if shutting_down && !has_pending {
+      inner.write_condvar.notify_all();
+      return;
+    }
+
+    // Reschedule immediately if more work remains.
+    if !shutting_down {
+      let needs_c = {
+        let v = g.version_set.as_ref().map(|vs| vs.current());
+        v.as_ref()
+          .is_some_and(|v| needs_compaction(v, g.compaction_needed))
+      };
+      if has_pending || needs_c {
+        g.background_scheduled = true;
+        // Loop back immediately without waiting.
+      }
+    } else if has_pending {
+      // Still have pending work during shutdown — keep looping.
+      g.background_scheduled = true;
+    }
   }
 }
 
@@ -1182,11 +1399,17 @@ impl Db {
 //   finish_flush — under lock: install new Version, swap WAL, clear imm
 
 /// Phase 1 (under write lock): seal `mem` as `imm`, install a fresh memtable,
-/// allocate the next SSTable file number, and create the new WAL file.
+/// allocate the next SSTable file number, and create and activate the new WAL.
 ///
-/// The new WAL is created here — under the lock — so that any writes between
-/// now and `finish_flush` still go to the *old* WAL (via `state.log`).  The
-/// new WAL becomes active only once `finish_flush` swaps `state.log`.
+/// The new WAL is activated immediately (swapped into `state.log`) so that
+/// any writes between now and when the background thread runs `finish_flush`
+/// go to the new WAL rather than the old one.  If the new WAL were activated
+/// only in `finish_flush`, those intermediate writes would land in the old WAL
+/// which `finish_flush` then deletes — causing data loss on reopen.
+///
+/// `finish_flush` still calls `vs.set_log_number` and `log_and_apply` to
+/// commit the new log number and SSTable to the MANIFEST, so that on reopen
+/// the correct WAL is replayed.
 fn begin_flush(path: &std::path::Path, state: &mut DbState) -> Result<FlushPrep, Error> {
   let vs = state
     .version_set
@@ -1197,14 +1420,21 @@ fn begin_flush(path: &std::path::Path, state: &mut DbState) -> Result<FlushPrep,
   let new_log_number = vs.next_file_number();
   let new_log_file = std::fs::File::create(path.join(format!("{new_log_number:06}.log")))?;
   let new_log = LogWriter::new(new_log_file, 0);
+  // Activate the new WAL immediately; preserve the old WAL so finish_flush
+  // can delete it after log_and_apply commits the rotation to the MANIFEST.
+  let _old_log = state.log.replace(new_log);
   let old_mem = std::mem::take(&mut state.mem);
   state.imm = None; // should already be None; be explicit
+                    // Capture last_sequence now so finish_flush stores the correct value in the
+                    // MANIFEST.  Writes that happen to the new WAL after begin_flush will have
+                    // sequences > last_sequence_at_rotation and will be replayed on next open.
+  let last_sequence_at_rotation = state.last_sequence;
   Ok(FlushPrep {
     sst_number,
     sst_path: path.join(format!("{sst_number:06}.ldb")),
     old_mem,
     new_log_number,
-    new_log,
+    last_sequence_at_rotation,
     old_log_path: path.join(format!("{old_log_number:06}.log")),
   })
 }
@@ -1219,7 +1449,7 @@ fn write_flush(prep: FlushPrep, opts: &Options) -> Result<FlushResult, Error> {
     sst_path,
     old_mem,
     new_log_number,
-    new_log,
+    last_sequence_at_rotation,
     old_log_path,
   } = prep;
   let file = OpenOptions::new()
@@ -1270,17 +1500,18 @@ fn write_flush(prep: FlushPrep, opts: &Options) -> Result<FlushResult, Error> {
     largest_user_key,
     table,
     new_log_number,
-    new_log,
+    last_sequence_at_rotation,
     old_log_path,
   })
 }
 
 /// Phase 3 (under write lock): atomically record the new SST *and* new log
-/// number in the MANIFEST (`log_and_apply`), swap `state.log` to the new WAL,
-/// clear `imm`, and delete the old WAL.
+/// number in the MANIFEST (`log_and_apply`), clear `imm`, and delete the old WAL.
 ///
-/// `set_log_number` is called *before* `log_and_apply` so the MANIFEST record
-/// carries the correct log number — matching LevelDB's `MakeRoomForWrite`.
+/// `begin_flush` already activated the new WAL (swapping `state.log`), so
+/// `finish_flush` does not touch `state.log`.  `set_log_number` is called
+/// before `log_and_apply` so the MANIFEST record carries the correct log
+/// number — matching LevelDB's `MakeRoomForWrite`.
 fn finish_flush(
   state: &mut DbState,
   result: FlushResult,
@@ -1316,11 +1547,14 @@ fn finish_flush(
     .version_set
     .as_mut()
     .expect("finish_flush: no VersionSet");
-  vs.set_last_sequence(state.last_sequence);
+  // Use the sequence number captured at rotation time, NOT the current
+  // state.last_sequence.  Writes to the new WAL after begin_flush have
+  // sequences > last_sequence_at_rotation and must be replayed on reopen;
+  // recording the current (higher) last_sequence would cause them to be skipped.
+  vs.set_last_sequence(result.last_sequence_at_rotation);
   vs.set_log_number(result.new_log_number);
   vs.log_and_apply(&mut edit, tc)?;
-  // Switch to the new WAL; the MANIFEST now points past the old one.
-  state.log = Some(result.new_log);
+  // state.log was already swapped to the new WAL in begin_flush — no swap needed here.
   state.imm = None;
   // Best-effort delete — ignore errors (e.g. the path never existed on new DB).
   let _ = std::fs::remove_file(&result.old_log_path);
@@ -1343,6 +1577,7 @@ fn finish_flush(
 #[allow(dead_code)]
 const L0_COMPACTION_TRIGGER: usize = 4;
 const L0_SLOWDOWN_WRITES_TRIGGER: usize = 8;
+const L0_STOP_WRITES_TRIGGER: usize = 12;
 
 /// Extract the user-key prefix from an SSTable internal key.
 /// Internal key format: `user_key || (seq<<8|vtype).to_le_bytes()` (8-byte tag).
@@ -3230,7 +3465,7 @@ mod tests {
     // After enough writes (many flushes → multiple compactions), L0 should
     // be below the compaction trigger.
     let l0_count = {
-      let g = db.state.lock().unwrap();
+      let g = db.inner.state.lock().unwrap();
       g.version_set.as_ref().unwrap().current().files[0].len()
     };
     assert!(
@@ -3324,7 +3559,7 @@ mod tests {
       db.put(format!("k{i:05}").as_bytes(), b"v").unwrap();
     }
     let deep_count: usize = {
-      let g = db.state.lock().unwrap();
+      let g = db.inner.state.lock().unwrap();
       let cur = g.version_set.as_ref().unwrap().current();
       (1..crate::db::version::NUM_LEVELS)
         .map(|l| cur.files[l].len())
@@ -3389,7 +3624,7 @@ mod tests {
     }
     db.compact_range(None, None).unwrap();
     let l0_count = {
-      let g = db.state.lock().unwrap();
+      let g = db.inner.state.lock().unwrap();
       g.version_set.as_ref().unwrap().current().files[0].len()
     };
     assert_eq!(l0_count, 0, "L0 should be empty after full compact_range");
@@ -4170,7 +4405,7 @@ mod tests {
     // L0 must be empty: the flush was pushed to a higher level.
     // With a completely empty version the output lands at L2 (MAX_MEM_COMPACT_LEVEL).
     let (l0, l2) = {
-      let g = db.state.lock().unwrap();
+      let g = db.inner.state.lock().unwrap();
       let cur = g.version_set.as_ref().unwrap().current();
       (cur.files[0].len(), cur.files[2].len())
     };
@@ -4254,7 +4489,7 @@ mod tests {
     }
 
     let (l1_bytes, l2_files) = {
-      let g = db.state.lock().unwrap();
+      let g = db.inner.state.lock().unwrap();
       let cur = g.version_set.as_ref().unwrap().current();
       let l1b: u64 = cur.files[1].iter().map(|f| f.file_size).sum();
       (l1b, cur.files[2].len())
@@ -4614,6 +4849,9 @@ mod tests {
       completed: Default::default(),
       seek_compact_file: None,
       compaction_needed: false,
+      background_scheduled: false,
+      background_error: None,
+      pending_flush: None,
     };
     super::update_stats(&mut ds, &stats);
     let after = version.files[0][0].allowed_seeks.load(Ordering::Relaxed);
@@ -4675,6 +4913,9 @@ mod tests {
       completed: Default::default(),
       seek_compact_file: None,
       compaction_needed: false,
+      background_scheduled: false,
+      background_error: None,
+      pending_flush: None,
     };
     super::update_stats(&mut ds, &stats);
 
@@ -4722,7 +4963,7 @@ mod tests {
     // Manually drain allowed_seeks on an L0 file to force a seek-compaction.
     {
       use std::sync::atomic::Ordering;
-      let g = db.state.lock().unwrap();
+      let g = db.inner.state.lock().unwrap();
       if let Some(vs) = &g.version_set {
         let cur = vs.current();
         if let Some(f) = cur.files[0].first() {
