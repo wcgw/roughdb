@@ -2286,6 +2286,7 @@ fn delete_obsolete_files(path: &std::path::Path, state: &Mutex<DbState>) {
 #[cfg(test)]
 mod tests {
   use crate::{Db, Error, Options, ReadOptions, WriteBatch, WriteOptions};
+  use serial_test::serial;
 
   // ── parse_db_filename tests (port of LevelDB filename_test.cc: Parse) ─────────
 
@@ -3072,6 +3073,7 @@ mod tests {
   }
 
   #[test]
+  #[serial(fd)]
   fn compaction_reduces_l0_file_count() {
     // Write enough data to produce ≥ L0_COMPACTION_TRIGGER flushes, which
     // should trigger a compaction that moves files from L0 to L1.
@@ -3099,6 +3101,7 @@ mod tests {
   }
 
   #[test]
+  #[serial(fd)]
   fn compacted_data_readable() {
     // All keys written before compaction must still be readable after it.
     let dir = tempfile::tempdir().unwrap();
@@ -3121,6 +3124,7 @@ mod tests {
   }
 
   #[test]
+  #[serial(fd)]
   fn compaction_tombstone_hides_l1_value() {
     // Write a value for a key, flush it to L0/L1 via enough extra writes,
     // then write a tombstone.  The tombstone must shadow the compacted value.
@@ -3146,6 +3150,7 @@ mod tests {
   }
 
   #[test]
+  #[serial(fd)]
   fn compacted_data_readable_after_reopen() {
     // Data compacted to L1 must survive a reopen (MANIFEST recovery).
     let dir = tempfile::tempdir().unwrap();
@@ -3169,6 +3174,7 @@ mod tests {
   }
 
   #[test]
+  #[serial(fd)]
   fn files_present_below_l0_after_writes() {
     // After enough writes, data should be present at L1 or deeper.
     // With flush placement enabled, sequential unique-key flushes may bypass
@@ -3194,6 +3200,7 @@ mod tests {
   // ── compact_range tests ────────────────────────────────────────────────────
 
   #[test]
+  #[serial(fd)]
   fn compact_range_all_keys_readable_after() {
     // compact_range over the full key space must not lose any data.
     let dir = tempfile::tempdir().unwrap();
@@ -3213,6 +3220,7 @@ mod tests {
   }
 
   #[test]
+  #[serial(fd)]
   fn compact_range_subrange_preserves_keys_outside() {
     // Compacting a sub-range must not disturb keys outside it.
     let dir = tempfile::tempdir().unwrap();
@@ -3232,6 +3240,7 @@ mod tests {
   }
 
   #[test]
+  #[serial(fd)]
   fn compact_range_moves_data_to_deeper_level() {
     // After a full compact_range, all data should be below L0.
     let dir = tempfile::tempdir().unwrap();
@@ -3248,6 +3257,7 @@ mod tests {
   }
 
   #[test]
+  #[serial(fd)]
   fn compact_range_tombstone_elided_with_no_data_below() {
     // After compact_range pushes a tombstone to the deepest level, the key
     // must still be gone (tombstone correctly shadows the value).
@@ -3269,6 +3279,7 @@ mod tests {
   }
 
   #[test]
+  #[serial(fd)]
   fn compact_range_noop_on_inmemory_db() {
     let db = Db::default();
     db.put(b"k", b"v").unwrap();
@@ -3277,6 +3288,7 @@ mod tests {
   }
 
   #[test]
+  #[serial(fd)]
   fn compact_range_data_readable_after_reopen() {
     // Data compacted via compact_range must survive a reopen.
     let dir = tempfile::tempdir().unwrap();
@@ -3952,6 +3964,7 @@ mod tests {
   }
 
   #[test]
+  #[serial(fd)]
   fn compact_pointer_persists_across_reopen() {
     // Run a compaction that should set a compact_pointer, then reopen and verify
     // the pointer is restored from the MANIFEST.
@@ -3996,6 +4009,7 @@ mod tests {
   /// and no grandparent bytes at L2, so the file lands at L2.  The key invariant
   /// is that L0 stays empty and the data is readable.
   #[test]
+  #[serial(fd)]
   fn flush_placement_skips_l0_on_first_flush() {
     let dir = tempfile::tempdir().unwrap();
     let opts = Options {
@@ -4035,6 +4049,7 @@ mod tests {
   /// When L0 already has files that overlap the flush range, the output must
   /// stay at L0 (we cannot skip over in-progress L0 data).
   #[test]
+  #[serial(fd)]
   fn flush_placement_stays_at_l0_when_overlap() {
     let dir = tempfile::tempdir().unwrap();
     let opts = Options {
@@ -4066,6 +4081,7 @@ mod tests {
   }
 
   #[test]
+  #[serial(fd)]
   fn multilevel_compaction_l1_to_l2() {
     // Write enough data so that L1 exceeds 10 MiB, triggering L1→L2 compaction.
     //
@@ -4220,6 +4236,7 @@ mod tests {
   }
 
   #[test]
+  #[serial(fd)]
   fn trivial_move_end_to_end() {
     // Write data so a single non-overlapping file ends up at L1, then confirm
     // it is trivially moved to L2 by maybe_compact.  We force the scenario by
