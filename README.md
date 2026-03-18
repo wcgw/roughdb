@@ -145,7 +145,7 @@ RoughDB is in active development. The on-disk format is LevelDB-compatible.
 **Implemented:**
 
 - WAL + MANIFEST + SSTable flush and crash-safe recovery
-- Multi-level compaction (L0→L1, `compact_range`) with snapshot-aware pruning and tombstone elision
+- L0→L1 compaction with snapshot-aware pruning and tombstone elision; manual `compact_range`
 - Bidirectional iteration (`seek_to_first`, `seek_to_last`, `seek`, `next`, `prev`)
 - Snapshots (`get_snapshot` / `release_snapshot`)
 - Bloom filter support (`Options::filter_policy`)
@@ -156,12 +156,36 @@ RoughDB is in active development. The on-disk format is LevelDB-compatible.
 - `destroy` — safely removes a database directory
 - `LOCK` file — prevents concurrent opens by multiple processes
 - Table cache — LRU open-file-handle cache bounded by `Options::max_open_files`
-- Block cache
-- Batch-grouped writes
+- Block cache — LRU byte-capacity cache with per-table IDs; `ReadOptions::fill_cache`
+- Batch-grouped writes — concurrent writers are grouped under one WAL record, amortising fsync cost
+
+**Partial / known limitations:**
+
+- **Compaction is L0→L1 only.** LevelDB uses a level-score system (L1 target 10 MB, 10× per level) to drive
+  multi-level compaction. RoughDB only compacts when L0 reaches 4 files; L1–L6 can grow unbounded after L0 pressure
+  subsides. `compact_range` works across all levels but automatic background compaction does not.
+- **Compaction runs synchronously** on the writing thread. LevelDB runs a background thread so writes are never
+  blocked waiting for compaction I/O. Large compactions will cause P99 write-latency spikes.
+- **No seek-based compaction.** LevelDB tracks per-file seek counts and triggers compaction on hot files regardless
+  of size; this read-sampling path (`RecordReadSample`) is not implemented.
+- **No trivial-move optimisation.** When a single file at level N has no overlap with level N+2, LevelDB moves it
+  without merging. RoughDB always merges all selected input files.
+- **No grandparent-overlap limiting.** LevelDB stops growing a compaction output file early when it would overlap
+  too many level-(N+2) files, reducing future compaction amplification. RoughDB sizes output files by
+  `max_file_size` only.
+- **All memtable flushes go to L0.** LevelDB's `PickLevelForMemTableOutput` can place a flush directly into L1 or
+  L2 when there is no overlap, reducing L0 pressure. Not implemented.
+- **`Options::reuse_logs`** is accepted but ignored.
 
 **Not yet implemented:**
 
-- Custom comparators
+- **Custom comparators** — keys are always compared bytewise; `Options::comparator` does not exist. Applications
+  that require a custom sort order (e.g. reverse, integer, prefix) cannot use RoughDB.
+- **`Env` abstraction** — file I/O is hardcoded to the local POSIX filesystem. There is no way to inject a custom
+  storage backend (in-memory, encrypted, cloud, etc.).
+- **`RepairDB`** — recovery from a corrupt or partial MANIFEST by scanning surviving SSTables.
+- **Info logging** — LevelDB writes compaction progress, recovery details, and errors to an `info_log`. RoughDB
+  produces no log output.
 
 ## License
 

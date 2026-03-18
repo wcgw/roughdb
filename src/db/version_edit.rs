@@ -12,6 +12,7 @@
 
 use crate::coding::{read_varu64, write_varu64};
 use crate::error::Error;
+use std::sync::atomic::AtomicI32;
 use std::sync::Arc;
 
 // LevelDB-compatible MANIFEST tag constants.
@@ -19,6 +20,7 @@ const TAG_COMPARATOR: u64 = 1;
 const TAG_LOG_NUMBER: u64 = 2;
 const TAG_NEXT_FILE_NUMBER: u64 = 3;
 const TAG_LAST_SEQUENCE: u64 = 4;
+const TAG_COMPACT_POINTER: u64 = 5;
 const TAG_DELETED_FILE: u64 = 6;
 const TAG_NEW_FILE: u64 = 7;
 const TAG_PREV_LOG_NUMBER: u64 = 9;
@@ -36,15 +38,26 @@ pub(crate) struct FileMetaData {
   pub smallest: Vec<u8>,
   /// Largest internal key stored in this file.
   pub largest: Vec<u8>,
+  /// Remaining seek budget before this file is nominated for compaction.
+  ///
+  /// In-memory only — not encoded in the MANIFEST.  Initialised to
+  /// `max(100, file_size / 16384)` matching LevelDB's heuristic (one seek
+  /// costs ~16 KiB of I/O; after enough misses the overhead outweighs a
+  /// compaction).  Decremented atomically on each `get` that probes the file
+  /// without finding the target key; when it reaches ≤ 0 the file is
+  /// flagged for seek-based compaction.
+  pub allowed_seeks: AtomicI32,
 }
 
 impl FileMetaData {
   pub(crate) fn new(number: u64, file_size: u64, smallest: Vec<u8>, largest: Vec<u8>) -> Arc<Self> {
+    let allowed_seeks = (file_size / 16384).max(100) as i32;
     Arc::new(Self {
       number,
       file_size,
       smallest,
       largest,
+      allowed_seeks: AtomicI32::new(allowed_seeks),
     })
   }
 }
@@ -62,6 +75,8 @@ pub(crate) struct VersionEdit {
   pub new_files: Vec<(i32, Arc<FileMetaData>)>,
   /// Files removed: `(level, file_number)`.
   pub deleted_files: Vec<(i32, u64)>,
+  /// Compact pointers: `(level, largest_internal_key)` — round-robin compaction cursor.
+  pub compact_pointers: Vec<(i32, Vec<u8>)>,
 }
 
 impl VersionEdit {
@@ -73,6 +88,7 @@ impl VersionEdit {
       last_sequence: None,
       new_files: Vec::new(),
       deleted_files: Vec::new(),
+      compact_pointers: Vec::new(),
     }
   }
 
@@ -106,6 +122,11 @@ impl VersionEdit {
     if let Some(v) = self.last_sequence {
       push_varint!(TAG_LAST_SEQUENCE);
       push_varint!(v);
+    }
+    for (level, key) in &self.compact_pointers {
+      push_varint!(TAG_COMPACT_POINTER);
+      push_varint!(*level as u64);
+      encode_bytes(&mut buf, key);
     }
     for &(level, number) in &self.deleted_files {
       push_varint!(TAG_DELETED_FILE);
@@ -210,6 +231,16 @@ impl VersionEdit {
             level as i32,
             FileMetaData::new(number, file_size, smallest, largest),
           ));
+        }
+        TAG_COMPACT_POINTER => {
+          let (level, n) = read_varu64(&data[pos..]);
+          if n == 0 {
+            return Err(trunc("compact_pointer level"));
+          }
+          pos += n;
+          let (key, n) = decode_bytes(&data[pos..])?;
+          pos += n;
+          edit.compact_pointers.push((level as i32, key));
         }
         TAG_COMPARATOR => {
           // Skip comparator name (length-prefixed bytes).

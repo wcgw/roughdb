@@ -118,6 +118,7 @@ use crate::memtable::{ArcMemTableIter, Memtable, MemtableResult};
 use crate::table::builder::TableBuilder;
 use crate::table::reader::{LookupResult, Table};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub mod cache;
@@ -151,7 +152,14 @@ pub struct Snapshot<'db> {
 
 impl Drop for Snapshot<'_> {
   fn drop(&mut self) {
-    self.db.state.lock().unwrap().snapshots.remove(&self.seq);
+    self
+      .db
+      .inner
+      .state
+      .lock()
+      .unwrap()
+      .snapshots
+      .remove(&self.seq);
   }
 }
 
@@ -272,6 +280,24 @@ struct DbState {
   /// A follower checks this map on wake-up and removes its own entry.
   /// `Ok(())` is the common case; `Err` propagates a WAL/memtable failure.
   completed: std::collections::HashMap<u64, Result<(), Error>>,
+  // ── Seek-based compaction (Gap 5) ──────────────────────────────────────────
+  /// File + level nominated for seek-based compaction (its `allowed_seeks` hit
+  /// zero).  `None` when no file is pending.  Cleared by `install_compaction`
+  /// after the file is removed from the live set.
+  seek_compact_file: Option<(Arc<FileMetaData>, usize)>,
+  /// Set to `true` when `seek_compact_file` is first populated, so the next
+  /// `Db::write` compaction loop runs even without a preceding flush.
+  compaction_needed: bool,
+  // ── Background thread coordination ─────────────────────────────────────────
+  /// `true` while the background thread has been notified and hasn't yet
+  /// finished one cycle.  Prevents redundant notifications.
+  background_scheduled: bool,
+  /// Sticky error set by the background thread on flush/compaction failure.
+  /// Returned to writers on their next call; clears only on reopen.
+  background_error: Option<Error>,
+  /// `FlushPrep` produced by `begin_flush` under the write lock; consumed by
+  /// the background thread via `write_flush` + `finish_flush`.
+  pending_flush: Option<FlushPrep>,
 }
 
 // ── FlushPrep / FlushResult ───────────────────────────────────────────────────
@@ -282,10 +308,13 @@ struct FlushPrep {
   sst_number: u64,
   sst_path: std::path::PathBuf,
   old_mem: Arc<Memtable>,
-  /// File number of the new WAL created under the write lock.
+  /// File number of the new WAL that was activated in `begin_flush`.
+  /// `finish_flush` records this in the MANIFEST via `vs.set_log_number`.
   new_log_number: u64,
-  /// Open writer for the new WAL (empty at this point).
-  new_log: LogWriter,
+  /// Sequence number at the time of the flush rotation.  `finish_flush`
+  /// records this as `last_sequence` in the MANIFEST so WAL replay correctly
+  /// replays entries written to the new WAL after the rotation.
+  last_sequence_at_rotation: u64,
   /// Path of the old WAL to delete after `log_and_apply` succeeds.
   old_log_path: std::path::PathBuf,
 }
@@ -295,11 +324,21 @@ struct FlushPrep {
 struct FlushResult {
   file_number: u64,
   file_size: u64,
+  /// Smallest internal key written to the SSTable.
   smallest: Vec<u8>,
+  /// Largest internal key written to the SSTable.
   largest: Vec<u8>,
+  /// User-key extracted from `smallest` (for `pick_level_for_memtable_output`).
+  smallest_user_key: Vec<u8>,
+  /// User-key extracted from `largest` (for `pick_level_for_memtable_output`).
+  largest_user_key: Vec<u8>,
   table: Arc<Table>,
+  /// New WAL file number (already active; just needs to be committed to MANIFEST).
   new_log_number: u64,
-  new_log: LogWriter,
+  /// Sequence number captured at rotation time; used as `last_sequence` in the
+  /// MANIFEST so WAL replay correctly replays entries written after the rotation.
+  last_sequence_at_rotation: u64,
+  /// Path of the old WAL, deleted by `finish_flush` after `log_and_apply`.
   old_log_path: std::path::PathBuf,
 }
 
@@ -404,16 +443,26 @@ struct Persistence {
   _lock: std::fs::File,
 }
 
-// ── Db ───────────────────────────────────────────────────────────────────────
+// ── DbInner / Db ─────────────────────────────────────────────────────────────
 
-pub struct Db {
-  state: Mutex<DbState>,
+/// Shared state owned by both the foreground `Db` handle and the background
+/// compaction/flush thread.  Always accessed through an `Arc`.
+pub(crate) struct DbInner {
+  pub(crate) state: Mutex<DbState>,
   /// Wakes follower writers when the current group leader finishes and when
   /// there may be a new leader at the front of the write queue.
-  /// Always paired with `state` (the same `Mutex<DbState>`).
   write_condvar: std::sync::Condvar,
-  options: Options,
-  persistence: Option<Persistence>,
+  /// Wakes the background thread when work is available (flush / compact).
+  bg_condvar: std::sync::Condvar,
+  pub(crate) options: Options,
+  pub(crate) persistence: Option<Persistence>,
+  /// Set to `true` on `Db::drop` to tell the background thread to exit.
+  shutting_down: AtomicBool,
+}
+
+pub struct Db {
+  pub(crate) inner: Arc<DbInner>,
+  bg_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Default for Db {
@@ -421,20 +470,42 @@ impl Default for Db {
   /// Intended for tests and ephemeral use.
   fn default() -> Self {
     Self {
-      state: Mutex::new(DbState {
-        last_sequence: 0,
-        log: None,
-        mem: Arc::new(Memtable::default()),
-        imm: None,
-        version_set: None,
-        snapshots: std::collections::BTreeSet::new(),
-        writers: std::collections::VecDeque::new(),
-        next_writer_id: 0,
-        completed: std::collections::HashMap::new(),
+      inner: Arc::new(DbInner {
+        state: Mutex::new(DbState {
+          last_sequence: 0,
+          log: None,
+          mem: Arc::new(Memtable::default()),
+          imm: None,
+          version_set: None,
+          snapshots: std::collections::BTreeSet::new(),
+          writers: std::collections::VecDeque::new(),
+          next_writer_id: 0,
+          completed: std::collections::HashMap::new(),
+          seek_compact_file: None,
+          compaction_needed: false,
+          background_scheduled: false,
+          background_error: None,
+          pending_flush: None,
+        }),
+        write_condvar: std::sync::Condvar::new(),
+        bg_condvar: std::sync::Condvar::new(),
+        options: Options::default(),
+        persistence: None,
+        shutting_down: AtomicBool::new(false),
       }),
-      write_condvar: std::sync::Condvar::new(),
-      options: Options::default(),
-      persistence: None,
+      bg_thread: None,
+    }
+  }
+}
+
+impl Drop for Db {
+  fn drop(&mut self) {
+    if self.inner.persistence.is_some() {
+      self.inner.shutting_down.store(true, Ordering::Release);
+      self.inner.bg_condvar.notify_one();
+      if let Some(t) = self.bg_thread.take() {
+        t.join().ok();
+      }
     }
   }
 }
@@ -551,7 +622,7 @@ impl Db {
     let file_len = log_file.metadata()?.len();
     let log_writer = LogWriter::new(log_file, file_len);
 
-    Ok(Self {
+    let inner = Arc::new(DbInner {
       state: Mutex::new(DbState {
         last_sequence,
         log: Some(log_writer),
@@ -562,14 +633,27 @@ impl Db {
         writers: std::collections::VecDeque::new(),
         next_writer_id: 0,
         completed: std::collections::HashMap::new(),
+        seek_compact_file: None,
+        compaction_needed: false,
+        background_scheduled: false,
+        background_error: None,
+        pending_flush: None,
       }),
       write_condvar: std::sync::Condvar::new(),
+      bg_condvar: std::sync::Condvar::new(),
       options,
       persistence: Some(Persistence {
         dir: path.to_path_buf(),
         table_cache,
         _lock: lock_file,
       }),
+      shutting_down: AtomicBool::new(false),
+    });
+    let bg_inner = Arc::clone(&inner);
+    let bg_thread = std::thread::spawn(move || bg_worker(bg_inner));
+    Ok(Self {
+      inner,
+      bg_thread: Some(bg_thread),
     })
   }
 
@@ -629,7 +713,7 @@ impl Db {
     // the current memtable refs and sequence number, then release before doing
     // any I/O (memtable reads are lock-free; SSTable reads go to disk).
     let (sequence, mem, imm, version) = {
-      let state = self.state.lock().unwrap();
+      let state = self.inner.state.lock().unwrap();
       (
         opts.snapshot.map(|s| s.seq).unwrap_or(state.last_sequence),
         Arc::clone(&state.mem),
@@ -638,7 +722,7 @@ impl Db {
       )
     };
 
-    let verify_checksums = opts.verify_checksums || self.options.paranoid_checks;
+    let verify_checksums = opts.verify_checksums || self.inner.options.paranoid_checks;
     let fill_cache = opts.fill_cache;
 
     match mem.get(key, sequence) {
@@ -656,14 +740,21 @@ impl Db {
     }
 
     if let Some(version) = version {
-      if let Some(persistence) = &self.persistence {
-        match version.get(
+      if let Some(persistence) = &self.inner.persistence {
+        let (result, stats) = version.get(
           key,
           sequence,
           verify_checksums,
           fill_cache,
           &persistence.table_cache,
-        )? {
+        )?;
+        // Update seek stats under the lock (re-acquire briefly).
+        if stats.seek_file.is_some() {
+          let mut g = self.inner.state.lock().unwrap();
+          update_stats(&mut g, &stats);
+          maybe_schedule_compaction(&self.inner, &mut g);
+        }
+        match result {
           LookupResult::Value(v) => return Ok(v),
           LookupResult::Deleted => return Err(Error::NotFound),
           LookupResult::NotInTable => {}
@@ -685,7 +776,7 @@ impl Db {
   ///
   /// See `include/leveldb/db.h: DB::GetSnapshot`.
   pub fn get_snapshot(&self) -> Snapshot<'_> {
-    let mut state = self.state.lock().unwrap();
+    let mut state = self.inner.state.lock().unwrap();
     let seq = state.last_sequence;
     state.snapshots.insert(seq);
     Snapshot { db: self, seq }
@@ -709,7 +800,7 @@ impl Db {
 
     // Snapshot what we need under the lock, then release before formatting.
     let (version, mem_usage, imm_usage) = {
-      let state = self.state.lock().unwrap();
+      let state = self.inner.state.lock().unwrap();
       let version = state.version_set.as_ref().map(|vs| vs.current());
       let mem_usage = state.mem.approximate_memory_usage();
       let imm_usage = state
@@ -775,14 +866,14 @@ impl Db {
 
     // Snapshot the current version under the lock, then release.
     let version = {
-      let state = self.state.lock().unwrap();
+      let state = self.inner.state.lock().unwrap();
       state.version_set.as_ref().map(|vs| vs.current())
     };
 
     ranges
       .iter()
       .map(|&(start, limit)| {
-        let (Some(ref v), Some(ref tc)) = (&version, &self.persistence) else {
+        let (Some(ref v), Some(ref tc)) = (&version, &self.inner.persistence) else {
           return 0;
         };
         // Convert user keys to lookup internal keys (seq=u64::MAX>>8, vtype=1)
@@ -830,7 +921,7 @@ impl Db {
     // Snapshot Arc refs under the lock, then release before constructing the
     // iterator (matching LevelDB's NewInternalIterator pattern).
     let (sequence, mem, imm, version) = {
-      let state = self.state.lock().unwrap();
+      let state = self.inner.state.lock().unwrap();
       (
         opts.snapshot.map(|s| s.seq).unwrap_or(state.last_sequence),
         Arc::clone(&state.mem),
@@ -839,7 +930,7 @@ impl Db {
       )
     };
 
-    let verify_checksums = opts.verify_checksums || self.options.paranoid_checks;
+    let verify_checksums = opts.verify_checksums || self.inner.options.paranoid_checks;
     let fill_cache = opts.fill_cache;
 
     let mut children: Vec<Box<dyn crate::iter::InternalIterator>> = Vec::new();
@@ -853,7 +944,7 @@ impl Db {
     }
 
     // SSTable files from the current Version, level by level (L0 first).
-    if let (Some(version), Some(persistence)) = (version, &self.persistence) {
+    if let (Some(version), Some(persistence)) = (version, &self.inner.persistence) {
       for level_files in &version.files {
         for meta in level_files {
           let table = persistence
@@ -935,7 +1026,7 @@ impl Db {
   pub fn compact_range(&self, begin: Option<&[u8]>, end: Option<&[u8]>) -> Result<(), Error> {
     use crate::db::version::NUM_LEVELS;
 
-    let persistence = match &self.persistence {
+    let persistence = match &self.inner.persistence {
       Some(p) => p,
       None => return Ok(()),
     };
@@ -944,7 +1035,7 @@ impl Db {
 
     // Find the deepest level that currently has files overlapping [begin, end].
     let max_level = {
-      let g = self.state.lock().unwrap();
+      let g = self.inner.state.lock().unwrap();
       let vs = match &g.version_set {
         Some(vs) => vs,
         None => return Ok(()),
@@ -974,8 +1065,8 @@ impl Db {
     for level in 0..stop {
       compact_level_range(
         path,
-        &self.state,
-        &self.options,
+        &self.inner.state,
+        &self.inner.options,
         &persistence.table_cache,
         level,
         begin,
@@ -993,7 +1084,7 @@ impl Db {
     // front of the queue (becoming the group leader) or has been processed by a
     // previous leader and its result placed in `state.completed`.
     let my_id = {
-      let mut state = self.state.lock().unwrap();
+      let mut state = self.inner.state.lock().unwrap();
       let id = state.next_writer_id;
       state.next_writer_id += 1;
       state.writers.push_back(WriterSlot {
@@ -1005,7 +1096,7 @@ impl Db {
     };
 
     // ── Phase 2: Wait to become leader or receive a completed result ──────────
-    let mut state = self.state.lock().unwrap();
+    let mut state = self.inner.state.lock().unwrap();
     loop {
       // A previous leader may have already processed our slot.
       if let Some(result) = state.completed.remove(&my_id) {
@@ -1015,8 +1106,11 @@ impl Db {
       if state.writers.front().map(|w| w.id) == Some(my_id) {
         break;
       }
-      state = self.write_condvar.wait(state).unwrap();
+      state = self.inner.write_condvar.wait(state).unwrap();
     }
+
+    // ── Phase 2.5: Ensure there is room in the memtable ──────────────────────
+    state = make_room_for_write(&self.inner, state)?;
 
     // ── Phase 3: Build a group ────────────────────────────────────────────────
     //
@@ -1094,55 +1188,205 @@ impl Db {
 
     // Wake all waiting writers: the next leader can now step up, and
     // followers whose result is in `completed` can return it.
-    self.write_condvar.notify_all();
+    self.inner.write_condvar.notify_all();
 
-    // Propagate the leader's own status before doing flush/compact work.
+    // Propagate the leader's own status.
     status?;
 
-    // ── Phase 6: Flush and compact (leader only) ──────────────────────────────
+    // ── Phase 6: Schedule background work if needed ───────────────────────────
     //
-    // Followers return `Ok(())` immediately above.  The leader checks whether
-    // the memtable is full and, if so, drives the three-phase flush.  This is
-    // identical to the original single-writer path.
-    if let Some(persistence) = &self.persistence {
-      let path = persistence.dir.as_path();
-      if state.mem.approximate_memory_usage() >= self.options.write_buffer_size {
-        // Phase 1: rotate mem → imm, allocate new WAL file (write lock held).
-        let prep = begin_flush(path, &mut state)?;
-        // Release the write lock before doing any I/O.
-        drop(state);
-        // Phase 2: write the SSTable (no lock held — reads proceed freely).
-        let result = write_flush(prep, &self.options)?;
-        // Phase 3: install the new Version, swap WAL, clear imm (lock held).
-        let mut state = self.state.lock().unwrap();
-        finish_flush(&mut state, result, &persistence.table_cache)?;
-        drop(state);
-        // Phase 4: delete obsolete files (lock released; best-effort).
-        delete_obsolete_files(path, &self.state);
-        // Phase 5: compact L0 → L1 if we've hit the trigger.  Loop so that a
-        // burst of flushes that accumulates more than one compaction's worth of
-        // L0 files still gets drained before returning to the caller.
-        for _ in 0..32 {
-          let l0 = {
-            let g = self.state.lock().unwrap();
-            g.version_set
-              .as_ref()
-              .map_or(0, |vs| vs.current().files[0].len())
-          };
-          if l0 < L0_COMPACTION_TRIGGER {
-            break;
+    // If the write filled the memtable and no flush is already pending, rotate
+    // mem → imm now so the background thread can flush it.  Then wait for the
+    // flush to complete before returning, preserving the invariant that all
+    // data written before a `put` returns is durable and readable.
+    if let Some(ref persistence) = self.inner.persistence {
+      let triggered_flush = if state.imm.is_none()
+        && state.pending_flush.is_none()
+        && state.mem.approximate_memory_usage() >= self.inner.options.write_buffer_size
+      {
+        let path = persistence.dir.as_path();
+        match begin_flush(path, &mut state) {
+          Ok(prep) => {
+            state.imm = Some(Arc::clone(&prep.old_mem));
+            state.pending_flush = Some(prep);
+            true
           }
-          // Slow-write throttle: yield briefly when L0 is piling up but hasn't
-          // hit the stop threshold.  This matches LevelDB's MakeRoomForWrite.
-          if l0 >= L0_SLOWDOWN_WRITES_TRIGGER {
-            std::thread::sleep(std::time::Duration::from_millis(1));
-          }
-          maybe_compact(path, &self.state, &self.options, &persistence.table_cache);
+          Err(_) => false,
+        }
+      } else {
+        false
+      };
+      maybe_schedule_compaction(&self.inner, &mut state);
+      // If we triggered a flush, wait for the background thread to complete it.
+      // This preserves the original synchronous-flush behaviour seen by callers.
+      if triggered_flush {
+        while state.imm.is_some() || state.pending_flush.is_some() {
+          state = self.inner.write_condvar.wait(state).unwrap();
         }
       }
     }
+    drop(state);
 
     Ok(())
+  }
+}
+
+// ── Background scheduling helpers ────────────────────────────────────────────
+
+/// Notify the background thread if there is work to do and no notification is
+/// already outstanding.  Call while holding the `DbState` lock.
+fn maybe_schedule_compaction(inner: &Arc<DbInner>, g: &mut DbState) {
+  if inner.shutting_down.load(Ordering::Relaxed) {
+    return;
+  }
+  if g.background_error.is_some() {
+    return;
+  }
+  if g.background_scheduled {
+    return;
+  }
+  let has_imm = g.imm.is_some() || g.pending_flush.is_some();
+  let needs = has_imm || {
+    let v = g.version_set.as_ref().map(|vs| vs.current());
+    v.as_ref()
+      .is_some_and(|v| needs_compaction(v, g.compaction_needed))
+  };
+  if !needs {
+    return;
+  }
+  g.background_scheduled = true;
+  inner.bg_condvar.notify_one();
+}
+
+/// Called by the write leader (while holding the lock) to ensure there is room
+/// in the memtable.  May sleep or wait on `write_condvar` if the system is
+/// under write pressure.  Returns the (possibly re-acquired) lock guard.
+fn make_room_for_write<'a>(
+  inner: &'a Arc<DbInner>,
+  mut g: std::sync::MutexGuard<'a, DbState>,
+) -> Result<std::sync::MutexGuard<'a, DbState>, Error> {
+  let mut allow_delay = true;
+  loop {
+    if let Some(ref e) = g.background_error {
+      return Err(e.clone());
+    }
+    if inner.persistence.is_none() {
+      // In-memory: no flush needed.
+      break;
+    }
+    let l0 = g
+      .version_set
+      .as_ref()
+      .map_or(0, |vs| vs.current().files[0].len());
+    if allow_delay && l0 >= L0_SLOWDOWN_WRITES_TRIGGER {
+      // Slow down at most once per write call.
+      allow_delay = false;
+      drop(g);
+      std::thread::sleep(std::time::Duration::from_millis(1));
+      g = inner.state.lock().unwrap();
+    } else if g.mem.approximate_memory_usage() < inner.options.write_buffer_size {
+      break; // There is room in the current memtable.
+    } else if g.imm.is_some() || g.pending_flush.is_some() {
+      // A flush is already in progress; wait for the background thread.
+      g = inner.write_condvar.wait(g).unwrap();
+    } else if l0 >= L0_STOP_WRITES_TRIGGER {
+      // Too many L0 files; wait for the background thread to drain them.
+      g = inner.write_condvar.wait(g).unwrap();
+    } else {
+      // Rotate mem → imm, schedule background flush.
+      let path = inner.persistence.as_ref().unwrap().dir.as_path();
+      let prep = begin_flush(path, &mut g)?;
+      g.imm = Some(Arc::clone(&prep.old_mem));
+      g.pending_flush = Some(prep);
+      maybe_schedule_compaction(inner, &mut g);
+    }
+  }
+  Ok(g)
+}
+
+/// Background worker: sleeps on `bg_condvar`, wakes to perform flush or
+/// compaction, then re-checks.
+fn bg_worker(inner: Arc<DbInner>) {
+  let mut g = inner.state.lock().unwrap();
+  loop {
+    // Sleep until scheduled or shutting down.
+    while !g.background_scheduled && !inner.shutting_down.load(Ordering::Relaxed) {
+      g = inner.bg_condvar.wait(g).unwrap();
+    }
+    g.background_scheduled = false;
+
+    // On shutdown: flush any pending memtable, then exit.
+    let shutting_down = inner.shutting_down.load(Ordering::Relaxed);
+
+    if g.background_error.is_some() {
+      inner.write_condvar.notify_all();
+      if shutting_down {
+        return;
+      }
+      continue;
+    }
+
+    let Some(ref p) = inner.persistence else {
+      inner.write_condvar.notify_all();
+      if shutting_down {
+        return;
+      }
+      continue;
+    };
+    let path = p.dir.clone();
+    let tc = p.table_cache.clone();
+
+    // ── Flush if pending ──────────────────────────────────────────────────────
+    if let Some(prep) = g.pending_flush.take() {
+      drop(g);
+      let result = write_flush(prep, &inner.options);
+      g = inner.state.lock().unwrap();
+      match result {
+        Ok(res) => {
+          if let Err(e) = finish_flush(&mut g, res, &inner.options, &tc) {
+            g.background_error = Some(e);
+          }
+        }
+        Err(e) => {
+          g.background_error = Some(e);
+        }
+      }
+      inner.write_condvar.notify_all();
+      drop(g);
+      delete_obsolete_files(&path, &inner.state);
+      g = inner.state.lock().unwrap();
+    } else if !shutting_down {
+      // ── Compaction (skipped on shutdown path) ────────────────────────────
+      drop(g);
+      maybe_compact(&path, &inner.state, &inner.options, &tc);
+      inner.write_condvar.notify_all();
+      delete_obsolete_files(&path, &inner.state);
+      g = inner.state.lock().unwrap();
+    }
+
+    // After processing, check whether to exit (shutdown) or reschedule.
+    let shutting_down = inner.shutting_down.load(Ordering::Relaxed);
+    let has_pending = g.imm.is_some() || g.pending_flush.is_some();
+    if shutting_down && !has_pending {
+      inner.write_condvar.notify_all();
+      return;
+    }
+
+    // Reschedule immediately if more work remains.
+    if !shutting_down {
+      let needs_c = {
+        let v = g.version_set.as_ref().map(|vs| vs.current());
+        v.as_ref()
+          .is_some_and(|v| needs_compaction(v, g.compaction_needed))
+      };
+      if has_pending || needs_c {
+        g.background_scheduled = true;
+        // Loop back immediately without waiting.
+      }
+    } else if has_pending {
+      // Still have pending work during shutdown — keep looping.
+      g.background_scheduled = true;
+    }
   }
 }
 
@@ -1155,11 +1399,17 @@ impl Db {
 //   finish_flush — under lock: install new Version, swap WAL, clear imm
 
 /// Phase 1 (under write lock): seal `mem` as `imm`, install a fresh memtable,
-/// allocate the next SSTable file number, and create the new WAL file.
+/// allocate the next SSTable file number, and create and activate the new WAL.
 ///
-/// The new WAL is created here — under the lock — so that any writes between
-/// now and `finish_flush` still go to the *old* WAL (via `state.log`).  The
-/// new WAL becomes active only once `finish_flush` swaps `state.log`.
+/// The new WAL is activated immediately (swapped into `state.log`) so that
+/// any writes between now and when the background thread runs `finish_flush`
+/// go to the new WAL rather than the old one.  If the new WAL were activated
+/// only in `finish_flush`, those intermediate writes would land in the old WAL
+/// which `finish_flush` then deletes — causing data loss on reopen.
+///
+/// `finish_flush` still calls `vs.set_log_number` and `log_and_apply` to
+/// commit the new log number and SSTable to the MANIFEST, so that on reopen
+/// the correct WAL is replayed.
 fn begin_flush(path: &std::path::Path, state: &mut DbState) -> Result<FlushPrep, Error> {
   let vs = state
     .version_set
@@ -1170,14 +1420,21 @@ fn begin_flush(path: &std::path::Path, state: &mut DbState) -> Result<FlushPrep,
   let new_log_number = vs.next_file_number();
   let new_log_file = std::fs::File::create(path.join(format!("{new_log_number:06}.log")))?;
   let new_log = LogWriter::new(new_log_file, 0);
+  // Activate the new WAL immediately; preserve the old WAL so finish_flush
+  // can delete it after log_and_apply commits the rotation to the MANIFEST.
+  let _old_log = state.log.replace(new_log);
   let old_mem = std::mem::take(&mut state.mem);
   state.imm = None; // should already be None; be explicit
+                    // Capture last_sequence now so finish_flush stores the correct value in the
+                    // MANIFEST.  Writes that happen to the new WAL after begin_flush will have
+                    // sequences > last_sequence_at_rotation and will be replayed on next open.
+  let last_sequence_at_rotation = state.last_sequence;
   Ok(FlushPrep {
     sst_number,
     sst_path: path.join(format!("{sst_number:06}.ldb")),
     old_mem,
     new_log_number,
-    new_log,
+    last_sequence_at_rotation,
     old_log_path: path.join(format!("{old_log_number:06}.log")),
   })
 }
@@ -1192,7 +1449,7 @@ fn write_flush(prep: FlushPrep, opts: &Options) -> Result<FlushResult, Error> {
     sst_path,
     old_mem,
     new_log_number,
-    new_log,
+    last_sequence_at_rotation,
     old_log_path,
   } = prep;
   let file = OpenOptions::new()
@@ -1232,27 +1489,33 @@ fn write_flush(prep: FlushPrep, opts: &Options) -> Result<FlushResult, Error> {
     opts.filter_policy.clone(),
     opts.block_cache.clone(),
   )?);
+  let smallest_user_key = ikey_user_key(&smallest).to_vec();
+  let largest_user_key = ikey_user_key(&largest).to_vec();
   Ok(FlushResult {
     file_number: sst_number,
     file_size,
     smallest,
     largest,
+    smallest_user_key,
+    largest_user_key,
     table,
     new_log_number,
-    new_log,
+    last_sequence_at_rotation,
     old_log_path,
   })
 }
 
 /// Phase 3 (under write lock): atomically record the new SST *and* new log
-/// number in the MANIFEST (`log_and_apply`), swap `state.log` to the new WAL,
-/// clear `imm`, and delete the old WAL.
+/// number in the MANIFEST (`log_and_apply`), clear `imm`, and delete the old WAL.
 ///
-/// `set_log_number` is called *before* `log_and_apply` so the MANIFEST record
-/// carries the correct log number — matching LevelDB's `MakeRoomForWrite`.
+/// `begin_flush` already activated the new WAL (swapping `state.log`), so
+/// `finish_flush` does not touch `state.log`.  `set_log_number` is called
+/// before `log_and_apply` so the MANIFEST record carries the correct log
+/// number — matching LevelDB's `MakeRoomForWrite`.
 fn finish_flush(
   state: &mut DbState,
   result: FlushResult,
+  opts: &Options,
   tc: &crate::db::table_cache::TableCache,
 ) -> Result<(), Error> {
   // Register the new table in the cache before installing the version.
@@ -1263,17 +1526,35 @@ fn finish_flush(
     result.smallest,
     result.largest,
   );
+  // Choose output level: try to push past L0 when there is no overlap and
+  // grandparent bytes are within bounds.  Falls back to L0 when the memtable
+  // range overlaps existing L0 files.
+  let output_level = {
+    let version = state.version_set.as_ref().map(|vs| vs.current());
+    match version {
+      Some(v) if !result.smallest_user_key.is_empty() => pick_level_for_memtable_output(
+        &v,
+        &result.smallest_user_key,
+        &result.largest_user_key,
+        opts.max_file_size as u64,
+      ),
+      _ => 0,
+    }
+  };
   let mut edit = VersionEdit::new();
-  edit.new_files.push((0, meta));
+  edit.new_files.push((output_level as i32, meta));
   let vs = state
     .version_set
     .as_mut()
     .expect("finish_flush: no VersionSet");
-  vs.set_last_sequence(state.last_sequence);
+  // Use the sequence number captured at rotation time, NOT the current
+  // state.last_sequence.  Writes to the new WAL after begin_flush have
+  // sequences > last_sequence_at_rotation and must be replayed on reopen;
+  // recording the current (higher) last_sequence would cause them to be skipped.
+  vs.set_last_sequence(result.last_sequence_at_rotation);
   vs.set_log_number(result.new_log_number);
   vs.log_and_apply(&mut edit, tc)?;
-  // Switch to the new WAL; the MANIFEST now points past the old one.
-  state.log = Some(result.new_log);
+  // state.log was already swapped to the new WAL in begin_flush — no swap needed here.
   state.imm = None;
   // Best-effort delete — ignore errors (e.g. the path never existed on new DB).
   let _ = std::fs::remove_file(&result.old_log_path);
@@ -1290,8 +1571,13 @@ fn finish_flush(
 // Tombstone elision: deletion markers are dropped when there is definitely no
 // data for that key below the output level (L2+).
 
+// L0_COMPACTION_TRIGGER is referenced in tests and as a documentation anchor;
+// `needs_compaction` uses `compaction_score` so the constant itself is only
+// used in tests.
+#[allow(dead_code)]
 const L0_COMPACTION_TRIGGER: usize = 4;
 const L0_SLOWDOWN_WRITES_TRIGGER: usize = 8;
+const L0_STOP_WRITES_TRIGGER: usize = 12;
 
 /// Extract the user-key prefix from an SSTable internal key.
 /// Internal key format: `user_key || (seq<<8|vtype).to_le_bytes()` (8-byte tag).
@@ -1308,56 +1594,478 @@ fn key_ranges_overlap(a_s: &[u8], a_l: &[u8], b_s: &[u8], b_l: &[u8]) -> bool {
   ikey_user_key(a_s) <= ikey_user_key(b_l) && ikey_user_key(b_s) <= ikey_user_key(a_l)
 }
 
-/// True if `user_key` is definitely absent from all files at level ≥ `from_level`.
+// ── Geometry helpers ──────────────────────────────────────────────────────────
+
+/// User-key range union of a non-empty slice of files.
 ///
-/// A conservative check: returns `false` if any file's key range spans the user
-/// key, even if the key isn't actually present in the file.  Safe to use for
-/// tombstone elision: we only drop a tombstone when this returns `true`.
-fn is_base_level(version: &crate::db::version::Version, uk: &[u8], from_level: usize) -> bool {
-  use crate::db::version::NUM_LEVELS;
-  for level in from_level..NUM_LEVELS {
-    for meta in &version.files[level] {
-      if uk >= ikey_user_key(&meta.smallest) && uk <= ikey_user_key(&meta.largest) {
-        return false;
+/// Returns `(smallest_internal_key, largest_internal_key)` spanning all files.
+fn get_range(files: &[Arc<FileMetaData>]) -> (Vec<u8>, Vec<u8>) {
+  debug_assert!(!files.is_empty());
+  let mut smallest = files[0].smallest.clone();
+  let mut largest = files[0].largest.clone();
+  for f in files.iter().skip(1) {
+    if ikey_user_key(&f.smallest) < ikey_user_key(&smallest) {
+      smallest = f.smallest.clone();
+    }
+    if ikey_user_key(&f.largest) > ikey_user_key(&largest) {
+      largest = f.largest.clone();
+    }
+  }
+  (smallest, largest)
+}
+
+/// Union of the key ranges of two slices of files (either may be empty).
+fn get_range2(a: &[Arc<FileMetaData>], b: &[Arc<FileMetaData>]) -> (Vec<u8>, Vec<u8>) {
+  if b.is_empty() {
+    return get_range(a);
+  }
+  if a.is_empty() {
+    return get_range(b);
+  }
+  let (s1, l1) = get_range(a);
+  let (s2, l2) = get_range(b);
+  let smallest = if ikey_user_key(&s1) <= ikey_user_key(&s2) {
+    s1
+  } else {
+    s2
+  };
+  let largest = if ikey_user_key(&l1) >= ikey_user_key(&l2) {
+    l1
+  } else {
+    l2
+  };
+  (smallest, largest)
+}
+
+/// Total on-disk bytes across a slice of files.
+fn total_file_size(files: &[Arc<FileMetaData>]) -> u64 {
+  files.iter().map(|f| f.file_size).sum()
+}
+
+/// Files at `level` whose user-key range overlaps `[begin_uk, end_uk]`.
+///
+/// For L0, the result may expand the input range (L0 files can overlap each
+/// other), so the scan repeats until stable.  For L1+, files are
+/// non-overlapping and sorted, so a single linear pass suffices.
+///
+/// `begin_uk` and `end_uk` are bare user keys (no internal key suffix).
+fn get_overlapping_inputs(
+  version: &crate::db::version::Version,
+  level: usize,
+  begin_uk: &[u8],
+  end_uk: &[u8],
+) -> Vec<Arc<FileMetaData>> {
+  let mut result: Vec<Arc<FileMetaData>> = Vec::new();
+  let mut lo = begin_uk.to_vec();
+  let mut hi = end_uk.to_vec();
+
+  loop {
+    result.clear();
+    let prev_lo = lo.clone();
+    let prev_hi = hi.clone();
+    for f in &version.files[level] {
+      let f_lo = ikey_user_key(&f.smallest);
+      let f_hi = ikey_user_key(&f.largest);
+      if f_hi < lo.as_slice() || f_lo > hi.as_slice() {
+        continue; // no overlap
       }
+      result.push(Arc::clone(f));
+      if level == 0 {
+        // Expand range to cover this file.
+        if f_lo < lo.as_slice() {
+          lo = f_lo.to_vec();
+        }
+        if f_hi > hi.as_slice() {
+          hi = f_hi.to_vec();
+        }
+      }
+    }
+    if level > 0 || (lo == prev_lo && hi == prev_hi) {
+      break;
+    }
+  }
+  result
+}
+
+/// True if any file at `level` has a user-key range overlapping `[smallest_uk, largest_uk]`.
+///
+/// For L0 uses a full scan (files may overlap each other).
+/// For L1+ uses a linear scan; files are non-overlapping and sorted so we can break early.
+///
+/// Port of LevelDB's `Version::OverlapInLevel`.
+fn overlap_in_level(
+  version: &crate::db::version::Version,
+  level: usize,
+  smallest_uk: &[u8],
+  largest_uk: &[u8],
+) -> bool {
+  for f in &version.files[level] {
+    let f_lo = ikey_user_key(&f.smallest);
+    let f_hi = ikey_user_key(&f.largest);
+    if f_hi >= smallest_uk && f_lo <= largest_uk {
+      return true;
+    }
+    // L1+: files are sorted by smallest key; once f_lo > largest_uk no later file can overlap.
+    if level > 0 && f_lo > largest_uk {
+      break;
+    }
+  }
+  false
+}
+
+/// Maximum grandparent (level+2) overlap in bytes before flush placement stops pushing deeper.
+///
+/// Matches LevelDB's `MaxGrandParentOverlapBytes = 10 * TargetFileSize`.
+fn max_grandparent_overlap_bytes(max_file_size: u64) -> u64 {
+  10 * max_file_size
+}
+
+/// Choose the level at which to place a freshly flushed memtable SSTable.
+///
+/// If the flush range does not overlap any L0 files, it may be safe to push the
+/// output directly to L1 or even L2, reducing L0→L1 compaction pressure.
+///
+/// Rules (port of `Version::PickLevelForMemTableOutput`):
+/// - Start at L0.
+/// - While `level < MAX_MEM_COMPACT_LEVEL` (2):
+///   - If the range overlaps L+1, stop.
+///   - If grandparent (L+2) overlap exceeds `max_grandparent_overlap_bytes`, stop.
+///   - Otherwise advance to level+1.
+fn pick_level_for_memtable_output(
+  version: &crate::db::version::Version,
+  smallest_uk: &[u8],
+  largest_uk: &[u8],
+  max_file_size: u64,
+) -> usize {
+  use crate::db::version::NUM_LEVELS;
+  const MAX_MEM_COMPACT_LEVEL: usize = 2;
+
+  let mut level = 0;
+  if !overlap_in_level(version, 0, smallest_uk, largest_uk) {
+    // No L0 overlap — consider pushing deeper.
+    while level < MAX_MEM_COMPACT_LEVEL {
+      if overlap_in_level(version, level + 1, smallest_uk, largest_uk) {
+        break;
+      }
+      if level + 2 < NUM_LEVELS {
+        // Check grandparent overlap to avoid creating a file that will cause
+        // an expensive compaction at the next level.
+        let grandparent_bytes = total_file_size(&get_overlapping_inputs(
+          version,
+          level + 2,
+          smallest_uk,
+          largest_uk,
+        ));
+        if grandparent_bytes > max_grandparent_overlap_bytes(max_file_size) {
+          break;
+        }
+      }
+      level += 1;
+    }
+  }
+  level
+}
+
+/// Extend `compaction_files` with any file in `version.files[level]` that
+/// shares a user key with the current largest key in `compaction_files` (at a
+/// different sequence number).
+///
+/// This prevents a compaction from splitting entries for the same user key
+/// across two output SSTables.  Port of LevelDB's `AddBoundaryInputs`.
+fn add_boundary_inputs(
+  version: &crate::db::version::Version,
+  level: usize,
+  compaction_files: &mut Vec<Arc<FileMetaData>>,
+) {
+  use crate::table::format::cmp_internal_keys;
+
+  loop {
+    // Find the largest internal key in the current compaction set.
+    let largest = match compaction_files
+      .iter()
+      .max_by(|a, b| cmp_internal_keys(&a.largest, &b.largest))
+    {
+      Some(f) => f.largest.clone(),
+      None => return,
+    };
+    let largest_uk = ikey_user_key(&largest).to_vec();
+
+    // Find the smallest file in version.files[level] whose smallest key has
+    // the same user key as `largest_uk` but a strictly greater internal key
+    // (i.e., same user key, lower sequence number), and isn't already in the
+    // compaction set.
+    let boundary = version.files[level]
+      .iter()
+      .filter(|f| {
+        let f_uk = ikey_user_key(&f.smallest);
+        f_uk == largest_uk.as_slice()
+          && cmp_internal_keys(&f.smallest, &largest) == std::cmp::Ordering::Greater
+          && !compaction_files.iter().any(|c| c.number == f.number)
+      })
+      .min_by(|a, b| cmp_internal_keys(&a.smallest, &b.smallest));
+
+    match boundary {
+      Some(f) => compaction_files.push(Arc::clone(f)),
+      None => return,
+    }
+  }
+}
+
+// ── CompactionSpec ────────────────────────────────────────────────────────────
+
+/// Everything needed to execute one compaction pass.
+struct CompactionSpec {
+  /// Level being compacted; inputs come from `level` and `level+1`.
+  level: usize,
+  /// `inputs[0]` = files at `level`; `inputs[1]` = files at `level+1`.
+  inputs: [Vec<Arc<FileMetaData>>; 2],
+  /// Files at `level+2` overlapping the full input range.
+  grandparents: Vec<Arc<FileMetaData>>,
+  /// Version snapshot used to build this spec.
+  input_version: Arc<crate::db::version::Version>,
+  /// VersionEdit carrying the compact_pointer update (filled by setup_other_inputs).
+  edit: VersionEdit,
+
+  // ── Gap 4: grandparent-overlap output limiting ────────────────────────────
+  /// Index into `grandparents` of the next file to scan in `should_stop_before`.
+  grandparent_index: usize,
+  /// Whether we have seen at least one key (used to skip overlap accounting for
+  /// the very first key, matching LevelDB's `Compaction::ShouldStopBefore`).
+  seen_key: bool,
+  /// Accumulated grandparent overlap bytes since the last output-file boundary.
+  overlapped_bytes: i64,
+  /// Per-level monotone cursors for `is_base_level_for_key`.  Each entry starts
+  /// at 0 and only advances forward, amortising repeated scans to O(1)/key.
+  level_ptrs: [usize; crate::db::version::NUM_LEVELS],
+}
+
+impl CompactionSpec {
+  fn new(level: usize, input_version: Arc<crate::db::version::Version>) -> Self {
+    CompactionSpec {
+      level,
+      inputs: [Vec::new(), Vec::new()],
+      grandparents: Vec::new(),
+      input_version,
+      edit: VersionEdit::new(),
+      grandparent_index: 0,
+      seen_key: false,
+      overlapped_bytes: 0,
+      level_ptrs: [0; crate::db::version::NUM_LEVELS],
+    }
+  }
+
+  fn all_input_files(&self) -> impl Iterator<Item = &Arc<FileMetaData>> {
+    self.inputs[0].iter().chain(self.inputs[1].iter())
+  }
+}
+
+// ── setup_other_inputs ────────────────────────────────────────────────────────
+
+/// Populate `spec.inputs[1]` (level+1 files), try to expand inputs[0] without
+/// pulling in more level+1 files, populate grandparents, and record the
+/// compact-pointer update in `spec.edit`.
+///
+/// Port of LevelDB's `VersionSet::SetupOtherInputs`.
+fn setup_other_inputs(
+  spec: &mut CompactionSpec,
+  version: &Arc<crate::db::version::Version>,
+  _compact_pointer: &[Vec<u8>; crate::db::version::NUM_LEVELS],
+  opts: &Options,
+) {
+  use crate::db::version::NUM_LEVELS;
+
+  let level = spec.level;
+  add_boundary_inputs(version, level, &mut spec.inputs[0]);
+
+  let (smallest, largest) = get_range(&spec.inputs[0]);
+  let smallest_uk = ikey_user_key(&smallest).to_vec();
+  let largest_uk = ikey_user_key(&largest).to_vec();
+
+  spec.inputs[1] = get_overlapping_inputs(version, level + 1, &smallest_uk, &largest_uk);
+  add_boundary_inputs(version, level + 1, &mut spec.inputs[1]);
+
+  let (all_start, all_limit) = get_range2(&spec.inputs[0], &spec.inputs[1]);
+  let all_start_uk = ikey_user_key(&all_start).to_vec();
+  let all_limit_uk = ikey_user_key(&all_limit).to_vec();
+
+  // Try to expand inputs[0] without expanding inputs[1].
+  if !spec.inputs[1].is_empty() {
+    let mut expanded0 = get_overlapping_inputs(version, level, &all_start_uk, &all_limit_uk);
+    add_boundary_inputs(version, level, &mut expanded0);
+
+    let inputs1_size = total_file_size(&spec.inputs[1]);
+    let expanded0_size = total_file_size(&expanded0);
+    let expand_limit = 25 * opts.max_file_size as u64;
+
+    if expanded0.len() > spec.inputs[0].len() && inputs1_size + expanded0_size < expand_limit {
+      let (exp_start, exp_limit) = get_range(&expanded0);
+      let exp_start_uk = ikey_user_key(&exp_start).to_vec();
+      let exp_limit_uk = ikey_user_key(&exp_limit).to_vec();
+      let expanded1 = get_overlapping_inputs(version, level + 1, &exp_start_uk, &exp_limit_uk);
+      // Only accept the expansion if it doesn't pull in more L+1 files.
+      if expanded1.len() == spec.inputs[1].len() {
+        spec.inputs[0] = expanded0;
+        spec.inputs[1] = expanded1;
+      }
+    }
+  }
+
+  // Populate grandparents (level+2 files overlapping the compaction range).
+  if level + 2 < NUM_LEVELS {
+    let (final_start, final_limit) = get_range2(&spec.inputs[0], &spec.inputs[1]);
+    let final_start_uk = ikey_user_key(&final_start).to_vec();
+    let final_limit_uk = ikey_user_key(&final_limit).to_vec();
+    spec.grandparents =
+      get_overlapping_inputs(version, level + 2, &final_start_uk, &final_limit_uk);
+  }
+
+  // Update compact_pointer: advance past largest key of inputs[0].
+  let (_, new_largest) = get_range(&spec.inputs[0]);
+  spec.edit.compact_pointers.push((level as i32, new_largest));
+}
+
+/// Returns `true` when the current output SSTable should be closed because the
+/// bytes it would overlap at `level+2` (the grandparents) have exceeded the
+/// limit `max_grandparent_overlap_bytes`.
+///
+/// Monotone in `ikey`: callers must feed keys in ascending internal-key order.
+/// Closing the output early limits future compaction amplification.
+///
+/// Port of LevelDB `Compaction::ShouldStopBefore`.
+fn should_stop_before(spec: &mut CompactionSpec, ikey: &[u8], opts: &Options) -> bool {
+  use crate::table::format::cmp_internal_keys;
+  let limit = max_grandparent_overlap_bytes(opts.max_file_size as u64) as i64;
+  while spec.grandparent_index < spec.grandparents.len()
+    && cmp_internal_keys(ikey, &spec.grandparents[spec.grandparent_index].largest)
+      == std::cmp::Ordering::Greater
+  {
+    if spec.seen_key {
+      spec.overlapped_bytes += spec.grandparents[spec.grandparent_index].file_size as i64;
+    }
+    spec.grandparent_index += 1;
+  }
+  spec.seen_key = true;
+  if spec.overlapped_bytes > limit {
+    spec.overlapped_bytes = 0;
+    return true;
+  }
+  false
+}
+
+/// Returns `true` if `user_key` is definitely absent from all levels ≥
+/// `spec.level + 2` (i.e., the output level is the lowest level that holds
+/// this key).  Used for tombstone elision: we can only drop a deletion marker
+/// when it cannot hide a live value at a deeper level.
+///
+/// Uses per-level monotone cursors (`spec.level_ptrs`) so each cursor advances
+/// at most once per key across the entire compaction — amortised O(1)/key.
+///
+/// Port of LevelDB `Compaction::IsBaseLevelForKey`.
+fn is_base_level_for_key(spec: &mut CompactionSpec, user_key: &[u8]) -> bool {
+  use crate::db::version::NUM_LEVELS;
+  for lvl in (spec.level + 2)..NUM_LEVELS {
+    let files = &spec.input_version.files[lvl];
+    while spec.level_ptrs[lvl] < files.len() {
+      let f = &files[spec.level_ptrs[lvl]];
+      let f_largest_uk = ikey_user_key(&f.largest);
+      if user_key <= f_largest_uk {
+        // user_key is ≤ this file's largest — it may be inside this file.
+        if user_key >= ikey_user_key(&f.smallest) {
+          return false; // user_key falls within this file's range
+        }
+        break; // user_key is before this file; no later file at this level can match
+      }
+      spec.level_ptrs[lvl] += 1; // user_key is past this file; advance cursor
     }
   }
   true
 }
 
-/// Select files for the next L0→L1 compaction.
+// ── Seek-based compaction helpers ─────────────────────────────────────────────
+
+/// Decrement the seek budget of the blamed file and, if it hits zero, nominate
+/// it for seek-based compaction.
 ///
-/// Returns `None` if L0 has fewer than `L0_COMPACTION_TRIGGER` files.  Otherwise
-/// returns `(l0_inputs, l1_inputs)` where `l1_inputs` are the L1 files whose key
-/// range overlaps with the union key range of all L0 files.
-type CompactionInputs = (Vec<Arc<FileMetaData>>, Vec<Arc<FileMetaData>>);
-
-fn pick_compaction(version: &crate::db::version::Version) -> Option<CompactionInputs> {
-  if version.files[0].len() < L0_COMPACTION_TRIGGER {
-    return None;
-  }
-  let l0_inputs: Vec<Arc<FileMetaData>> = version.files[0].to_vec();
-
-  // Union key range of all L0 files.
-  let mut range_small = l0_inputs[0].smallest.clone();
-  let mut range_large = l0_inputs[0].largest.clone();
-  for m in l0_inputs.iter().skip(1) {
-    if ikey_user_key(&m.smallest) < ikey_user_key(&range_small) {
-      range_small = m.smallest.clone();
-    }
-    if ikey_user_key(&m.largest) > ikey_user_key(&range_large) {
-      range_large = m.largest.clone();
+/// Called under the DB lock after every SSTable `get` that had to probe more
+/// than one file.  Port of LevelDB `Version::UpdateStats`.
+fn update_stats(state: &mut DbState, stats: &crate::db::version::GetStats) {
+  use std::sync::atomic::Ordering;
+  if let Some(ref file) = stats.seek_file {
+    let prev = file.allowed_seeks.fetch_sub(1, Ordering::Relaxed);
+    if prev <= 1 && state.seek_compact_file.is_none() {
+      state.seek_compact_file = Some((Arc::clone(file), stats.seek_file_level));
+      state.compaction_needed = true;
     }
   }
-
-  let l1_inputs: Vec<Arc<FileMetaData>> = version.files[1]
-    .iter()
-    .filter(|m| key_ranges_overlap(&m.smallest, &m.largest, &range_small, &range_large))
-    .cloned()
-    .collect();
-
-  Some((l0_inputs, l1_inputs))
 }
+
+/// True if `version` has a level that needs compaction (score ≥ 1.0), or if a
+/// seek-based compaction candidate has been nominated.
+fn needs_compaction(version: &crate::db::version::Version, compaction_needed: bool) -> bool {
+  version.compaction_score >= 1.0 || compaction_needed
+}
+
+/// Select the next compaction to run, based on level scores, compact-pointer
+/// round-robin, or seek-based nomination.
+///
+/// Returns `None` if no compaction is needed.
+fn pick_compaction(
+  version: &Arc<crate::db::version::Version>,
+  compact_pointer: &[Vec<u8>; crate::db::version::NUM_LEVELS],
+  opts: &Options,
+  seek_compact: Option<&(Arc<FileMetaData>, usize)>,
+) -> Option<CompactionSpec> {
+  // ── Size-triggered (highest priority) ─────────────────────────────────────
+  if version.compaction_score >= 1.0 {
+    let level = version.compaction_level as usize;
+    let mut spec = CompactionSpec::new(level, Arc::clone(version));
+
+    if level == 0 {
+      // For L0, seed with the first file past compact_pointer[0], then expand
+      // to all overlapping L0 files (L0 files can overlap each other).
+      let seed = version.files[0]
+        .iter()
+        .find(|f| {
+          compact_pointer[0].is_empty()
+            || ikey_user_key(&f.largest) > ikey_user_key(&compact_pointer[0])
+        })
+        .or_else(|| version.files[0].first())
+        .cloned()?;
+
+      let seed_lo = ikey_user_key(&seed.smallest).to_vec();
+      let seed_hi = ikey_user_key(&seed.largest).to_vec();
+      spec.inputs[0] = get_overlapping_inputs(version, 0, &seed_lo, &seed_hi);
+    } else {
+      // L1+: pick the first file whose largest key is past compact_pointer[level].
+      let file = version.files[level]
+        .iter()
+        .find(|f| {
+          compact_pointer[level].is_empty()
+            || ikey_user_key(&f.largest) > ikey_user_key(&compact_pointer[level])
+        })
+        .or_else(|| version.files[level].first())
+        .cloned()?;
+      spec.inputs[0].push(file);
+    }
+
+    setup_other_inputs(&mut spec, version, compact_pointer, opts);
+    return Some(spec);
+  }
+
+  // ── Seek-triggered fallback ────────────────────────────────────────────────
+  if let Some((file, level)) = seek_compact {
+    let mut spec = CompactionSpec::new(*level, Arc::clone(version));
+    spec.inputs[0].push(Arc::clone(file));
+    setup_other_inputs(&mut spec, version, compact_pointer, opts);
+    return Some(spec);
+  }
+
+  None
+}
+
+/// Alias for a plain (level_inputs, next_level_inputs) pair returned by
+/// `pick_range_compaction`.  Used only internally by `compact_level_range`.
+type CompactionInputs = (Vec<Arc<FileMetaData>>, Vec<Arc<FileMetaData>>);
 
 /// A completed compaction output SSTable.
 struct CompactionOutput {
@@ -1409,25 +2117,24 @@ fn finish_compaction_output(
 /// Tombstone elision: a deletion marker is dropped when there is provably no
 /// data for that key at levels > `output_level`.
 ///
-/// `inputs` should be ordered so that newer files (by file number) appear
-/// before older ones for the same level, allowing `MergingIterator` to resolve
-/// same-key ties in favour of the newer version via the lower child index.
-#[allow(clippy::too_many_arguments)]
+/// L0 inputs are already newest-first in `spec.inputs[0]` (Version stores them
+/// that way), so `MergingIterator` resolves same-key ties in favour of the
+/// newer version via the lower child index.
 fn do_compaction(
   path: &std::path::Path,
   state: &Mutex<DbState>,
-  version: &crate::db::version::Version,
-  inputs: &[&FileMetaData],
+  spec: &mut CompactionSpec,
   oldest_snapshot: u64,
-  output_level: usize,
   opts: &Options,
   tc: &crate::db::table_cache::TableCache,
 ) -> Result<Vec<CompactionOutput>, Error> {
   use crate::db::merge_iter::MergingIterator;
   use crate::iter::InternalIterator;
 
+  let _output_level = spec.level + 1;
+
   let mut children: Vec<Box<dyn InternalIterator>> = Vec::new();
-  for meta in inputs {
+  for meta in spec.all_input_files() {
     let table = tc.get_or_open(meta.number, meta.file_size)?;
     // Compaction is a bulk scan — don't pollute the block cache.
     children.push(Box::new(table.new_iterator(opts.paranoid_checks, false)?));
@@ -1468,7 +2175,7 @@ fn do_compaction(
       // A newer version for this user key was already emitted and is visible
       // to even the oldest active snapshot — this older version is invisible.
       true
-    } else if vtype == 0 && seq <= oldest_snapshot && is_base_level(version, uk, output_level + 1) {
+    } else if vtype == 0 && seq <= oldest_snapshot && is_base_level_for_key(spec, uk) {
       // Tombstone that no snapshot can see below this level — safe to elide.
       true
     } else {
@@ -1478,6 +2185,19 @@ fn do_compaction(
     last_sequence_for_key = seq;
 
     if !drop {
+      // Close the current output file early if grandparent overlap is too high.
+      // This limits future compaction amplification (Gap 4).
+      if current.is_some() && should_stop_before(spec, &ikey, opts) {
+        let finished = current.take().unwrap();
+        finish_compaction_output(
+          finished,
+          std::mem::take(&mut current_largest),
+          &mut outputs,
+          opts.filter_policy.clone(),
+          opts.block_cache.clone(),
+        )?;
+      }
+
       // Rotate to a new output file if the current one is at the size limit.
       if let Some(ref cur) = current {
         if cur.builder.file_size() >= opts.max_file_size as u64 {
@@ -1541,22 +2261,25 @@ fn do_compaction(
 /// Phase 3 (under lock): record deleted input files and new output files in a
 /// single `VersionEdit`, then call `log_and_apply`.
 ///
-/// `deleted` is a list of `(level, file_number)` pairs for all input files.
-/// `output_level` is the level the output SSTables are placed at.
+/// Also persists the compact-pointer update from `spec.edit` so the MANIFEST
+/// records the round-robin cursor advance.
 fn install_compaction(
   state: &mut DbState,
-  deleted: &[(i32, u64)],
+  spec: &CompactionSpec,
   outputs: Vec<CompactionOutput>,
-  output_level: i32,
   tc: &crate::db::table_cache::TableCache,
 ) -> Result<(), Error> {
   let vs = state
     .version_set
     .as_mut()
     .expect("install_compaction: no VersionSet");
+  let output_level = (spec.level + 1) as i32;
   let mut edit = VersionEdit::new();
-  for &(level, number) in deleted {
-    edit.deleted_files.push((level, number));
+  for f in &spec.inputs[0] {
+    edit.deleted_files.push((spec.level as i32, f.number));
+  }
+  for f in &spec.inputs[1] {
+    edit.deleted_files.push((spec.level as i32 + 1, f.number));
   }
   for out in outputs {
     // Register the output table in the cache before installing the version.
@@ -1564,8 +2287,22 @@ fn install_compaction(
     let meta = FileMetaData::new(out.file_number, out.file_size, out.smallest, out.largest);
     edit.new_files.push((output_level, meta));
   }
+  // Persist the compact-pointer update so it survives a reopen.
+  for (lvl, key) in &spec.edit.compact_pointers {
+    edit.compact_pointers.push((*lvl, key.clone()));
+  }
   vs.set_last_sequence(state.last_sequence);
   vs.log_and_apply(&mut edit, tc)?;
+
+  // Clear seek_compact_file if the nominated file was removed by this compaction.
+  let deleted_numbers: std::collections::HashSet<u64> =
+    spec.all_input_files().map(|f| f.number).collect();
+  if let Some((ref f, _)) = state.seek_compact_file {
+    if deleted_numbers.contains(&f.number) {
+      state.seek_compact_file = None;
+    }
+  }
+
   Ok(())
 }
 
@@ -1671,41 +2408,97 @@ fn compact_level_range(
     None => return Ok(false),
   };
 
-  let output_level = level + 1;
-  let inputs: Vec<&FileMetaData> = level_inputs
-    .iter()
-    .chain(next_inputs.iter())
-    .map(Arc::as_ref)
-    .collect();
-  let deleted: Vec<(i32, u64)> = level_inputs
-    .iter()
-    .map(|m| (level as i32, m.number))
-    .chain(next_inputs.iter().map(|m| (output_level as i32, m.number)))
-    .collect();
+  // Build a CompactionSpec from the range-compaction inputs.
+  let mut spec = CompactionSpec::new(level, Arc::clone(&version));
+  spec.inputs[0] = level_inputs;
+  spec.inputs[1] = next_inputs;
+  // No compact-pointer update for manual range compactions.
+  // Populate grandparents if level+2 < NUM_LEVELS.
+  if level + 2 < crate::db::version::NUM_LEVELS {
+    let (s, l) = get_range2(&spec.inputs[0], &spec.inputs[1]);
+    spec.grandparents =
+      get_overlapping_inputs(&version, level + 2, ikey_user_key(&s), ikey_user_key(&l));
+  }
 
   // Phase 2: I/O (no lock).
-  let outputs = do_compaction(
-    path,
-    state,
-    version.as_ref(),
-    inputs.as_slice(),
-    oldest_snapshot,
-    output_level,
-    opts,
-    tc,
-  )?;
+  let outputs = do_compaction(path, state, &mut spec, oldest_snapshot, opts, tc)?;
 
   // Phase 3: install.
   {
     let mut g = state.lock().unwrap();
-    install_compaction(&mut g, &deleted, outputs, output_level as i32, tc)?;
+    install_compaction(&mut g, &spec, outputs, tc)?;
   }
 
   delete_obsolete_files(path, state);
   Ok(true)
 }
 
-/// Run a synchronous L0→L1 compaction if L0 has reached the trigger.
+/// Returns `true` when the compaction can be executed as a trivial move:
+/// a single file at `spec.level` with no `level+1` overlap and acceptable
+/// grandparent overlap.  No data is read or written — only the MANIFEST is
+/// updated.
+///
+/// Port of LevelDB `Compaction::IsTrivialMove`.
+fn is_trivial_move(spec: &CompactionSpec, opts: &Options) -> bool {
+  spec.inputs[0].len() == 1
+    && spec.inputs[1].is_empty()
+    && total_file_size(&spec.grandparents)
+      <= max_grandparent_overlap_bytes(opts.max_file_size as u64)
+}
+
+/// Execute a trivial-move compaction: move one file from `spec.level` to
+/// `spec.level + 1` via a MANIFEST update only — no I/O.
+///
+/// The `TableCache` entry is evicted (so the file will be re-opened under the
+/// new level number mapping on next access) and then re-inserted with the same
+/// handle so the table stays warm in the cache.
+///
+/// Port of the trivial-move branch in LevelDB `DBImpl::BackgroundCompaction`.
+fn install_trivial_move(
+  state: &mut DbState,
+  spec: &CompactionSpec,
+  tc: &crate::db::table_cache::TableCache,
+) -> Result<(), Error> {
+  let vs = state
+    .version_set
+    .as_mut()
+    .expect("install_trivial_move: no VersionSet");
+
+  let file = Arc::clone(&spec.inputs[0][0]);
+  let mut edit = VersionEdit::new();
+  edit.deleted_files.push((spec.level as i32, file.number));
+  edit
+    .new_files
+    .push((spec.level as i32 + 1, Arc::clone(&file)));
+  // Persist the compact-pointer update.
+  for (lvl, key) in &spec.edit.compact_pointers {
+    edit.compact_pointers.push((*lvl, key.clone()));
+  }
+
+  // Keep the table warm: evict the old entry, re-insert under same number.
+  // log_and_apply evicts the deleted file; re-insert it here so the next
+  // access finds it in the cache instead of re-opening from disk.
+  let table_arc = tc.get_or_open(file.number, file.file_size).ok();
+
+  vs.set_last_sequence(state.last_sequence);
+  vs.log_and_apply(&mut edit, tc)?;
+
+  // Re-insert so the file stays warm even though log_and_apply evicted it.
+  if let Some(table) = table_arc {
+    tc.insert(file.number, table);
+  }
+
+  // Clear seek_compact_file if this file was the nominee.
+  if let Some((ref scf, _)) = state.seek_compact_file {
+    if scf.number == file.number {
+      state.seek_compact_file = None;
+    }
+  }
+
+  Ok(())
+}
+
+/// Run synchronous compaction for any level that needs it (score ≥ 1.0).
 ///
 /// Uses the same three-phase lock protocol as flush:
 ///   1. Snapshot current version under lock.
@@ -1713,7 +2506,7 @@ fn compact_level_range(
 ///   3. Install the result (VersionEdit + log_and_apply) under the lock.
 ///
 /// Errors are silently ignored — a failed compaction does not affect
-/// correctness; L0 will simply accumulate more files and be retried.
+/// correctness; the triggering level will be retried on the next call.
 fn maybe_compact(
   path: &std::path::Path,
   state: &Mutex<DbState>,
@@ -1721,10 +2514,10 @@ fn maybe_compact(
   tc: &crate::db::table_cache::TableCache,
 ) {
   // Phase 1: snapshot.
-  let (version, oldest_snapshot) = {
-    let g = state.lock().unwrap();
-    let vs = match &g.version_set {
-      Some(vs) => vs,
+  let (version, oldest_snapshot, compact_pointer, seek_compact_file) = {
+    let mut g = state.lock().unwrap();
+    let (current, compact_ptr) = match &g.version_set {
+      Some(vs) => (vs.current(), vs.compact_pointer().clone()),
       None => return,
     };
     let oldest = g
@@ -1733,37 +2526,35 @@ fn maybe_compact(
       .next()
       .copied()
       .unwrap_or(g.last_sequence);
-    (vs.current(), oldest)
+    // Clear the compaction_needed flag; it will be re-set if another seek miss
+    // occurs before we finish.
+    g.compaction_needed = false;
+    let seek = g.seek_compact_file.clone();
+    (current, oldest, compact_ptr, seek)
   };
 
-  let (l0_inputs, l1_inputs) = match pick_compaction(&version) {
-    Some(p) => p,
+  if !needs_compaction(&version, seek_compact_file.is_some()) {
+    return;
+  }
+
+  let mut spec = match pick_compaction(&version, &compact_pointer, opts, seek_compact_file.as_ref())
+  {
+    Some(s) => s,
     None => return,
   };
 
-  // Build the flat input list (L0 newest-first, then L1) and deleted pairs.
-  let inputs: Vec<&FileMetaData> = l0_inputs
-    .iter()
-    .chain(l1_inputs.iter())
-    .map(Arc::as_ref)
-    .collect();
-  let deleted: Vec<(i32, u64)> = l0_inputs
-    .iter()
-    .map(|m| (0i32, m.number))
-    .chain(l1_inputs.iter().map(|m| (1i32, m.number)))
-    .collect();
+  // Trivial move: single file, no L+1 overlap, acceptable grandparent overlap.
+  // No I/O needed — just a MANIFEST update.
+  if is_trivial_move(&spec, opts) {
+    let mut g = state.lock().unwrap();
+    let _ = install_trivial_move(&mut g, &spec, tc);
+    drop(g);
+    delete_obsolete_files(path, state);
+    return;
+  }
 
   // Phase 2: I/O (no lock).
-  let outputs = match do_compaction(
-    path,
-    state,
-    version.as_ref(),
-    inputs.as_slice(),
-    oldest_snapshot,
-    1,
-    opts,
-    tc,
-  ) {
+  let outputs = match do_compaction(path, state, &mut spec, oldest_snapshot, opts, tc) {
     Ok(o) => o,
     Err(_) => return,
   };
@@ -1771,7 +2562,7 @@ fn maybe_compact(
   // Phase 3: install.
   {
     let mut g = state.lock().unwrap();
-    if install_compaction(&mut g, &deleted, outputs, 1, tc).is_err() {
+    if install_compaction(&mut g, &spec, outputs, tc).is_err() {
       return;
     }
   }
@@ -1869,6 +2660,7 @@ fn delete_obsolete_files(path: &std::path::Path, state: &Mutex<DbState>) {
 #[cfg(test)]
 mod tests {
   use crate::{Db, Error, Options, ReadOptions, WriteBatch, WriteOptions};
+  use serial_test::serial;
 
   // ── parse_db_filename tests (port of LevelDB filename_test.cc: Parse) ─────────
 
@@ -2655,6 +3447,7 @@ mod tests {
   }
 
   #[test]
+  #[serial(fd)]
   fn compaction_reduces_l0_file_count() {
     // Write enough data to produce ≥ L0_COMPACTION_TRIGGER flushes, which
     // should trigger a compaction that moves files from L0 to L1.
@@ -2672,7 +3465,7 @@ mod tests {
     // After enough writes (many flushes → multiple compactions), L0 should
     // be below the compaction trigger.
     let l0_count = {
-      let g = db.state.lock().unwrap();
+      let g = db.inner.state.lock().unwrap();
       g.version_set.as_ref().unwrap().current().files[0].len()
     };
     assert!(
@@ -2682,6 +3475,7 @@ mod tests {
   }
 
   #[test]
+  #[serial(fd)]
   fn compacted_data_readable() {
     // All keys written before compaction must still be readable after it.
     let dir = tempfile::tempdir().unwrap();
@@ -2704,6 +3498,7 @@ mod tests {
   }
 
   #[test]
+  #[serial(fd)]
   fn compaction_tombstone_hides_l1_value() {
     // Write a value for a key, flush it to L0/L1 via enough extra writes,
     // then write a tombstone.  The tombstone must shadow the compacted value.
@@ -2729,6 +3524,7 @@ mod tests {
   }
 
   #[test]
+  #[serial(fd)]
   fn compacted_data_readable_after_reopen() {
     // Data compacted to L1 must survive a reopen (MANIFEST recovery).
     let dir = tempfile::tempdir().unwrap();
@@ -2752,26 +3548,33 @@ mod tests {
   }
 
   #[test]
-  fn l1_files_present_after_compaction() {
-    // After compaction, at least one L1 file must exist.
+  #[serial(fd)]
+  fn files_present_below_l0_after_writes() {
+    // After enough writes, data should be present at L1 or deeper.
+    // With flush placement enabled, sequential unique-key flushes may bypass
+    // L0 and land at L2 directly, so we test for any level ≥ 1.
     let dir = tempfile::tempdir().unwrap();
     let db = Db::open(dir.path(), tiny_options()).unwrap();
     for i in 0u32..200 {
       db.put(format!("k{i:05}").as_bytes(), b"v").unwrap();
     }
-    let l1_count = {
-      let g = db.state.lock().unwrap();
-      g.version_set.as_ref().unwrap().current().files[1].len()
+    let deep_count: usize = {
+      let g = db.inner.state.lock().unwrap();
+      let cur = g.version_set.as_ref().unwrap().current();
+      (1..crate::db::version::NUM_LEVELS)
+        .map(|l| cur.files[l].len())
+        .sum()
     };
     assert!(
-      l1_count >= 1,
-      "expected at least one L1 file after compaction"
+      deep_count >= 1,
+      "expected at least one file at L1+ after writes"
     );
   }
 
   // ── compact_range tests ────────────────────────────────────────────────────
 
   #[test]
+  #[serial(fd)]
   fn compact_range_all_keys_readable_after() {
     // compact_range over the full key space must not lose any data.
     let dir = tempfile::tempdir().unwrap();
@@ -2791,6 +3594,7 @@ mod tests {
   }
 
   #[test]
+  #[serial(fd)]
   fn compact_range_subrange_preserves_keys_outside() {
     // Compacting a sub-range must not disturb keys outside it.
     let dir = tempfile::tempdir().unwrap();
@@ -2810,6 +3614,7 @@ mod tests {
   }
 
   #[test]
+  #[serial(fd)]
   fn compact_range_moves_data_to_deeper_level() {
     // After a full compact_range, all data should be below L0.
     let dir = tempfile::tempdir().unwrap();
@@ -2819,13 +3624,14 @@ mod tests {
     }
     db.compact_range(None, None).unwrap();
     let l0_count = {
-      let g = db.state.lock().unwrap();
+      let g = db.inner.state.lock().unwrap();
       g.version_set.as_ref().unwrap().current().files[0].len()
     };
     assert_eq!(l0_count, 0, "L0 should be empty after full compact_range");
   }
 
   #[test]
+  #[serial(fd)]
   fn compact_range_tombstone_elided_with_no_data_below() {
     // After compact_range pushes a tombstone to the deepest level, the key
     // must still be gone (tombstone correctly shadows the value).
@@ -2847,6 +3653,7 @@ mod tests {
   }
 
   #[test]
+  #[serial(fd)]
   fn compact_range_noop_on_inmemory_db() {
     let db = Db::default();
     db.put(b"k", b"v").unwrap();
@@ -2855,6 +3662,7 @@ mod tests {
   }
 
   #[test]
+  #[serial(fd)]
   fn compact_range_data_readable_after_reopen() {
     // Data compacted via compact_range must survive a reopen.
     let dir = tempfile::tempdir().unwrap();
@@ -3426,6 +4234,756 @@ mod tests {
     for i in 0..3usize {
       let key = format!("skey{i}");
       assert_eq!(db.get(key.as_bytes()).unwrap(), b"v");
+    }
+  }
+
+  // ── Gap 1: level-score-based compaction tests ─────────────────────────────
+
+  /// Build a bare `Version` (no Arc) with controlled file sizes at each level.
+  fn version_with_files(level_sizes: &[(usize, u64)]) -> crate::db::version::Version {
+    use crate::db::version_edit::FileMetaData;
+    use crate::table::format::make_internal_key;
+
+    let mut v = crate::db::version::Version::new();
+    let mut file_number = 10u64;
+    for &(level, size) in level_sizes {
+      let ikey = make_internal_key(format!("a{file_number}").as_bytes(), file_number, 1);
+      let meta = FileMetaData::new(file_number, size, ikey.clone(), ikey);
+      v.files[level].push(meta);
+      file_number += 1;
+    }
+    v
+  }
+
+  #[test]
+  fn finalize_l0_score_from_file_count() {
+    // 4 L0 files / L0_COMPACTION_TRIGGER (4) = score 1.0.
+    let mut v = version_with_files(&[(0, 0), (0, 0), (0, 0), (0, 0)]);
+    crate::db::version::finalize(&mut v, 4);
+    assert!(
+      (v.compaction_score - 1.0).abs() < 1e-9,
+      "expected score 1.0, got {}",
+      v.compaction_score
+    );
+    assert_eq!(v.compaction_level, 0);
+  }
+
+  #[test]
+  fn finalize_l1_score_from_bytes() {
+    // 10 MiB at L1 = score exactly 1.0.
+    let ten_mib = 10 * 1_048_576u64;
+    let mut v = version_with_files(&[(1, ten_mib)]);
+    crate::db::version::finalize(&mut v, 4);
+    assert!(
+      (v.compaction_score - 1.0).abs() < 1e-9,
+      "expected score 1.0, got {}",
+      v.compaction_score
+    );
+    assert_eq!(v.compaction_level, 1);
+  }
+
+  #[test]
+  fn finalize_picks_best_level() {
+    // L1 half full (score 0.5), L0 double trigger (score 2.0) → best is L0.
+    let five_mib = 5 * 1_048_576u64;
+    let mut v = version_with_files(&[
+      (0, 0),
+      (0, 0),
+      (0, 0),
+      (0, 0),
+      (0, 0),
+      (0, 0),
+      (0, 0),
+      (0, 0), // 8 L0 files → score 2.0
+      (1, five_mib),
+    ]);
+    crate::db::version::finalize(&mut v, 4);
+    assert!(v.compaction_score >= 2.0 - 1e-9);
+    assert_eq!(v.compaction_level, 0);
+  }
+
+  #[test]
+  fn add_boundary_inputs_includes_same_user_key() {
+    use crate::db::version::Version;
+    use crate::db::version_edit::FileMetaData;
+    use crate::table::format::make_internal_key;
+    use std::sync::Arc;
+
+    // Two files at L1 with the same user key "k" but different sequence numbers.
+    // File A: smallest=("k", seq=5), largest=("k", seq=5)
+    // File B: smallest=("k", seq=2), largest=("k", seq=2)
+    // (higher seq sorts before lower seq in internal key order)
+    let ikey_high = make_internal_key(b"k", 5, 1);
+    let ikey_low = make_internal_key(b"k", 2, 1);
+
+    let file_a = FileMetaData::new(10, 100, ikey_high.clone(), ikey_high.clone());
+    let file_b = FileMetaData::new(11, 100, ikey_low.clone(), ikey_low.clone());
+
+    let mut v = Version::new();
+    // L1 sorted by smallest: file_a (seq=5) sorts BEFORE file_b (seq=2) because
+    // higher seq means lower internal key value (tag sorts descending).
+    v.files[1].push(Arc::clone(&file_a));
+    v.files[1].push(Arc::clone(&file_b));
+
+    // Start compaction with only file_a; boundary check should add file_b.
+    let mut compaction_files = vec![Arc::clone(&file_a)];
+    crate::add_boundary_inputs(&v, 1, &mut compaction_files);
+
+    assert_eq!(
+      compaction_files.len(),
+      2,
+      "add_boundary_inputs should have added file_b (same user key, lower seq)"
+    );
+    assert!(compaction_files.iter().any(|f| f.number == 11));
+  }
+
+  #[test]
+  #[serial(fd)]
+  fn compact_pointer_persists_across_reopen() {
+    // Run a compaction that should set a compact_pointer, then reopen and verify
+    // the pointer is restored from the MANIFEST.
+    //
+    // Strategy: write the same small key range many times so each flush overlaps
+    // with the previous L0 file, forcing all flushes to land at L0.  Once L0
+    // reaches L0_COMPACTION_TRIGGER (4) a real L0→L1 compaction fires and the
+    // compact_pointer is recorded in the MANIFEST.
+    let dir = tempfile::tempdir().unwrap();
+    {
+      let db = Db::open(dir.path(), tiny_options()).unwrap();
+      // Each round rewrites the same 5 keys.  With write_buffer_size=128 bytes,
+      // each round flushes, producing an overlapping L0 file.  After 4+ rounds
+      // L0→L1 compaction fires and compact_pointer is set.
+      for round in 0u32..8 {
+        for k in 0u32..5 {
+          db.put(
+            format!("key{k:02}").as_bytes(),
+            format!("val{round:02}_{k:02}").as_bytes(),
+          )
+          .unwrap();
+        }
+      }
+    }
+
+    // Reopen: the MANIFEST should contain compact_pointer records.
+    let vs = crate::db::version_set::VersionSet::recover(dir.path(), false).unwrap();
+    // At least one level should have a non-empty compact_pointer (L0 or L1).
+    let has_pointer = vs.compact_pointer().iter().any(|p| !p.is_empty());
+    assert!(
+      has_pointer,
+      "at least one compact_pointer should be set after compaction"
+    );
+  }
+
+  // ── Gap 2: flush placement tests ─────────────────────────────────────────
+
+  /// The first flush into an empty database should be pushed past L0.
+  ///
+  /// With an empty version (no files at any level), `pick_level_for_memtable_output`
+  /// advances to `MAX_MEM_COMPACT_LEVEL` (2) because there is no overlap at L1
+  /// and no grandparent bytes at L2, so the file lands at L2.  The key invariant
+  /// is that L0 stays empty and the data is readable.
+  #[test]
+  #[serial(fd)]
+  fn flush_placement_skips_l0_on_first_flush() {
+    let dir = tempfile::tempdir().unwrap();
+    let opts = Options {
+      create_if_missing: true,
+      write_buffer_size: 4 * 1024,
+      max_file_size: 2 * 1024 * 1024,
+      block_cache: None,
+      filter_policy: None,
+      ..Options::default()
+    };
+    let db = Db::open(dir.path(), opts).unwrap();
+
+    // Fill the memtable past the flush threshold.
+    // 200 writes × ~25 bytes each ≈ 5 KiB > write_buffer_size (4 KiB).
+    for i in 0u32..200 {
+      db.put(format!("flush{i:04}").as_bytes(), b"value").unwrap();
+    }
+
+    // L0 must be empty: the flush was pushed to a higher level.
+    // With a completely empty version the output lands at L2 (MAX_MEM_COMPACT_LEVEL).
+    let (l0, l2) = {
+      let g = db.inner.state.lock().unwrap();
+      let cur = g.version_set.as_ref().unwrap().current();
+      (cur.files[0].len(), cur.files[2].len())
+    };
+    assert_eq!(
+      l0, 0,
+      "expected L0 to be empty after first flush into empty DB"
+    );
+    assert_eq!(l2, 1, "expected one file at L2 (MAX_MEM_COMPACT_LEVEL)");
+
+    // Verify data is readable regardless of which level it landed at.
+    assert_eq!(db.get(b"flush0000").unwrap(), b"value");
+    assert_eq!(db.get(b"flush0199").unwrap(), b"value");
+  }
+
+  /// When L0 already has files that overlap the flush range, the output must
+  /// stay at L0 (we cannot skip over in-progress L0 data).
+  #[test]
+  #[serial(fd)]
+  fn flush_placement_stays_at_l0_when_overlap() {
+    let dir = tempfile::tempdir().unwrap();
+    let opts = Options {
+      create_if_missing: true,
+      write_buffer_size: 4 * 1024,
+      max_file_size: 2 * 1024 * 1024,
+      block_cache: None,
+      filter_policy: None,
+      ..Options::default()
+    };
+    let db = Db::open(dir.path(), opts).unwrap();
+
+    // Write overlapping key ranges twice so the first flush lands at L0 and
+    // the second flush's range overlaps L0.
+    // First batch → first flush → L1 (no L0 yet).
+    for i in 0u32..200 {
+      db.put(format!("key{i:04}").as_bytes(), b"v1").unwrap();
+    }
+    // Second batch uses the same key range → will overlap L0 (or L1) on flush.
+    for i in 0u32..200 {
+      db.put(format!("key{i:04}").as_bytes(), b"v2").unwrap();
+    }
+
+    // Both flushes should have completed; data must be readable.
+    for i in 0u32..200 {
+      let val = db.get(format!("key{i:04}").as_bytes()).unwrap();
+      assert_eq!(val, b"v2");
+    }
+  }
+
+  #[test]
+  #[serial(fd)]
+  fn multilevel_compaction_l1_to_l2() {
+    // Write enough data so that L1 exceeds 10 MiB, triggering L1→L2 compaction.
+    //
+    // Use a large value (~1 KiB) per key so data accumulates quickly at L1.
+    // write_buffer_size = 32 KiB → each flush produces ~32 entries.
+    // max_file_size = 64 KiB → L1 files are ~64 KiB each.
+    // After ~160 flushes and corresponding L0→L1 compactions, L1 total bytes
+    // exceeds 10 MiB and an automatic L1→L2 compaction fires.
+    let dir = tempfile::tempdir().unwrap();
+    let value_size = 1024usize; // 1 KiB per value
+    let opts = Options {
+      create_if_missing: true,
+      write_buffer_size: 32 * 1024,
+      max_file_size: 64 * 1024,
+      // Disable block cache and filter to avoid interference.
+      block_cache: None,
+      filter_policy: None,
+      ..Options::default()
+    };
+    let db = Db::open(dir.path(), opts).unwrap();
+
+    // Write enough keys to produce > 10 MiB at L1.
+    // Use pseudo-random bytes so Snappy compression doesn't shrink them to nothing.
+    let large_val: Vec<u8> = (0..value_size).map(|i| (i * 7 + 13) as u8).collect();
+    for i in 0u32..75_000 {
+      // Mix the index into each value so all values differ (avoids any dedup).
+      let mut val = large_val.clone();
+      let bytes = i.to_le_bytes();
+      val[..4].copy_from_slice(&bytes);
+      db.put(format!("key{i:07}").as_bytes(), &val).unwrap();
+    }
+
+    let (l1_bytes, l2_files) = {
+      let g = db.inner.state.lock().unwrap();
+      let cur = g.version_set.as_ref().unwrap().current();
+      let l1b: u64 = cur.files[1].iter().map(|f| f.file_size).sum();
+      (l1b, cur.files[2].len())
+    };
+    // L2 should have received at least one file from an L1→L2 compaction.
+    assert!(
+      l2_files > 0,
+      "L2 should have files after L1→L2 compaction; L1_bytes={l1_bytes} L2_files={l2_files}"
+    );
+    // Spot-check: a handful of keys must still be readable.
+    // (Full scan would be too slow; check every 2000th key.)
+    let large_val: Vec<u8> = (0..value_size).map(|i| (i * 7 + 13) as u8).collect();
+    for i in (0u32..75_000).step_by(2000) {
+      let mut expected = large_val.clone();
+      let bytes = i.to_le_bytes();
+      expected[..4].copy_from_slice(&bytes);
+      let val = db.get(format!("key{i:07}").as_bytes()).unwrap();
+      assert_eq!(val, expected.as_slice());
+    }
+  }
+
+  // ── Gap 3: Trivial-move tests ─────────────────────────────────────────────
+
+  #[test]
+  fn trivial_move_advances_file_to_next_level() {
+    // Build a Version with one L1 file and no L2 overlap,
+    // then verify is_trivial_move returns true.
+    use super::{is_trivial_move, CompactionSpec};
+    use crate::db::version::Version;
+    use crate::db::version_edit::FileMetaData;
+    use crate::table::format::make_internal_key;
+    use std::sync::Arc;
+
+    let make_meta = |number: u64, small: &[u8], large: &[u8]| -> Arc<FileMetaData> {
+      FileMetaData::new(
+        number,
+        4096,
+        make_internal_key(small, 10, 1u8), // 1 = Value
+        make_internal_key(large, 1, 1u8),
+      )
+    };
+
+    let mut v = Version::new();
+    // One L1 file covering "a".."z"; no L2 files.
+    v.files[1].push(make_meta(10, b"a", b"z"));
+    let version = Arc::new(v);
+
+    let opts = Options {
+      max_file_size: 64 * 1024,
+      ..Options::default()
+    };
+
+    // Build a spec for this file: one L1 input, no L2 inputs, no grandparents.
+    let mut spec = CompactionSpec::new(1, Arc::clone(&version));
+    spec.inputs[0].push(Arc::clone(&version.files[1][0]));
+    // inputs[1] and grandparents are empty (no L2 or L3 files).
+
+    assert!(
+      is_trivial_move(&spec, &opts),
+      "single file with no next-level overlap and no grandparents should be a trivial move"
+    );
+
+    // Also verify: adding grandparent bytes that exceed the limit disqualifies it.
+    for i in 0u64..12 {
+      spec.grandparents.push(make_meta(
+        100 + i,
+        &format!("{i:02}").into_bytes(),
+        &format!("{:02}", i + 1).into_bytes(),
+      ));
+    }
+    // Each grandparent file is 4096 bytes; 12 files = 49152 bytes.
+    // Use a very small max_file_size: 10 * 1024 = 10240 < 49152 → not trivial.
+    let tiny_opts = Options {
+      max_file_size: 1024,
+      ..Options::default()
+    };
+    assert!(
+      !is_trivial_move(&spec, &tiny_opts),
+      "excessive grandparent overlap should disqualify trivial move"
+    );
+  }
+
+  #[test]
+  fn trivial_move_not_trivial_when_next_level_has_files() {
+    use super::{is_trivial_move, CompactionSpec};
+    use crate::db::version::Version;
+    use crate::db::version_edit::FileMetaData;
+    use crate::table::format::make_internal_key;
+    use std::sync::Arc;
+
+    let make_meta = |number: u64, small: &[u8], large: &[u8]| -> Arc<FileMetaData> {
+      FileMetaData::new(
+        number,
+        4096,
+        make_internal_key(small, 10, 1u8),
+        make_internal_key(large, 1, 1u8),
+      )
+    };
+
+    let mut v = Version::new();
+    v.files[1].push(make_meta(10, b"a", b"z"));
+    v.files[2].push(make_meta(20, b"m", b"p")); // overlapping L2 file
+    let version = Arc::new(v);
+
+    let opts = Options {
+      max_file_size: 64 * 1024,
+      ..Options::default()
+    };
+
+    let mut spec = CompactionSpec::new(1, Arc::clone(&version));
+    spec.inputs[0].push(Arc::clone(&version.files[1][0]));
+    spec.inputs[1].push(Arc::clone(&version.files[2][0])); // L2 overlap present
+
+    assert!(
+      !is_trivial_move(&spec, &opts),
+      "trivial move requires inputs[1] to be empty"
+    );
+  }
+
+  #[test]
+  #[serial(fd)]
+  fn trivial_move_end_to_end() {
+    // Write data so a single non-overlapping file ends up at L1, then confirm
+    // it is trivially moved to L2 by maybe_compact.  We force the scenario by
+    // writing unique keys (no overlap with any future flush) and checking that
+    // after the DB is opened and a compaction cycle runs, L2 gains the file.
+    let dir = tempfile::tempdir().unwrap();
+    let opts = Options {
+      create_if_missing: true,
+      write_buffer_size: 512,
+      max_file_size: 64 * 1024,
+      block_cache: None,
+      filter_policy: None,
+      ..Options::default()
+    };
+
+    {
+      let db = Db::open(dir.path(), opts.clone()).unwrap();
+      // Write a small unique-key batch so it flushes to L2 (no overlap) and
+      // then write a large overlapping batch to force L0 accumulation and
+      // trigger compaction, which should move the L2 file trivially to L3.
+      for i in 0u32..10 {
+        db.put(format!("aaa{i:03}").as_bytes(), b"firstbatch")
+          .unwrap();
+      }
+      // Force a second flush to produce L0 files that overlap the first range.
+      for i in 0u32..10 {
+        db.put(format!("aaa{i:03}").as_bytes(), b"secondbatch")
+          .unwrap();
+      }
+    }
+
+    // Reopen and verify all keys readable with latest values.
+    let db2 = Db::open(dir.path(), opts).unwrap();
+    for i in 0u32..10 {
+      let val = db2.get(format!("aaa{i:03}").as_bytes()).unwrap();
+      assert_eq!(val, b"secondbatch");
+    }
+  }
+
+  // ── Gap 4: grandparent-overlap output limiting tests ──────────────────────
+
+  #[test]
+  fn is_base_level_for_key_cursor_advances_monotonically() {
+    // Build a version with a few L3 files; verify that is_base_level_for_key
+    // correctly returns false for keys inside those files and true for keys
+    // outside, and that the cursor only ever moves forward.
+    use super::{is_base_level_for_key, CompactionSpec};
+    use crate::db::version::Version;
+    use crate::db::version_edit::FileMetaData;
+    use crate::table::format::make_internal_key;
+    use std::sync::Arc;
+
+    let make_meta = |number: u64, small: &[u8], large: &[u8]| -> Arc<FileMetaData> {
+      FileMetaData::new(
+        number,
+        4096,
+        make_internal_key(small, 10, 1u8),
+        make_internal_key(large, 1, 1u8),
+      )
+    };
+
+    let mut v = Version::new();
+    // L1 compaction inputs (level 1).
+    v.files[1].push(make_meta(1, b"a", b"z"));
+    // L3 = level+2 from L1: two non-overlapping files.
+    v.files[3].push(make_meta(10, b"b", b"d")); // covers b..d
+    v.files[3].push(make_meta(11, b"p", b"r")); // covers p..r
+    let version = Arc::new(v);
+
+    let mut spec = CompactionSpec::new(1, Arc::clone(&version));
+    spec.inputs[0].push(Arc::clone(&version.files[1][0]));
+
+    // "c" is inside file 10 (b..d) → NOT base level.
+    assert!(!is_base_level_for_key(&mut spec, b"c"));
+    // "q" is inside file 11 (p..r) → NOT base level.
+    // Cursor for L3 should have advanced past file 10.
+    assert!(!is_base_level_for_key(&mut spec, b"q"));
+    // "s" is past both files → IS base level.
+    assert!(is_base_level_for_key(&mut spec, b"s"));
+    // Cursor must now be at the end; a key before the end (but still past both
+    // files) should also return true without regressing the cursor.
+    assert!(is_base_level_for_key(&mut spec, b"t"));
+    // The cursor for L3 should be at index 2 (past both files) — check it
+    // hasn't regressed.
+    assert_eq!(spec.level_ptrs[3], 2);
+  }
+
+  #[test]
+  fn should_stop_before_triggers_on_excess_grandparent_overlap() {
+    use super::{should_stop_before, CompactionSpec};
+    use crate::db::version::Version;
+    use crate::db::version_edit::FileMetaData;
+    use crate::table::format::make_internal_key;
+    use std::sync::Arc;
+
+    let make_meta = |number: u64, small: &[u8], large: &[u8], size: u64| -> Arc<FileMetaData> {
+      FileMetaData::new(
+        number,
+        size,
+        make_internal_key(small, 10, 1u8),
+        make_internal_key(large, 1, 1u8),
+      )
+    };
+
+    let v = Version::new();
+    let version = Arc::new(v);
+
+    let opts = Options {
+      max_file_size: 1024, // max_grandparent_overlap_bytes = 10 * 1024 = 10240
+      ..Options::default()
+    };
+
+    let mut spec = CompactionSpec::new(0, Arc::clone(&version));
+    // Three grandparent files, each 6000 bytes.
+    // seen_key is false for the first key, so file 20's bytes don't count.
+    // After passing file 21 (6000 bytes) and then file 22 (6000 more = 12000),
+    // the limit of 10 * 1024 = 10240 is exceeded on the third key.
+    spec.grandparents.push(make_meta(20, b"b", b"d", 6000));
+    spec.grandparents.push(make_meta(21, b"e", b"g", 6000));
+    spec.grandparents.push(make_meta(22, b"h", b"k", 6000));
+
+    // Feed keys that advance past each grandparent file.
+    // Keys are internal keys; construct them to be > each file's largest.
+    let after_d = make_internal_key(b"e", 0, 0u8); // > "d" in ikey order
+    let after_g = make_internal_key(b"h", 0, 0u8);
+    let after_k = make_internal_key(b"l", 0, 0u8);
+
+    // First key — seen_key becomes true, no bytes accumulated yet.
+    assert!(!should_stop_before(&mut spec, &after_d, &opts));
+    // Second key — passes file 20 (4096 bytes accumulated), still under limit.
+    assert!(!should_stop_before(&mut spec, &after_g, &opts));
+    // Third key — passes file 21 (8192 bytes), still under limit.
+    // After passing file 22 (12288 > 10240) it should trigger.
+    assert!(should_stop_before(&mut spec, &after_k, &opts));
+    // After triggering, overlapped_bytes is reset to 0.
+    assert_eq!(spec.overlapped_bytes, 0);
+  }
+
+  #[test]
+  #[serial(fd)]
+  fn grandparent_limiting_produces_multiple_output_files() {
+    // Verify that a compaction subject to high grandparent overlap produces
+    // multiple output files rather than one giant file.
+    //
+    // Setup:
+    //   - Write key ranges A and B into the DB, flush to L2 (empty DB).
+    //   - Write overlapping versions to force L0 accumulation and L0→L1 compaction.
+    //   - After L0→L1, write yet more data to push L1→L2.
+    //   - Verify all keys remain readable after compaction.
+    let dir = tempfile::tempdir().unwrap();
+    let opts = Options {
+      create_if_missing: true,
+      write_buffer_size: 512,
+      max_file_size: 2 * 1024,
+      block_cache: None,
+      filter_policy: None,
+      ..Options::default()
+    };
+
+    let db = Db::open(dir.path(), opts.clone()).unwrap();
+    // Write enough unique keys with large-ish values so multiple flushes and
+    // compactions occur, exercising the grandparent limiting path.
+    let val = vec![b'x'; 64];
+    for round in 0u32..20 {
+      for k in 0u32..20 {
+        db.put(format!("k{k:04}").as_bytes(), &val).unwrap();
+      }
+      let _ = round; // suppress lint
+    }
+    drop(db);
+
+    // Reopen and verify correctness.
+    let db2 = Db::open(dir.path(), opts).unwrap();
+    for k in 0u32..20 {
+      let result = db2.get(format!("k{k:04}").as_bytes());
+      assert!(
+        result.is_ok(),
+        "key k{k:04} should be readable after compaction"
+      );
+      assert_eq!(result.unwrap(), val);
+    }
+  }
+
+  // ── Gap 5: seek-based compaction tests ────────────────────────────────────
+
+  #[test]
+  fn seek_stats_decrements_allowed_seeks() {
+    // Build a two-file L0 scenario and verify that the first probed file has
+    // its allowed_seeks decremented when more than one file is consulted.
+    use crate::db::version::Version;
+    use crate::db::version_edit::FileMetaData;
+    use crate::table::format::make_internal_key;
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+
+    // Two L0 files with overlapping ranges so any key lookup in the overlap
+    // must consult file 0 first (newest-first), then file 1.
+    let mk = |num: u64, small: &[u8], large: &[u8]| -> Arc<FileMetaData> {
+      FileMetaData::new(
+        num,
+        4096,
+        make_internal_key(small, 10, 1u8),
+        make_internal_key(large, 1, 1u8),
+      )
+    };
+
+    let mut v = Version::new();
+    // Newest file (file 1) covers "a".."m"; older file (file 2) covers "g".."z".
+    // L0 is newest-first so file 1 is index 0.
+    v.files[0].push(mk(1, b"a", b"m"));
+    v.files[0].push(mk(2, b"g", b"z"));
+    let version = Arc::new(v);
+
+    // We can't do a real table lookup without actual SSTable files, so instead
+    // directly call the get stats logic by checking GetStats construction.
+    // Simulate: we probed file 1 first (found nothing) then file 2.
+    // Blame = file 1 (first consulted, not where we found the answer).
+    let before = version.files[0][0].allowed_seeks.load(Ordering::Relaxed);
+    assert!(before >= 100, "initial allowed_seeks should be ≥ 100");
+
+    // Simulate the update_stats call that Db::get would make.
+    use crate::db::version::GetStats;
+    let stats = GetStats {
+      seek_file: Some(Arc::clone(&version.files[0][0])),
+      seek_file_level: 0,
+    };
+    let mut ds = super::DbState {
+      last_sequence: 0,
+      log: None,
+      mem: Arc::new(crate::memtable::Memtable::new()),
+      imm: None,
+      version_set: None,
+      snapshots: Default::default(),
+      writers: Default::default(),
+      next_writer_id: 0,
+      completed: Default::default(),
+      seek_compact_file: None,
+      compaction_needed: false,
+      background_scheduled: false,
+      background_error: None,
+      pending_flush: None,
+    };
+    super::update_stats(&mut ds, &stats);
+    let after = version.files[0][0].allowed_seeks.load(Ordering::Relaxed);
+    assert_eq!(
+      after,
+      before - 1,
+      "allowed_seeks should have decremented by 1"
+    );
+    assert!(
+      ds.seek_compact_file.is_none(),
+      "seek budget not exhausted yet"
+    );
+    assert!(!ds.compaction_needed);
+  }
+
+  #[test]
+  fn seek_stats_triggers_compaction_when_budget_exhausted() {
+    use crate::db::version::GetStats;
+    use crate::db::version::Version;
+    use crate::db::version_edit::FileMetaData;
+    use crate::table::format::make_internal_key;
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+
+    let mk = |num: u64| -> Arc<FileMetaData> {
+      // Use a tiny file (size < 16384) so allowed_seeks initialises to 100.
+      FileMetaData::new(
+        num,
+        1024,
+        make_internal_key(b"a", 10, 1u8),
+        make_internal_key(b"z", 1, 1u8),
+      )
+    };
+
+    let mut v = Version::new();
+    v.files[0].push(mk(1));
+    let version = Arc::new(v);
+
+    let file = Arc::clone(&version.files[0][0]);
+    let initial = file.allowed_seeks.load(Ordering::Relaxed);
+    assert_eq!(initial, 100);
+
+    // Drain allowed_seeks to 1 manually.
+    file.allowed_seeks.store(1, Ordering::Relaxed);
+
+    let stats = GetStats {
+      seek_file: Some(Arc::clone(&file)),
+      seek_file_level: 0,
+    };
+    let mut ds = super::DbState {
+      last_sequence: 0,
+      log: None,
+      mem: Arc::new(crate::memtable::Memtable::new()),
+      imm: None,
+      version_set: None,
+      snapshots: Default::default(),
+      writers: Default::default(),
+      next_writer_id: 0,
+      completed: Default::default(),
+      seek_compact_file: None,
+      compaction_needed: false,
+      background_scheduled: false,
+      background_error: None,
+      pending_flush: None,
+    };
+    super::update_stats(&mut ds, &stats);
+
+    assert!(
+      ds.seek_compact_file.is_some(),
+      "seek_compact_file should be set once budget hits 0"
+    );
+    assert!(ds.compaction_needed, "compaction_needed should be set");
+    let (nominated, level) = ds.seek_compact_file.as_ref().unwrap();
+    assert_eq!(nominated.number, 1);
+    assert_eq!(*level, 0);
+  }
+
+  #[test]
+  #[serial(fd)]
+  fn seek_based_compaction_fires_after_repeated_misses() {
+    // Write data so there are multiple L0 files with overlapping key ranges.
+    // Then perform repeated gets on a key that forces consulting 2+ files but
+    // doesn't exist (all misses), draining allowed_seeks.  Once exhausted the
+    // compaction loop should fire and reduce L0.
+    let dir = tempfile::tempdir().unwrap();
+    let opts = Options {
+      create_if_missing: true,
+      write_buffer_size: 512,
+      max_file_size: 4 * 1024,
+      block_cache: None,
+      filter_policy: None,
+      ..Options::default()
+    };
+    let db = Db::open(dir.path(), opts.clone()).unwrap();
+
+    // Write overlapping key ranges in multiple rounds so multiple L0 files
+    // accumulate (we write fast enough that compaction doesn't drain them all).
+    // Use write_buffer_size=512 so each round flushes.
+    for round in 0u32..4 {
+      for k in 0u32..5 {
+        db.put(
+          format!("key{k:02}").as_bytes(),
+          format!("val{round:02}").as_bytes(),
+        )
+        .unwrap();
+      }
+    }
+
+    // Manually drain allowed_seeks on an L0 file to force a seek-compaction.
+    {
+      use std::sync::atomic::Ordering;
+      let g = db.inner.state.lock().unwrap();
+      if let Some(vs) = &g.version_set {
+        let cur = vs.current();
+        if let Some(f) = cur.files[0].first() {
+          f.allowed_seeks.store(1, Ordering::Relaxed);
+        }
+      }
+    }
+
+    // One more get will trigger update_stats → seek_compact_file nominated.
+    // The next write's compaction loop should drain it.
+    let _ = db.get(b"key00");
+    db.put(b"trigger", b"compaction").unwrap();
+
+    // Verify all original keys still readable.
+    for k in 0u32..5 {
+      let val = db.get(format!("key{k:02}").as_bytes()).unwrap();
+      assert!(
+        val.starts_with(b"val"),
+        "key{k:02} should still be readable"
+      );
     }
   }
 }

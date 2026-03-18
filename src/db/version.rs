@@ -17,6 +17,21 @@ use crate::table::format::parse_internal_key;
 use crate::table::reader::LookupResult;
 use std::sync::Arc;
 
+/// Statistics returned by [`Version::get`] for seek-based compaction tracking.
+///
+/// `seek_file` is set to the first file that was probed (opened) for this
+/// lookup when more than one file had to be consulted.  The rationale: if we
+/// only needed one file, no seek was "wasted".  If we needed two or more, the
+/// first file is charged — it forced an unnecessary I/O probe.
+///
+/// Port of LevelDB `Version::GetStats`.
+pub(crate) struct GetStats {
+  /// The first file charged with a wasted seek, if any.
+  pub seek_file: Option<Arc<FileMetaData>>,
+  /// Level of `seek_file`.
+  pub seek_file_level: usize,
+}
+
 /// Number of levels in the LSM tree.
 pub(crate) const NUM_LEVELS: usize = 7;
 
@@ -30,22 +45,33 @@ pub(crate) const NUM_LEVELS: usize = 7;
 #[derive(Clone)]
 pub(crate) struct Version {
   pub files: [Vec<Arc<FileMetaData>>; NUM_LEVELS],
+  /// Best compaction score across all levels.  -1.0 before `finalize` is called.
+  /// Score ≥ 1.0 means this level should be compacted.
+  pub compaction_score: f64,
+  /// Level with the highest compaction score.  -1 before `finalize` is called.
+  pub compaction_level: i32,
 }
 
 impl Version {
   pub(crate) fn new() -> Self {
     Version {
       files: std::array::from_fn(|_| Vec::new()),
+      compaction_score: -1.0,
+      compaction_level: -1,
     }
   }
 
-  /// Look up `user_key` across all levels, returning the first match.
+  /// Look up `user_key` across all levels, returning the first match and seek
+  /// statistics for compaction accounting.
   ///
   /// L0 is scanned newest-first.  L1–L6 are scanned linearly (binary search
   /// deferred to a later phase).
   ///
   /// Tables are opened on demand via `tc`; `verify_checksums` is forwarded to
   /// every `Table::get` call.
+  ///
+  /// The returned [`GetStats`] blames the first file consulted when the lookup
+  /// required probing more than one file (matching LevelDB `Version::Get`).
   pub(crate) fn get(
     &self,
     user_key: &[u8],
@@ -53,13 +79,33 @@ impl Version {
     verify_checksums: bool,
     fill_cache: bool,
     tc: &TableCache,
-  ) -> Result<LookupResult, Error> {
+  ) -> Result<(LookupResult, GetStats), Error> {
+    let mut stats = GetStats {
+      seek_file: None,
+      seek_file_level: 0,
+    };
+    let mut last_file_read: Option<Arc<FileMetaData>> = None;
+    let mut last_file_read_level: usize = 0;
+
+    // Helper: record blame on the previous file before moving to a new one.
+    macro_rules! charge_prev {
+      ($meta:expr, $level:expr) => {
+        if last_file_read.is_some() && stats.seek_file.is_none() {
+          stats.seek_file = last_file_read.clone();
+          stats.seek_file_level = last_file_read_level;
+        }
+        last_file_read = Some(Arc::clone($meta));
+        last_file_read_level = $level;
+      };
+    }
+
     // L0: newest-first scan.
     for meta in &self.files[0] {
+      charge_prev!(meta, 0);
       let table = tc.get_or_open(meta.number, meta.file_size)?;
       match table.get(user_key, verify_checksums, fill_cache)? {
-        LookupResult::Value(v) => return Ok(LookupResult::Value(v)),
-        LookupResult::Deleted => return Ok(LookupResult::Deleted),
+        LookupResult::Value(v) => return Ok((LookupResult::Value(v), stats)),
+        LookupResult::Deleted => return Ok((LookupResult::Deleted, stats)),
         LookupResult::NotInTable => {}
       }
     }
@@ -67,16 +113,17 @@ impl Version {
     // L1–L6: linear scan (binary search deferred to a later phase).
     for level in 1..NUM_LEVELS {
       for meta in &self.files[level] {
+        charge_prev!(meta, level);
         let table = tc.get_or_open(meta.number, meta.file_size)?;
         match table.get(user_key, verify_checksums, fill_cache)? {
-          LookupResult::Value(v) => return Ok(LookupResult::Value(v)),
-          LookupResult::Deleted => return Ok(LookupResult::Deleted),
+          LookupResult::Value(v) => return Ok((LookupResult::Value(v), stats)),
+          LookupResult::Deleted => return Ok((LookupResult::Deleted, stats)),
           LookupResult::NotInTable => {}
         }
       }
     }
 
-    Ok(LookupResult::NotInTable)
+    Ok((LookupResult::NotInTable, stats))
   }
 
   /// Estimate the cumulative on-disk byte offset of `ikey` across all levels.
@@ -149,6 +196,49 @@ impl Version {
     }
     out
   }
+}
+
+// ── Compaction score helpers ──────────────────────────────────────────────────
+
+/// Maximum total bytes allowed at a given level (L1+).
+///
+/// L1 = 10 MiB, L2 = 100 MiB, L3 = 1 GiB, …  (×10 per level).
+/// L0 uses a file-count threshold, not byte size.
+pub(crate) fn max_bytes_for_level(level: usize) -> f64 {
+  let mut result = 10.0 * 1_048_576.0_f64; // 10 MiB
+  let mut l = level;
+  while l > 1 {
+    result *= 10.0;
+    l -= 1;
+  }
+  result
+}
+
+/// Compute and store the highest compaction score across all levels in `version`.
+///
+/// Must be called on an owned `Version` before it is wrapped in `Arc`.
+///
+/// `l0_trigger` is the L0 file-count threshold (matches `L0_COMPACTION_TRIGGER`
+/// in `src/lib.rs`).
+pub(crate) fn finalize(version: &mut Version, l0_trigger: usize) {
+  let mut best_level = -1i32;
+  let mut best_score = -1.0f64;
+
+  for level in 0..(NUM_LEVELS - 1) {
+    let score = if level == 0 {
+      version.files[0].len() as f64 / l0_trigger as f64
+    } else {
+      let bytes: u64 = version.files[level].iter().map(|f| f.file_size).sum();
+      bytes as f64 / max_bytes_for_level(level)
+    };
+    if score > best_score {
+      best_score = score;
+      best_level = level as i32;
+    }
+  }
+
+  version.compaction_score = best_score;
+  version.compaction_level = best_level;
 }
 
 /// Render an internal key as an escaped user-key string.

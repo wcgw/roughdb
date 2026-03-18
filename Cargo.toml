@@ -20,6 +20,7 @@ zstd = "0.13"
 clap = { version = "4", features = ["derive"] }
 criterion = "0.5"
 tempfile = "3"
+serial_test = "3.4"
 
 [[bench]]
 name = "db"
