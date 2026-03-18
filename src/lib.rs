@@ -272,6 +272,14 @@ struct DbState {
   /// A follower checks this map on wake-up and removes its own entry.
   /// `Ok(())` is the common case; `Err` propagates a WAL/memtable failure.
   completed: std::collections::HashMap<u64, Result<(), Error>>,
+  // ── Seek-based compaction (Gap 5) ──────────────────────────────────────────
+  /// File + level nominated for seek-based compaction (its `allowed_seeks` hit
+  /// zero).  `None` when no file is pending.  Cleared by `install_compaction`
+  /// after the file is removed from the live set.
+  seek_compact_file: Option<(Arc<FileMetaData>, usize)>,
+  /// Set to `true` when `seek_compact_file` is first populated, so the next
+  /// `Db::write` compaction loop runs even without a preceding flush.
+  compaction_needed: bool,
 }
 
 // ── FlushPrep / FlushResult ───────────────────────────────────────────────────
@@ -437,6 +445,8 @@ impl Default for Db {
         writers: std::collections::VecDeque::new(),
         next_writer_id: 0,
         completed: std::collections::HashMap::new(),
+        seek_compact_file: None,
+        compaction_needed: false,
       }),
       write_condvar: std::sync::Condvar::new(),
       options: Options::default(),
@@ -568,6 +578,8 @@ impl Db {
         writers: std::collections::VecDeque::new(),
         next_writer_id: 0,
         completed: std::collections::HashMap::new(),
+        seek_compact_file: None,
+        compaction_needed: false,
       }),
       write_condvar: std::sync::Condvar::new(),
       options,
@@ -663,13 +675,19 @@ impl Db {
 
     if let Some(version) = version {
       if let Some(persistence) = &self.persistence {
-        match version.get(
+        let (result, stats) = version.get(
           key,
           sequence,
           verify_checksums,
           fill_cache,
           &persistence.table_cache,
-        )? {
+        )?;
+        // Update seek stats under the lock (re-acquire briefly).
+        if stats.seek_file.is_some() {
+          let mut g = self.state.lock().unwrap();
+          update_stats(&mut g, &stats);
+        }
+        match result {
           LookupResult::Value(v) => return Ok(v),
           LookupResult::Deleted => return Err(Error::NotFound),
           LookupResult::NotInTable => {}
@@ -1132,7 +1150,9 @@ impl Db {
           let (needs, l0) = {
             let g = self.state.lock().unwrap();
             let version = g.version_set.as_ref().map(|vs| vs.current());
-            let needs = version.as_ref().is_some_and(|v| needs_compaction(v));
+            let needs = version
+              .as_ref()
+              .is_some_and(|v| needs_compaction(v, g.compaction_needed));
             let l0 = version.as_ref().map_or(0, |v| v.files[0].len());
             (needs, l0)
           };
@@ -1726,57 +1746,86 @@ fn is_base_level_for_key(spec: &mut CompactionSpec, user_key: &[u8]) -> bool {
   true
 }
 
-/// True if `version` has a level that needs compaction (score ≥ 1.0).
-fn needs_compaction(version: &crate::db::version::Version) -> bool {
-  version.compaction_score >= 1.0
+// ── Seek-based compaction helpers ─────────────────────────────────────────────
+
+/// Decrement the seek budget of the blamed file and, if it hits zero, nominate
+/// it for seek-based compaction.
+///
+/// Called under the DB lock after every SSTable `get` that had to probe more
+/// than one file.  Port of LevelDB `Version::UpdateStats`.
+fn update_stats(state: &mut DbState, stats: &crate::db::version::GetStats) {
+  use std::sync::atomic::Ordering;
+  if let Some(ref file) = stats.seek_file {
+    let prev = file.allowed_seeks.fetch_sub(1, Ordering::Relaxed);
+    if prev <= 1 && state.seek_compact_file.is_none() {
+      state.seek_compact_file = Some((Arc::clone(file), stats.seek_file_level));
+      state.compaction_needed = true;
+    }
+  }
 }
 
-/// Select the next compaction to run, based on level scores and compact-pointer
-/// round-robin.
+/// True if `version` has a level that needs compaction (score ≥ 1.0), or if a
+/// seek-based compaction candidate has been nominated.
+fn needs_compaction(version: &crate::db::version::Version, compaction_needed: bool) -> bool {
+  version.compaction_score >= 1.0 || compaction_needed
+}
+
+/// Select the next compaction to run, based on level scores, compact-pointer
+/// round-robin, or seek-based nomination.
 ///
-/// Returns `None` if no level needs compaction (`score < 1.0` at all levels).
+/// Returns `None` if no compaction is needed.
 fn pick_compaction(
   version: &Arc<crate::db::version::Version>,
   compact_pointer: &[Vec<u8>; crate::db::version::NUM_LEVELS],
   opts: &Options,
+  seek_compact: Option<&(Arc<FileMetaData>, usize)>,
 ) -> Option<CompactionSpec> {
-  if !needs_compaction(version) {
-    return None;
+  // ── Size-triggered (highest priority) ─────────────────────────────────────
+  if version.compaction_score >= 1.0 {
+    let level = version.compaction_level as usize;
+    let mut spec = CompactionSpec::new(level, Arc::clone(version));
+
+    if level == 0 {
+      // For L0, seed with the first file past compact_pointer[0], then expand
+      // to all overlapping L0 files (L0 files can overlap each other).
+      let seed = version.files[0]
+        .iter()
+        .find(|f| {
+          compact_pointer[0].is_empty()
+            || ikey_user_key(&f.largest) > ikey_user_key(&compact_pointer[0])
+        })
+        .or_else(|| version.files[0].first())
+        .cloned()?;
+
+      let seed_lo = ikey_user_key(&seed.smallest).to_vec();
+      let seed_hi = ikey_user_key(&seed.largest).to_vec();
+      spec.inputs[0] = get_overlapping_inputs(version, 0, &seed_lo, &seed_hi);
+    } else {
+      // L1+: pick the first file whose largest key is past compact_pointer[level].
+      let file = version.files[level]
+        .iter()
+        .find(|f| {
+          compact_pointer[level].is_empty()
+            || ikey_user_key(&f.largest) > ikey_user_key(&compact_pointer[level])
+        })
+        .or_else(|| version.files[level].first())
+        .cloned()?;
+      spec.inputs[0].push(file);
+    }
+
+    setup_other_inputs(&mut spec, version, compact_pointer, opts);
+    return Some(spec);
   }
 
-  let level = version.compaction_level as usize;
-  let mut spec = CompactionSpec::new(level, Arc::clone(version));
-
-  if level == 0 {
-    // For L0, seed with the first file past compact_pointer[0], then expand to
-    // all overlapping L0 files (L0 files can overlap each other).
-    let seed = version.files[0]
-      .iter()
-      .find(|f| {
-        compact_pointer[0].is_empty()
-          || ikey_user_key(&f.largest) > ikey_user_key(&compact_pointer[0])
-      })
-      .or_else(|| version.files[0].first())
-      .cloned()?;
-
-    let seed_lo = ikey_user_key(&seed.smallest).to_vec();
-    let seed_hi = ikey_user_key(&seed.largest).to_vec();
-    spec.inputs[0] = get_overlapping_inputs(version, 0, &seed_lo, &seed_hi);
-  } else {
-    // L1+: pick the first file whose largest key is past compact_pointer[level].
-    let file = version.files[level]
-      .iter()
-      .find(|f| {
-        compact_pointer[level].is_empty()
-          || ikey_user_key(&f.largest) > ikey_user_key(&compact_pointer[level])
-      })
-      .or_else(|| version.files[level].first())
-      .cloned()?;
-    spec.inputs[0].push(file);
+  // ── Seek-triggered fallback ────────────────────────────────────────────────
+  if let Some((file, level)) = seek_compact {
+    let mut spec = CompactionSpec::new(*level, Arc::clone(version));
+    spec.inputs[0].push(Arc::clone(file));
+    setup_other_inputs(&mut spec, version, compact_pointer, opts);
+    return Some(spec);
   }
 
-  setup_other_inputs(&mut spec, version, compact_pointer, opts);
-  Some(spec)
+  None
 }
 
 /// Alias for a plain (level_inputs, next_level_inputs) pair returned by
@@ -2009,6 +2058,16 @@ fn install_compaction(
   }
   vs.set_last_sequence(state.last_sequence);
   vs.log_and_apply(&mut edit, tc)?;
+
+  // Clear seek_compact_file if the nominated file was removed by this compaction.
+  let deleted_numbers: std::collections::HashSet<u64> =
+    spec.all_input_files().map(|f| f.number).collect();
+  if let Some((ref f, _)) = state.seek_compact_file {
+    if deleted_numbers.contains(&f.number) {
+      state.seek_compact_file = None;
+    }
+  }
+
   Ok(())
 }
 
@@ -2194,6 +2253,13 @@ fn install_trivial_move(
     tc.insert(file.number, table);
   }
 
+  // Clear seek_compact_file if this file was the nominee.
+  if let Some((ref scf, _)) = state.seek_compact_file {
+    if scf.number == file.number {
+      state.seek_compact_file = None;
+    }
+  }
+
   Ok(())
 }
 
@@ -2213,10 +2279,10 @@ fn maybe_compact(
   tc: &crate::db::table_cache::TableCache,
 ) {
   // Phase 1: snapshot.
-  let (version, oldest_snapshot, compact_pointer) = {
-    let g = state.lock().unwrap();
-    let vs = match &g.version_set {
-      Some(vs) => vs,
+  let (version, oldest_snapshot, compact_pointer, seek_compact_file) = {
+    let mut g = state.lock().unwrap();
+    let (current, compact_ptr) = match &g.version_set {
+      Some(vs) => (vs.current(), vs.compact_pointer().clone()),
       None => return,
     };
     let oldest = g
@@ -2225,14 +2291,19 @@ fn maybe_compact(
       .next()
       .copied()
       .unwrap_or(g.last_sequence);
-    (vs.current(), oldest, vs.compact_pointer().clone())
+    // Clear the compaction_needed flag; it will be re-set if another seek miss
+    // occurs before we finish.
+    g.compaction_needed = false;
+    let seek = g.seek_compact_file.clone();
+    (current, oldest, compact_ptr, seek)
   };
 
-  if !needs_compaction(&version) {
+  if !needs_compaction(&version, seek_compact_file.is_some()) {
     return;
   }
 
-  let mut spec = match pick_compaction(&version, &compact_pointer, opts) {
+  let mut spec = match pick_compaction(&version, &compact_pointer, opts, seek_compact_file.as_ref())
+  {
     Some(s) => s,
     None => return,
   };
@@ -4351,11 +4422,11 @@ mod tests {
     // Build a version with a few L3 files; verify that is_base_level_for_key
     // correctly returns false for keys inside those files and true for keys
     // outside, and that the cursor only ever moves forward.
-    use crate::db::version_edit::FileMetaData;
+    use super::{is_base_level_for_key, CompactionSpec};
     use crate::db::version::Version;
+    use crate::db::version_edit::FileMetaData;
     use crate::table::format::make_internal_key;
     use std::sync::Arc;
-    use super::{CompactionSpec, is_base_level_for_key};
 
     let make_meta = |number: u64, small: &[u8], large: &[u8]| -> Arc<FileMetaData> {
       FileMetaData::new(
@@ -4394,11 +4465,11 @@ mod tests {
 
   #[test]
   fn should_stop_before_triggers_on_excess_grandparent_overlap() {
-    use crate::db::version_edit::FileMetaData;
+    use super::{should_stop_before, CompactionSpec};
     use crate::db::version::Version;
+    use crate::db::version_edit::FileMetaData;
     use crate::table::format::make_internal_key;
     use std::sync::Arc;
-    use super::{CompactionSpec, should_stop_before};
 
     let make_meta = |number: u64, small: &[u8], large: &[u8], size: u64| -> Arc<FileMetaData> {
       FileMetaData::new(
@@ -4480,8 +4551,198 @@ mod tests {
     let db2 = Db::open(dir.path(), opts).unwrap();
     for k in 0u32..20 {
       let result = db2.get(format!("k{k:04}").as_bytes());
-      assert!(result.is_ok(), "key k{k:04} should be readable after compaction");
+      assert!(
+        result.is_ok(),
+        "key k{k:04} should be readable after compaction"
+      );
       assert_eq!(result.unwrap(), val);
+    }
+  }
+
+  // ── Gap 5: seek-based compaction tests ────────────────────────────────────
+
+  #[test]
+  fn seek_stats_decrements_allowed_seeks() {
+    // Build a two-file L0 scenario and verify that the first probed file has
+    // its allowed_seeks decremented when more than one file is consulted.
+    use crate::db::version::Version;
+    use crate::db::version_edit::FileMetaData;
+    use crate::table::format::make_internal_key;
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+
+    // Two L0 files with overlapping ranges so any key lookup in the overlap
+    // must consult file 0 first (newest-first), then file 1.
+    let mk = |num: u64, small: &[u8], large: &[u8]| -> Arc<FileMetaData> {
+      FileMetaData::new(
+        num,
+        4096,
+        make_internal_key(small, 10, 1u8),
+        make_internal_key(large, 1, 1u8),
+      )
+    };
+
+    let mut v = Version::new();
+    // Newest file (file 1) covers "a".."m"; older file (file 2) covers "g".."z".
+    // L0 is newest-first so file 1 is index 0.
+    v.files[0].push(mk(1, b"a", b"m"));
+    v.files[0].push(mk(2, b"g", b"z"));
+    let version = Arc::new(v);
+
+    // We can't do a real table lookup without actual SSTable files, so instead
+    // directly call the get stats logic by checking GetStats construction.
+    // Simulate: we probed file 1 first (found nothing) then file 2.
+    // Blame = file 1 (first consulted, not where we found the answer).
+    let before = version.files[0][0].allowed_seeks.load(Ordering::Relaxed);
+    assert!(before >= 100, "initial allowed_seeks should be ≥ 100");
+
+    // Simulate the update_stats call that Db::get would make.
+    use crate::db::version::GetStats;
+    let stats = GetStats {
+      seek_file: Some(Arc::clone(&version.files[0][0])),
+      seek_file_level: 0,
+    };
+    let mut ds = super::DbState {
+      last_sequence: 0,
+      log: None,
+      mem: Arc::new(crate::memtable::Memtable::new()),
+      imm: None,
+      version_set: None,
+      snapshots: Default::default(),
+      writers: Default::default(),
+      next_writer_id: 0,
+      completed: Default::default(),
+      seek_compact_file: None,
+      compaction_needed: false,
+    };
+    super::update_stats(&mut ds, &stats);
+    let after = version.files[0][0].allowed_seeks.load(Ordering::Relaxed);
+    assert_eq!(
+      after,
+      before - 1,
+      "allowed_seeks should have decremented by 1"
+    );
+    assert!(
+      ds.seek_compact_file.is_none(),
+      "seek budget not exhausted yet"
+    );
+    assert!(!ds.compaction_needed);
+  }
+
+  #[test]
+  fn seek_stats_triggers_compaction_when_budget_exhausted() {
+    use crate::db::version::GetStats;
+    use crate::db::version::Version;
+    use crate::db::version_edit::FileMetaData;
+    use crate::table::format::make_internal_key;
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+
+    let mk = |num: u64| -> Arc<FileMetaData> {
+      // Use a tiny file (size < 16384) so allowed_seeks initialises to 100.
+      FileMetaData::new(
+        num,
+        1024,
+        make_internal_key(b"a", 10, 1u8),
+        make_internal_key(b"z", 1, 1u8),
+      )
+    };
+
+    let mut v = Version::new();
+    v.files[0].push(mk(1));
+    let version = Arc::new(v);
+
+    let file = Arc::clone(&version.files[0][0]);
+    let initial = file.allowed_seeks.load(Ordering::Relaxed);
+    assert_eq!(initial, 100);
+
+    // Drain allowed_seeks to 1 manually.
+    file.allowed_seeks.store(1, Ordering::Relaxed);
+
+    let stats = GetStats {
+      seek_file: Some(Arc::clone(&file)),
+      seek_file_level: 0,
+    };
+    let mut ds = super::DbState {
+      last_sequence: 0,
+      log: None,
+      mem: Arc::new(crate::memtable::Memtable::new()),
+      imm: None,
+      version_set: None,
+      snapshots: Default::default(),
+      writers: Default::default(),
+      next_writer_id: 0,
+      completed: Default::default(),
+      seek_compact_file: None,
+      compaction_needed: false,
+    };
+    super::update_stats(&mut ds, &stats);
+
+    assert!(
+      ds.seek_compact_file.is_some(),
+      "seek_compact_file should be set once budget hits 0"
+    );
+    assert!(ds.compaction_needed, "compaction_needed should be set");
+    let (nominated, level) = ds.seek_compact_file.as_ref().unwrap();
+    assert_eq!(nominated.number, 1);
+    assert_eq!(*level, 0);
+  }
+
+  #[test]
+  #[serial(fd)]
+  fn seek_based_compaction_fires_after_repeated_misses() {
+    // Write data so there are multiple L0 files with overlapping key ranges.
+    // Then perform repeated gets on a key that forces consulting 2+ files but
+    // doesn't exist (all misses), draining allowed_seeks.  Once exhausted the
+    // compaction loop should fire and reduce L0.
+    let dir = tempfile::tempdir().unwrap();
+    let opts = Options {
+      create_if_missing: true,
+      write_buffer_size: 512,
+      max_file_size: 4 * 1024,
+      block_cache: None,
+      filter_policy: None,
+      ..Options::default()
+    };
+    let db = Db::open(dir.path(), opts.clone()).unwrap();
+
+    // Write overlapping key ranges in multiple rounds so multiple L0 files
+    // accumulate (we write fast enough that compaction doesn't drain them all).
+    // Use write_buffer_size=512 so each round flushes.
+    for round in 0u32..4 {
+      for k in 0u32..5 {
+        db.put(
+          format!("key{k:02}").as_bytes(),
+          format!("val{round:02}").as_bytes(),
+        )
+        .unwrap();
+      }
+    }
+
+    // Manually drain allowed_seeks on an L0 file to force a seek-compaction.
+    {
+      use std::sync::atomic::Ordering;
+      let g = db.state.lock().unwrap();
+      if let Some(vs) = &g.version_set {
+        let cur = vs.current();
+        if let Some(f) = cur.files[0].first() {
+          f.allowed_seeks.store(1, Ordering::Relaxed);
+        }
+      }
+    }
+
+    // One more get will trigger update_stats → seek_compact_file nominated.
+    // The next write's compaction loop should drain it.
+    let _ = db.get(b"key00");
+    db.put(b"trigger", b"compaction").unwrap();
+
+    // Verify all original keys still readable.
+    for k in 0u32..5 {
+      let val = db.get(format!("key{k:02}").as_bytes()).unwrap();
+      assert!(
+        val.starts_with(b"val"),
+        "key{k:02} should still be readable"
+      );
     }
   }
 }

@@ -17,6 +17,21 @@ use crate::table::format::parse_internal_key;
 use crate::table::reader::LookupResult;
 use std::sync::Arc;
 
+/// Statistics returned by [`Version::get`] for seek-based compaction tracking.
+///
+/// `seek_file` is set to the first file that was probed (opened) for this
+/// lookup when more than one file had to be consulted.  The rationale: if we
+/// only needed one file, no seek was "wasted".  If we needed two or more, the
+/// first file is charged — it forced an unnecessary I/O probe.
+///
+/// Port of LevelDB `Version::GetStats`.
+pub(crate) struct GetStats {
+  /// The first file charged with a wasted seek, if any.
+  pub seek_file: Option<Arc<FileMetaData>>,
+  /// Level of `seek_file`.
+  pub seek_file_level: usize,
+}
+
 /// Number of levels in the LSM tree.
 pub(crate) const NUM_LEVELS: usize = 7;
 
@@ -46,13 +61,17 @@ impl Version {
     }
   }
 
-  /// Look up `user_key` across all levels, returning the first match.
+  /// Look up `user_key` across all levels, returning the first match and seek
+  /// statistics for compaction accounting.
   ///
   /// L0 is scanned newest-first.  L1–L6 are scanned linearly (binary search
   /// deferred to a later phase).
   ///
   /// Tables are opened on demand via `tc`; `verify_checksums` is forwarded to
   /// every `Table::get` call.
+  ///
+  /// The returned [`GetStats`] blames the first file consulted when the lookup
+  /// required probing more than one file (matching LevelDB `Version::Get`).
   pub(crate) fn get(
     &self,
     user_key: &[u8],
@@ -60,13 +79,33 @@ impl Version {
     verify_checksums: bool,
     fill_cache: bool,
     tc: &TableCache,
-  ) -> Result<LookupResult, Error> {
+  ) -> Result<(LookupResult, GetStats), Error> {
+    let mut stats = GetStats {
+      seek_file: None,
+      seek_file_level: 0,
+    };
+    let mut last_file_read: Option<Arc<FileMetaData>> = None;
+    let mut last_file_read_level: usize = 0;
+
+    // Helper: record blame on the previous file before moving to a new one.
+    macro_rules! charge_prev {
+      ($meta:expr, $level:expr) => {
+        if last_file_read.is_some() && stats.seek_file.is_none() {
+          stats.seek_file = last_file_read.clone();
+          stats.seek_file_level = last_file_read_level;
+        }
+        last_file_read = Some(Arc::clone($meta));
+        last_file_read_level = $level;
+      };
+    }
+
     // L0: newest-first scan.
     for meta in &self.files[0] {
+      charge_prev!(meta, 0);
       let table = tc.get_or_open(meta.number, meta.file_size)?;
       match table.get(user_key, verify_checksums, fill_cache)? {
-        LookupResult::Value(v) => return Ok(LookupResult::Value(v)),
-        LookupResult::Deleted => return Ok(LookupResult::Deleted),
+        LookupResult::Value(v) => return Ok((LookupResult::Value(v), stats)),
+        LookupResult::Deleted => return Ok((LookupResult::Deleted, stats)),
         LookupResult::NotInTable => {}
       }
     }
@@ -74,16 +113,17 @@ impl Version {
     // L1–L6: linear scan (binary search deferred to a later phase).
     for level in 1..NUM_LEVELS {
       for meta in &self.files[level] {
+        charge_prev!(meta, level);
         let table = tc.get_or_open(meta.number, meta.file_size)?;
         match table.get(user_key, verify_checksums, fill_cache)? {
-          LookupResult::Value(v) => return Ok(LookupResult::Value(v)),
-          LookupResult::Deleted => return Ok(LookupResult::Deleted),
+          LookupResult::Value(v) => return Ok((LookupResult::Value(v), stats)),
+          LookupResult::Deleted => return Ok((LookupResult::Deleted, stats)),
           LookupResult::NotInTable => {}
         }
       }
     }
 
-    Ok(LookupResult::NotInTable)
+    Ok((LookupResult::NotInTable, stats))
   }
 
   /// Estimate the cumulative on-disk byte offset of `ikey` across all levels.

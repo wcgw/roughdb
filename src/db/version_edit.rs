@@ -12,6 +12,7 @@
 
 use crate::coding::{read_varu64, write_varu64};
 use crate::error::Error;
+use std::sync::atomic::AtomicI32;
 use std::sync::Arc;
 
 // LevelDB-compatible MANIFEST tag constants.
@@ -37,15 +38,26 @@ pub(crate) struct FileMetaData {
   pub smallest: Vec<u8>,
   /// Largest internal key stored in this file.
   pub largest: Vec<u8>,
+  /// Remaining seek budget before this file is nominated for compaction.
+  ///
+  /// In-memory only — not encoded in the MANIFEST.  Initialised to
+  /// `max(100, file_size / 16384)` matching LevelDB's heuristic (one seek
+  /// costs ~16 KiB of I/O; after enough misses the overhead outweighs a
+  /// compaction).  Decremented atomically on each `get` that probes the file
+  /// without finding the target key; when it reaches ≤ 0 the file is
+  /// flagged for seek-based compaction.
+  pub allowed_seeks: AtomicI32,
 }
 
 impl FileMetaData {
   pub(crate) fn new(number: u64, file_size: u64, smallest: Vec<u8>, largest: Vec<u8>) -> Arc<Self> {
+    let allowed_seeks = (file_size / 16384).max(100) as i32;
     Arc::new(Self {
       number,
       file_size,
       smallest,
       largest,
+      allowed_seeks: AtomicI32::new(allowed_seeks),
     })
   }
 }
