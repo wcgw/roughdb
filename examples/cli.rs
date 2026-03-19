@@ -21,7 +21,7 @@
 //! ```
 
 use clap::{Parser, Subcommand};
-use roughdb::Db;
+use roughdb::{Db, FlushOptions};
 
 #[derive(Parser)]
 #[command(
@@ -56,7 +56,9 @@ enum Command {
     /// The key to remove.
     key: String,
   },
-  /// Remove KEY from the database.
+  /// Flush in-mem & WAL
+  Flush,
+  /// Compact SSTables
   Compact,
 }
 
@@ -77,6 +79,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     },
     Command::Put { key, value } => db.put(key, value)?,
     Command::Delete { key } => db.delete(key)?,
+    Command::Flush => db.flush(&FlushOptions::default())?,
     Command::Compact => db.compact_range(None, None)?,
   }
 
