@@ -26,8 +26,10 @@ cargo add roughdb
 ```rust
 use roughdb::{Db, Options};
 
-let mut opts = Options::default();
-opts.create_if_missing = true;
+let opts = roughdb::Options {
+    create_if_missing: true,
+    ..Default::default()
+};
 
 let db = Db::open("/tmp/my_db", opts)?;
 ```
