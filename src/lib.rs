@@ -696,6 +696,12 @@ impl Db {
     Ok(max_sequence)
   }
 
+  /// Look up `key` in the database, returning its value.
+  ///
+  /// Returns [`Error::NotFound`] if `key` does not exist or was deleted.
+  /// Equivalent to calling [`get_with_options`] with [`ReadOptions::default`].
+  ///
+  /// [`get_with_options`]: Db::get_with_options
   pub fn get<K>(&self, key: K) -> Result<Vec<u8>, Error>
   where
     K: AsRef<[u8]>,
@@ -703,6 +709,23 @@ impl Db {
     self.get_with_options(&ReadOptions::default(), key)
   }
 
+  /// Look up `key` in the database with explicit read options, returning its value.
+  ///
+  /// The lookup order mirrors LevelDB's `DBImpl::Get`:
+  /// 1. Active memtable (lock-free after a brief snapshot under the lock).
+  /// 2. Sealed memtable (`imm`) being flushed to disk, if any.
+  /// 3. SSTable files in the current `Version`, level by level (L0 first).
+  ///
+  /// The lock is held only long enough to snapshot the current `Arc<Memtable>` refs and
+  /// sequence number; all subsequent lookups (memtable reads and SSTable I/O) proceed without
+  /// the lock.
+  ///
+  /// If `opts.snapshot` is set, only writes that preceded the snapshot are visible; otherwise
+  /// the read sees all writes committed before this call.
+  ///
+  /// Returns [`Error::NotFound`] if `key` does not exist or was deleted.
+  ///
+  /// See `db/db_impl.cc: DBImpl::Get`.
   pub fn get_with_options<K>(&self, opts: &ReadOptions, key: K) -> Result<Vec<u8>, Error>
   where
     K: AsRef<[u8]>,
@@ -959,23 +982,6 @@ impl Db {
     Ok(DbIter { inner })
   }
 
-  /// Compact all SSTable files that overlap `[begin, end]` (user-key range)
-  /// down toward the deepest level, matching LevelDB's `CompactRange`.
-  ///
-  /// Both bounds are inclusive and optional (`None` means "no bound").
-  ///
-  /// The compaction is synchronous and runs level-by-level from L0 to the
-  /// deepest level that currently has overlapping files.  After each level's
-  /// compaction the updated version is used for the next level, so newly
-  /// created files are eligible for further compaction in the same call.
-  ///
-  /// No-op for in-memory databases (`Db::default()`).
-  /// Destroy the database at `path`, deleting all of its files and the directory.
-  ///
-  /// Acquires the `LOCK` file before removing anything to ensure no other process
-  /// has the database open.  Returns [`Error::IoError`] immediately (without blocking)
-  /// if the lock cannot be acquired.
-  ///
   /// All recognised database files (`CURRENT`, `MANIFEST-*`, `*.log`, `*.ldb`, `LOCK`) are
   /// removed.  Unrecognised files are left in place; the directory is removed only if it is
   /// empty afterwards.
@@ -1023,6 +1029,22 @@ impl Db {
     Ok(())
   }
 
+  /// Compact all SSTable files that overlap `[begin, end]` (user-key range)
+  /// down toward the deepest level, matching LevelDB's `CompactRange`.
+  ///
+  /// Both bounds are inclusive and optional (`None` means "no bound").
+  ///
+  /// The compaction is synchronous and runs level-by-level from L0 to the
+  /// deepest level that currently has overlapping files.  After each level's
+  /// compaction the updated version is used for the next level, so newly
+  /// created files are eligible for further compaction in the same call.
+  ///
+  /// No-op for in-memory databases (`Db::default()`).
+  /// Destroy the database at `path`, deleting all of its files and the directory.
+  ///
+  /// Acquires the `LOCK` file before removing anything to ensure no other process
+  /// has the database open.  Returns [`Error::IoError`] immediately (without blocking)
+  /// if the lock cannot be acquired.
   pub fn compact_range(&self, begin: Option<&[u8]>, end: Option<&[u8]>) -> Result<(), Error> {
     use crate::db::version::NUM_LEVELS;
 
@@ -1077,6 +1099,35 @@ impl Db {
     Ok(())
   }
 
+  /// Apply `batch` atomically to the database.
+  ///
+  /// All operations in `batch` are written together as a single WAL record and inserted into the
+  /// memtable under a contiguous range of sequence numbers.  Either all operations succeed or
+  /// none are applied.
+  ///
+  /// ## Write grouping
+  ///
+  /// Concurrent callers are batched together by a group leader that writes a single combined WAL
+  /// record and memtable pass, amortising `fsync` cost.  A `sync = true` writer never joins a
+  /// non-sync group (doing so would silently drop its sync guarantee).  Non-sync writers may join
+  /// a sync group — they receive a free `fsync`, which is harmless.
+  ///
+  /// ## Backpressure
+  ///
+  /// The write leader calls `make_room_for_write` before writing:
+  /// - **L0 slowdown** (≥ 8 files): sleeps 1 ms (at most once per `write` call).
+  /// - **Flush in progress** (`imm` present): waits for the background thread to complete it.
+  /// - **L0 hard stop** (≥ 12 files): blocks until the background thread drains L0.
+  /// - **Memtable full**: rotates `mem → imm`, schedules the background flush, and continues.
+  ///
+  /// Followers bypass all backpressure — only the leader gates on it.
+  ///
+  /// ## Durability
+  ///
+  /// If `opts.sync` is `true`, the WAL record is `fsync`'d before this call returns.  Otherwise
+  /// the OS page cache provides durability — data survives crashes of the process but not the OS.
+  ///
+  /// See `db/db_impl.cc: DBImpl::Write`.
   pub fn write(&self, opts: &WriteOptions, batch: &WriteBatch) -> Result<(), Error> {
     // ── Phase 1: Enqueue this write request ──────────────────────────────────
     //
