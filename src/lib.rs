@@ -64,7 +64,7 @@
 //! batch.put(b"key2", b"val2");
 //! batch.delete(b"old_key");
 //!
-//! db.write(&WriteOptions::default(), &batch)?;
+//! db.write(&WriteOptions::default(), batch)?;
 //! # Ok::<(), roughdb::Error>(())
 //! ```
 //!
@@ -918,7 +918,7 @@ impl Db {
   {
     let mut batch = WriteBatch::new();
     batch.put(key.as_ref(), value.as_ref());
-    self.write(&WriteOptions::default(), &batch)
+    self.write(&WriteOptions::default(), batch)
   }
 
   pub fn delete<K>(&self, key: K) -> Result<(), Error>
@@ -927,7 +927,7 @@ impl Db {
   {
     let mut batch = WriteBatch::new();
     batch.delete(key.as_ref());
-    self.write(&WriteOptions::default(), &batch)
+    self.write(&WriteOptions::default(), batch)
   }
 
   /// Create a forward iterator over a consistent snapshot of the database.
@@ -1194,7 +1194,7 @@ impl Db {
   /// the OS page cache provides durability — data survives crashes of the process but not the OS.
   ///
   /// See `db/db_impl.cc: DBImpl::Write`.
-  pub fn write(&self, opts: &WriteOptions, batch: &WriteBatch) -> Result<(), Error> {
+  pub fn write(&self, opts: &WriteOptions, batch: WriteBatch) -> Result<(), Error> {
     // ── Phase 1: Enqueue this write request ──────────────────────────────────
     //
     // Every caller pushes a `WriterSlot` and waits until it is either at the
@@ -1206,7 +1206,7 @@ impl Db {
       state.next_writer_id += 1;
       state.writers.push_back(WriterSlot {
         id,
-        batch: batch.clone(),
+        batch,
         sync: opts.sync,
       });
       id
@@ -3023,7 +3023,7 @@ mod tests {
       batch.put("a", "1");
       batch.put("b", "2");
       batch.put("c", "3");
-      db.write(&WriteOptions::default(), &batch).unwrap();
+      db.write(&WriteOptions::default(), batch).unwrap();
     }
     let db = Db::open(dir.path(), Options::default()).unwrap();
     assert_eq!(db.get("a").unwrap(), b"1");
@@ -4339,7 +4339,7 @@ mod tests {
           let key = format!("skey{i}");
           let mut batch = WriteBatch::new();
           batch.put(key.as_bytes(), b"v");
-          db.write(&opts, &batch).unwrap();
+          db.write(&opts, batch).unwrap();
         })
       })
       .collect();
