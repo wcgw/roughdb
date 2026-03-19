@@ -128,7 +128,7 @@ pub use error::Error;
 pub mod filter;
 pub use filter::BloomFilterPolicy;
 pub mod options;
-pub use options::{CompressionType, Options, WriteOptions};
+pub use options::{CompressionType, FlushOptions, Options, WriteOptions};
 pub(crate) mod coding;
 pub(crate) mod db;
 pub(crate) mod iter;
@@ -1094,6 +1094,72 @@ impl Db {
         begin,
         end,
       )?;
+    }
+
+    Ok(())
+  }
+
+  /// Flush all in-memory writes to an SSTable and clear the corresponding WAL segment.
+  ///
+  /// If the active memtable is empty, this is a no-op (returns `Ok(())` immediately).
+  /// If a flush is already in progress for a previous memtable, waits for it to finish
+  /// before rotating the current one.
+  ///
+  /// After this call returns (with `opts.wait = true`), all data written before the call
+  /// is guaranteed to reside in an SSTable on disk and the WAL segment that covered it has
+  /// been deleted.
+  ///
+  /// Always a no-op on in-memory databases (`Db::default()`).
+  ///
+  /// See `include/rocksdb/db.h: DB::Flush`.
+  pub fn flush(&self, opts: &FlushOptions) -> Result<(), Error> {
+    let mut g = self.inner.state.lock().unwrap();
+
+    if let Some(ref e) = g.background_error {
+      return Err(e.clone());
+    }
+    // No-op for in-memory databases.
+    if self.inner.persistence.is_none() {
+      return Ok(());
+    }
+
+    // If the memtable is empty, there is nothing to flush.  We may still need to wait for an
+    // in-progress flush that was triggered by a prior writer.
+    if g.mem.approximate_memory_usage() == 0 {
+      if opts.wait {
+        while (g.imm.is_some() || g.pending_flush.is_some()) && g.background_error.is_none() {
+          g = self.inner.write_condvar.wait(g).unwrap();
+        }
+        return g
+          .background_error
+          .as_ref()
+          .map_or(Ok(()), |e| Err(e.clone()));
+      }
+      return Ok(());
+    }
+
+    // Wait for any in-progress flush to drain before rotating mem → imm.
+    while (g.imm.is_some() || g.pending_flush.is_some()) && g.background_error.is_none() {
+      g = self.inner.write_condvar.wait(g).unwrap();
+    }
+    if let Some(ref e) = g.background_error {
+      return Err(e.clone());
+    }
+
+    // Rotate mem → imm and schedule the background flush.
+    let path = self.inner.persistence.as_ref().unwrap().dir.as_path();
+    let prep = begin_flush(path, &mut g)?;
+    g.imm = Some(Arc::clone(&prep.old_mem));
+    g.pending_flush = Some(prep);
+    maybe_schedule_compaction(&self.inner, &mut g);
+
+    if opts.wait {
+      while (g.imm.is_some() || g.pending_flush.is_some()) && g.background_error.is_none() {
+        g = self.inner.write_condvar.wait(g).unwrap();
+      }
+      if let Some(ref e) = g.background_error {
+        return Err(e.clone());
+      }
     }
 
     Ok(())
@@ -5036,5 +5102,78 @@ mod tests {
         "key{k:02} should still be readable"
       );
     }
+  }
+
+  // ── Db::flush tests ──────────────────────────────────────────────────────
+
+  #[test]
+  fn flush_noop_on_in_memory_db() {
+    let db = Db::default();
+    db.put(b"k", b"v").unwrap();
+    db.flush(&crate::FlushOptions::default()).unwrap();
+    assert_eq!(db.get(b"k").unwrap(), b"v");
+  }
+
+  #[test]
+  fn flush_noop_on_empty_memtable() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path(), create_options()).unwrap();
+    // No writes — flush should return Ok without error.
+    db.flush(&crate::FlushOptions::default()).unwrap();
+  }
+
+  #[serial(fd)]
+  #[test]
+  fn flush_moves_data_to_sstable() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path(), create_options()).unwrap();
+    db.put(b"hello", b"world").unwrap();
+    // Before flush: L0 should be empty.
+    assert_eq!(db.get_property("leveldb.num-files-at-level0").unwrap(), "0");
+    db.flush(&crate::FlushOptions::default()).unwrap();
+    // After flush: at least one L0 (or higher) SSTable should exist.
+    let total_files: usize = (0..7)
+      .map(|l| {
+        db.get_property(&format!("leveldb.num-files-at-level{l}"))
+          .unwrap_or_else(|| "0".into())
+          .parse::<usize>()
+          .unwrap_or(0)
+      })
+      .sum();
+    assert!(
+      total_files >= 1,
+      "expected at least one SSTable after flush"
+    );
+    // Data must still be readable.
+    assert_eq!(db.get(b"hello").unwrap(), b"world");
+  }
+
+  #[serial(fd)]
+  #[test]
+  fn flush_is_durable_across_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+      let db = Db::open(dir.path(), create_options()).unwrap();
+      db.put(b"persist", b"yes").unwrap();
+      db.flush(&crate::FlushOptions::default()).unwrap();
+      // Drop db — WAL for the flushed data was already deleted by the flush.
+    }
+    // Reopen without writing anything: data must come from the SSTable.
+    let db = Db::open(dir.path(), Options::default()).unwrap();
+    assert_eq!(db.get(b"persist").unwrap(), b"yes");
+  }
+
+  #[serial(fd)]
+  #[test]
+  fn flush_wait_false_does_not_block() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path(), create_options()).unwrap();
+    for i in 0..10u32 {
+      db.put(format!("k{i}").as_bytes(), b"v").unwrap();
+    }
+    // Non-blocking flush: should return immediately.
+    db.flush(&crate::FlushOptions { wait: false }).unwrap();
+    // Data must be readable regardless of whether the flush has completed yet.
+    assert_eq!(db.get(b"k0").unwrap(), b"v");
   }
 }

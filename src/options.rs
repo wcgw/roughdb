@@ -190,3 +190,25 @@ pub struct WriteOptions {
   /// Default: false.
   pub sync: bool,
 }
+
+/// Options that control [`Db::flush`](crate::Db::flush).
+///
+/// See `include/rocksdb/db.h: FlushOptions`.
+#[derive(Debug, Clone)]
+pub struct FlushOptions {
+  /// If `true`, block until the background thread has written the memtable to an SSTable and
+  /// installed the new `Version`.  The WAL segment covering the flushed data is deleted before
+  /// this call returns.
+  ///
+  /// If `false`, the flush is scheduled and this call returns immediately.  The data will appear
+  /// in an SSTable at some point in the near future (subject to background-thread scheduling).
+  ///
+  /// Default: `true`.
+  pub wait: bool,
+}
+
+impl Default for FlushOptions {
+  fn default() -> Self {
+    FlushOptions { wait: true }
+  }
+}
