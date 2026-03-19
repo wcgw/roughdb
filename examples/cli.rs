@@ -56,6 +56,8 @@ enum Command {
     /// The key to remove.
     key: String,
   },
+  /// Remove KEY from the database.
+  Compact,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -75,6 +77,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     },
     Command::Put { key, value } => db.put(key, value)?,
     Command::Delete { key } => db.delete(key)?,
+    Command::Compact => db.compact_range(None, None)?,
   }
 
   Ok(())
