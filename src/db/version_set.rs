@@ -27,7 +27,7 @@ pub(crate) fn manifest_filename(number: u64) -> String {
   format!("MANIFEST-{number:06}")
 }
 
-fn write_current_file(path: &Path, manifest_number: u64) -> Result<(), Error> {
+pub(crate) fn write_current_file(path: &Path, manifest_number: u64) -> Result<(), Error> {
   let content = format!("{}\n", manifest_filename(manifest_number));
   std::fs::write(path.join("CURRENT"), content)?;
   Ok(())

@@ -162,10 +162,15 @@ RoughDB is in active development. The on-disk format is LevelDB-compatible.
 - `get_property` — `leveldb.num-files-at-level<N>`, `leveldb.stats`, `leveldb.sstables`,
   `leveldb.approximate-memory-usage`
 - `get_approximate_sizes` — byte-range estimation via index-block seeks
+- `repair` — recovers a database from a corrupt or missing MANIFEST by scanning surviving SSTables
+  and WAL files, converting WALs to SSTables, and writing a fresh MANIFEST
 - `destroy` — safely removes a database directory
 - `LOCK` file — prevents concurrent opens by multiple processes
 - Table cache — LRU open-file-handle cache bounded by `Options::max_open_files`
 - Block cache — LRU byte-capacity cache with per-table IDs; `ReadOptions::fill_cache`
+- `ForwardIter` — stdlib `Iterator` adapter via `DbIter::forward()` for ergonomic forward scans
+- Info logging via the [`log`](https://crates.io/crates/log) crate — compaction progress, flush
+  lifecycle, recovery details, backpressure events, and errors
 
 **Known limitations:**
 
@@ -180,9 +185,6 @@ RoughDB is in active development. The on-disk format is LevelDB-compatible.
   RoughDB.
 - **`Env` abstraction** — file I/O is hardcoded to the local POSIX filesystem. There is no way to
   inject a custom storage backend (in-memory, encrypted, cloud, etc.).
-- **`RepairDB`** — recovery from a corrupt or partial MANIFEST by scanning surviving SSTables.
-- **Info logging** — LevelDB writes compaction progress, recovery details, and errors to an
-  `info_log`. RoughDB produces no log output.
 
 ## License
 
