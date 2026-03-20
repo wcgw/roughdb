@@ -377,6 +377,16 @@ what remains is compaction, the full Iterator/Snapshot API, and operational hygi
   distinguish recycled files. See `db/log_writer.cc` in RocksDB.
 - **Ribbon filters** (RocksDB): Drop-in replacement for Bloom filters offering the same false-positive rate in ~30%
   fewer bits. See `util/ribbon_impl.h` in RocksDB.
+- **`Db::repair` directory locking** (RocksDB): Acquire the `LOCK` file during repair to prevent concurrent access.
+  LevelDB does not lock during repair; RocksDB does (`env_->LockFile` in `db/repair.cc`). Our current implementation
+  follows LevelDB and does not lock.
+- **`CompactionFilter`** (RocksDB): User-supplied callback invoked for every key during compaction. Returns
+  `Keep`, `Remove`, `ChangeValue`, or `RemoveAndSkipUntil`. Enables TTL expiry, value transformations, and
+  range deletions without a separate scan-and-delete pass. LevelDB has no equivalent — only shadow-key pruning
+  and tombstone elision are built in. See `include/rocksdb/compaction_filter.h`.
+- **`CompactionFilterFactory`** (RocksDB): Creates a `CompactionFilter` per compaction run, allowing the filter
+  to hold per-compaction state (e.g. a snapshot of the current time for TTL checks). Paired with `CompactionFilter`
+  above. See `include/rocksdb/compaction_filter.h: CompactionFilterFactory`.
 
 ---
 
