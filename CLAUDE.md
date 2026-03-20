@@ -99,14 +99,14 @@ Features are listed in dependency order. Each phase must be complete before the 
 
 **Step 2 — Log primitives**
 
-- [x] **Format** (`src/log/format.rs`): 32 KB blocks. Record header: `[crc32c: u32 LE][len: u16 LE][type: u8]` (7
+- [x] **Format** (`src/logfile/format.rs`): 32 KB blocks. Record header: `[crc32c: u32 LE][len: u16 LE][type: u8]` (7
   bytes). Fragment types: `Zero=0` (pad), `Full=1`, `First=2`, `Middle=3`, `Last=4`. Constants: `BLOCK_SIZE = 32768`,
   `HEADER_SIZE = 7`. See `db/log_format.h`.
-- [x] **`log::Writer`** (`src/log/writer.rs`): Wraps `BufWriter<File>` directly — no `Env` abstraction yet (deferred to
+- [x] **`logfile::Writer`** (`src/logfile/writer.rs`): Wraps `BufWriter<File>` directly — no `Env` abstraction yet (deferred to
   Phase 9). `add_record(&[u8])` fragments the payload across block boundaries; pads trailing fewer-than-7-byte remnants
   with zeros; pre-computes per-type CRCs on construction. Constructor: `new(file: File, dest_length: u64)` where
   `dest_length` allows resuming an existing file. See `db/log_writer.h/cc`.
-- [x] **`log::Reader`** (`src/log/reader.rs`): Wraps `File`. `read_record() -> Option<Vec<u8>>` reassembles
+- [x] **`logfile::Reader`** (`src/logfile/reader.rs`): Wraps `File`. `read_record() -> Option<Vec<u8>>` reassembles
   multi-fragment records into a scratch buffer. Optional CRC verification (`checksum: bool`). Reports corruption via a
   `Reporter` trait (one method: `corruption(bytes: u64, reason: &str)`). Resynchronisation: when `initial_offset > 0`,
   skips `Middle`/`Last` fragments until a `Full` or `First` is found. See `db/log_reader.h/cc`.
@@ -114,14 +114,14 @@ Features are listed in dependency order. Each phase must be complete before the 
 **Step 3 — Integration**
 
 - [x] **`Db::open(path)`** (`src/lib.rs` or `src/db/mod.rs`): Creates the directory if absent; opens or creates
-  `<path>/000001.log`; constructs `Db` with a live `log::Writer`. Returns `Result<Db, Error>`. `Db::default()` retained
+  `<path>/000001.log`; constructs `Db` with a live `logfile::Writer`. Returns `Result<Db, Error>`. `Db::default()` retained
   for in-memory/test use (no WAL). Full MANIFEST-driven log-number tracking deferred to Phase 9.
 - [x] **`Db::write` wired to WAL**: Change signature to `fn write(&self, opts: &WriteOptions, batch: &WriteBatch) ->
   Result<(), Error>`. Under the write lock: read `start_seq`, call `batch.set_sequence(start_seq)`, call
   `log_writer.add_record(batch.contents())`, sync if `opts.sync`, iterate into memtable, advance `last_sequence`.
   The stamp must precede the log write so WAL records carry the correct embedded sequence for recovery replay.
   `Db::put`/`delete` updated to forward a default `WriteOptions`.
-- [x] **Recovery** (`Db::open` calls this when WAL exists): Construct a `log::Reader` from offset 0; for each record
+- [x] **Recovery** (`Db::open` calls this when WAL exists): Construct a `logfile::Reader` from offset 0; for each record
   decode it as a `WriteBatch` and replay via `batch.iterate(&mut inserter)` using the batch's embedded sequence; after
   all records restore `last_sequence` to the highest sequence seen. Incomplete trailing records (torn write on crash)
   are silently ignored.
@@ -237,10 +237,13 @@ what remains is compaction, the full Iterator/Snapshot API, and operational hygi
   when no data exists at L2+). Writes output SSTables to L1 (new file per `max_file_size`). `install_compaction`
   (under lock) records a single `VersionEdit` deleting all inputs and adding all outputs, then calls
   `log_and_apply`. `log_and_apply` now sorts L1–L6 files by smallest user key after each edit. `maybe_compact`
-  orchestrates the three phases; called from `Db::write` in a loop (up to 32×) after every flush. Slow-write
-  throttle: sleeps 1 ms per iteration when L0 ≥ `L0_SLOWDOWN_WRITES_TRIGGER` (8). No background thread — runs
-  synchronously on the writing goroutine. `compact_pointer` round-robin not implemented (all L0 files always
-  selected). See `db/db_impl.cc: DBImpl::BackgroundCompaction`, `DoCompactionWork`, `MakeRoomForWrite`.
+  orchestrates the three phases; called by the background thread after each flush. Compaction is fully
+  asynchronous — a dedicated background thread runs flush and compaction while writers proceed. `Db` is split into
+  `Arc<DbInner>` (shared with the background thread) + `JoinHandle` (joined on drop). Write backpressure:
+  `make_room_for_write` sleeps 1 ms at L0 ≥ 8 (`L0_SLOWDOWN_WRITES_TRIGGER`), blocks at L0 ≥ 12
+  (`L0_STOP_WRITES_TRIGGER`), and waits for an in-progress flush if `imm` is occupied. Level-score scheduling,
+  compact-pointer round-robin, seek-based compaction, trivial-move optimisation, and grandparent-overlap limiting
+  are all implemented. See `db/db_impl.cc: DBImpl::BackgroundCompaction`, `DoCompactionWork`, `MakeRoomForWrite`.
 - [x] **`Db::compact_range(begin, end)`**: Manual compaction of a user-key range (`Option<&[u8]>` for open bounds).
   Finds the deepest level with files overlapping `[begin, end]`, then calls `compact_level_range` for each level
   from 0 to `max_level - 1`.  Each call uses the three-phase lock protocol; newly compacted files are visible to
@@ -324,7 +327,7 @@ what remains is compaction, the full Iterator/Snapshot API, and operational hygi
   `verify_checksums = opts.verify_checksums || self.options.paranoid_checks` is computed in `Db::get_with_options`
   and `Db::new_iterator` and forwarded to `Version::get(verify_checksums)` and `Table::new_iterator(verify_checksums)`
   (which threads it into the `BlockFn` closure).  `Options::paranoid_checks` is also passed to `VersionSet::recover`
-  and `recover_wal` as the `checksum` argument to `log::Reader::new`, so MANIFEST and WAL records are verified during
+  and `recover_wal` as the `checksum` argument to `logfile::Reader::new`, so MANIFEST and WAL records are verified during
   recovery.  See `db/db_impl.cc: DBImpl::Get`, `table/table.cc: Table::InternalGet`.
 
 ---
@@ -359,8 +362,10 @@ what remains is compaction, the full Iterator/Snapshot API, and operational hygi
 - **Custom comparator**: Wire `Options::comparator` through to all key-comparison sites (skip list, block seek,
   compaction). Currently hardcoded bytewise. Needed to use RoughDB as a sorted map on non-lexicographic keys.
   See `include/leveldb/comparator.h`.
-- **`RepairDB(path, options)`**: Scans the database directory, recovers as many SSTables as possible from a corrupt
-  or partial MANIFEST, and rebuilds a valid MANIFEST. See `db/repair.cc`.
+- ✅ **`Db::repair(path, options)`**: Scans the database directory for surviving `.ldb` and `.log` files, converts WALs
+  to SSTables via `LogReader` → `Memtable` → `TableBuilder`, extracts metadata from all SSTables, writes a fresh
+  `MANIFEST-000001` placing all files at L0, and writes `CURRENT`.  Corrupt records/files are skipped and archived to
+  `lost/`.  Port of `db/repair.cc: RepairDB`.
 - **`Options::reuse_logs`**: Experimental LevelDB flag — when set, the existing WAL and MANIFEST files are reused
   on `Db::open` rather than creating new ones after recovery, saving an `fsync` of `CURRENT`. Low priority.
   See `db/db_impl.cc: DBImpl::Recover`.
