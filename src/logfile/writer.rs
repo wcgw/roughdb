@@ -12,7 +12,7 @@
 
 use crate::coding::{crc32c, crc32c_extend, mask_crc};
 use crate::error::Error;
-use crate::log::format::{RecordType, BLOCK_SIZE, HEADER_SIZE};
+use crate::logfile::format::{RecordType, BLOCK_SIZE, HEADER_SIZE};
 use std::fs::File;
 use std::io::{BufWriter, Write};
 
@@ -121,7 +121,7 @@ impl Writer {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::log::format::{RecordType, BLOCK_SIZE, HEADER_SIZE};
+  use crate::logfile::format::{RecordType, BLOCK_SIZE, HEADER_SIZE};
   use std::io::{Read, Seek, SeekFrom};
 
   /// Write records to a temp file via Writer, then read back the raw bytes for

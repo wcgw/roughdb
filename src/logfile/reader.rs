@@ -11,7 +11,7 @@
 //    limitations under the License.
 
 use crate::coding::{crc32c, crc32c_extend, unmask_crc};
-use crate::log::format::{RecordType, BLOCK_SIZE, HEADER_SIZE};
+use crate::logfile::format::{RecordType, BLOCK_SIZE, HEADER_SIZE};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 
@@ -345,7 +345,7 @@ impl Reader {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::log::writer::Writer;
+  use crate::logfile::writer::Writer;
   use std::io::{Seek, SeekFrom, Write};
 
   struct CorruptionLog(Vec<(u64, String)>);
