@@ -383,7 +383,7 @@ mod tests {
     batch.put(b"foo", b"bar");
     batch.put(b"baz", b"qux");
     batch.delete(b"foo");
-    db.write(&WriteOptions::default(), &batch).unwrap();
+    db.write(&WriteOptions::default(), batch).unwrap();
     assert!(db
       .get_with_options(&ReadOptions::default(), b"foo")
       .unwrap_err()
