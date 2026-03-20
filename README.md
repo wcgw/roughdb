@@ -166,6 +166,7 @@ RoughDB is in active development. The on-disk format is LevelDB-compatible.
 - `LOCK` file — prevents concurrent opens by multiple processes
 - Table cache — LRU open-file-handle cache bounded by `Options::max_open_files`
 - Block cache — LRU byte-capacity cache with per-table IDs; `ReadOptions::fill_cache`
+- Info logging — compaction progress, recovery details, and errors to `log`
 
 **Known limitations:**
 
@@ -181,8 +182,6 @@ RoughDB is in active development. The on-disk format is LevelDB-compatible.
 - **`Env` abstraction** — file I/O is hardcoded to the local POSIX filesystem. There is no way to
   inject a custom storage backend (in-memory, encrypted, cloud, etc.).
 - **`RepairDB`** — recovery from a corrupt or partial MANIFEST by scanning surviving SSTables.
-- **Info logging** — LevelDB writes compaction progress, recovery details, and errors to an
-  `info_log`. RoughDB produces no log output.
 
 ## License
 
