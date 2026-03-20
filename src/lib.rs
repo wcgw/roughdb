@@ -5272,7 +5272,7 @@ mod tests {
   fn forward_iter_from_seek() {
     let db = Db::default();
     for c in b'a'..=b'e' {
-      db.put(&[c], &[c]).unwrap();
+      db.put([c], [c]).unwrap();
     }
 
     let mut it = db.new_iterator(&ReadOptions::default()).unwrap();
