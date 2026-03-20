@@ -13,6 +13,7 @@ keywords = ["database", "levelDB", "persistence"]
 bumpalo = "3.20.2"
 crc32c = "0.6.8"
 libc = "0.2"
+log = "0.4"
 snap = "1"
 zstd = "0.13"
 
