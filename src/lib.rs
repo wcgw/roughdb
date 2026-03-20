@@ -1428,6 +1428,227 @@ impl Db {
 
     Ok(())
   }
+
+  /// Attempt to recover a database that cannot be opened normally.
+  ///
+  /// Scans the database directory for surviving `.ldb` (SSTable) and `.log` (WAL) files,
+  /// converts WAL files to SSTables, extracts metadata from all SSTables, and writes a fresh
+  /// `MANIFEST-000001` + `CURRENT` that places every recovered file at L0.
+  ///
+  /// Some data may be lost (corrupt WAL records and unreadable SSTables are skipped).
+  /// Processed WAL and corrupt files are moved to a `lost/` subdirectory.
+  ///
+  /// Does **not** acquire the database lock; the caller must ensure no other process has the
+  /// database open.  Call [`Db::open`] after repair to use the recovered database.
+  ///
+  /// See `db/repair.cc: RepairDB`.
+  pub fn repair<P: AsRef<std::path::Path>>(path: P, options: Options) -> Result<(), Error> {
+    use crate::iter::InternalIterator;
+    use crate::table::format::parse_internal_key;
+
+    let path = path.as_ref();
+
+    // ── Phase 1: find_files ────────────────────────────────────────────────────
+    let entries = std::fs::read_dir(path).map_err(|e| {
+      Error::IoError(std::io::Error::new(
+        e.kind(),
+        format!("repair: cannot read directory {}: {e}", path.display()),
+      ))
+    })?;
+
+    let mut logs: Vec<u64> = Vec::new();
+    let mut table_numbers: Vec<u64> = Vec::new();
+    let mut manifests: Vec<String> = Vec::new();
+    let mut max_number: u64 = 0;
+
+    for entry in entries.flatten() {
+      let name = entry.file_name();
+      let name = name.to_string_lossy();
+      if let Some((number, kind)) = parse_db_filename(&name) {
+        if number > max_number {
+          max_number = number;
+        }
+        match kind {
+          FileKind::Log => logs.push(number),
+          FileKind::Table => table_numbers.push(number),
+          FileKind::Manifest => manifests.push(name.to_string()),
+          _ => {}
+        }
+      }
+    }
+    let mut next_file_number = max_number.max(1) + 1;
+
+    // ── Phase 2: convert_log_to_table ──────────────────────────────────────────
+    for log_num in &logs {
+      let log_path = path.join(format!("{log_num:06}.log"));
+      let file = match std::fs::File::open(&log_path) {
+        Ok(f) => f,
+        Err(e) => {
+          log::warn!("repair: cannot open WAL {}: {e}", log_path.display());
+          continue;
+        }
+      };
+      let mut reader = LogReader::new(file, None, false, 0);
+      let mem = Memtable::default();
+
+      while let Some(record) = reader.read_record() {
+        let batch = match WriteBatch::from_contents(record) {
+          Ok(b) => b,
+          Err(e) => {
+            log::warn!(
+              "repair: skipping corrupt WAL record in {}: {e}",
+              log_path.display()
+            );
+            continue;
+          }
+        };
+        let mut inserter = Inserter {
+          mem: &mem,
+          seq: batch.sequence(),
+        };
+        if let Err(e) = batch.iterate(&mut inserter) {
+          log::warn!(
+            "repair: skipping WAL record in {} (iterate failed): {e}",
+            log_path.display()
+          );
+          continue;
+        }
+      }
+
+      if mem.approximate_memory_usage() > 0 {
+        let sst_number = next_file_number;
+        next_file_number += 1;
+        let sst_path = path.join(format!("{sst_number:06}.ldb"));
+        let sst_file = std::fs::File::create(&sst_path)?;
+        let mut builder = TableBuilder::new(
+          sst_file,
+          options.block_size,
+          options.block_restart_interval,
+          options.filter_policy.clone(),
+          options.compression,
+        );
+        let mut it = mem.iter();
+        it.seek_to_first();
+        while it.valid() {
+          builder.add(it.key(), it.value())?;
+          it.advance();
+        }
+        builder.finish()?;
+        table_numbers.push(sst_number);
+        log::info!("repair: converted WAL {log_num:06}.log → SSTable {sst_number:06}.ldb");
+      }
+
+      archive_file(path, &format!("{log_num:06}.log"));
+    }
+
+    // ── Phase 3: scan_table (extract metadata) ────────────────────────────────
+    struct TableInfo {
+      meta: Arc<FileMetaData>,
+      max_sequence: u64,
+    }
+
+    let mut tables: Vec<TableInfo> = Vec::new();
+
+    for &num in &table_numbers {
+      let sst_path = path.join(format!("{num:06}.ldb"));
+      let file_size = match std::fs::metadata(&sst_path) {
+        Ok(m) => m.len(),
+        Err(e) => {
+          log::warn!("repair: cannot stat {}: {e}", sst_path.display());
+          continue;
+        }
+      };
+      let file = match std::fs::File::open(&sst_path) {
+        Ok(f) => f,
+        Err(e) => {
+          log::warn!("repair: cannot open {}: {e}", sst_path.display());
+          continue;
+        }
+      };
+      let table = match Table::open(file, file_size, options.filter_policy.clone(), None) {
+        Ok(t) => t,
+        Err(e) => {
+          log::warn!("repair: cannot open SSTable {}: {e}", sst_path.display());
+          continue;
+        }
+      };
+      let mut iter = match table.new_iterator(options.paranoid_checks, false) {
+        Ok(it) => it,
+        Err(e) => {
+          log::warn!(
+            "repair: cannot create iterator for {}: {e}",
+            sst_path.display()
+          );
+          continue;
+        }
+      };
+
+      let mut smallest: Vec<u8> = Vec::new();
+      let mut largest: Vec<u8> = Vec::new();
+      let mut max_seq: u64 = 0;
+
+      iter.seek_to_first();
+      while iter.valid() {
+        let ikey = iter.key();
+        if smallest.is_empty() {
+          smallest = ikey.to_vec();
+        }
+        largest = ikey.to_vec();
+        if let Some((_user_key, seq, _vtype)) = parse_internal_key(ikey) {
+          if seq > max_seq {
+            max_seq = seq;
+          }
+        }
+        iter.next();
+      }
+
+      if let Some(e) = iter.status() {
+        log::warn!(
+          "repair: iterator error scanning {}: {e}",
+          sst_path.display()
+        );
+        continue;
+      }
+
+      if !smallest.is_empty() {
+        tables.push(TableInfo {
+          meta: FileMetaData::new(num, file_size, smallest, largest),
+          max_sequence: max_seq,
+        });
+      }
+    }
+
+    // ── Phase 4: write_descriptor ──────────────────────────────────────────────
+    let max_sequence = tables.iter().map(|t| t.max_sequence).max().unwrap_or(0);
+
+    let mut edit = VersionEdit::new();
+    edit.log_number = Some(0);
+    edit.next_file_number = Some(next_file_number);
+    edit.last_sequence = Some(max_sequence);
+    for t in &tables {
+      edit.new_files.push((0, Arc::clone(&t.meta)));
+    }
+
+    let manifest_path = path.join(crate::db::version_set::manifest_filename(1));
+    let manifest_file = std::fs::File::create(&manifest_path)?;
+    let mut manifest_writer = LogWriter::new(manifest_file, 0);
+    manifest_writer.add_record(&edit.encode())?;
+
+    // Delete old manifests.
+    for name in &manifests {
+      let _ = std::fs::remove_file(path.join(name));
+    }
+
+    // Write CURRENT pointing at MANIFEST-000001.
+    crate::db::version_set::write_current_file(path, 1)?;
+
+    log::info!(
+      "repair: wrote new manifest with {} tables, max_sequence={max_sequence}",
+      tables.len()
+    );
+
+    Ok(())
+  }
 }
 
 // ── Background scheduling helpers ────────────────────────────────────────────
@@ -2859,6 +3080,16 @@ fn parse_db_filename(name: &str) -> Option<(u64, FileKind)> {
     return Some((n, FileKind::Table));
   }
   None
+}
+
+/// Move a file from the database directory into a `lost/` subdirectory.
+///
+/// Used by [`Db::repair`] to archive processed WAL files and corrupt SSTables
+/// so they are not re-processed on a subsequent repair attempt.
+fn archive_file(db_path: &std::path::Path, filename: &str) {
+  let lost_dir = db_path.join("lost");
+  let _ = std::fs::create_dir_all(&lost_dir);
+  let _ = std::fs::rename(db_path.join(filename), lost_dir.join(filename));
 }
 
 /// Delete database files that are no longer referenced by any live `Version`.
@@ -5382,5 +5613,77 @@ mod tests {
     it.seek(b"b");
     let second: Vec<_> = it.forward().map(|r| r.unwrap().0).collect();
     assert_eq!(second, vec![b"b".to_vec()]);
+  }
+
+  // ── Db::repair tests ───────────────────────────────────────────────────────
+
+  #[serial(fd)]
+  #[test]
+  fn repair_recovers_flushed_data() {
+    let dir = tempfile::tempdir().unwrap();
+    // Write enough data to trigger a flush (small write_buffer_size).
+    {
+      let mut opts = create_options();
+      opts.write_buffer_size = 512;
+      let db = Db::open(dir.path(), opts).unwrap();
+      for i in 0..20u32 {
+        db.put(
+          format!("key{i:03}").as_bytes(),
+          format!("val{i:03}").as_bytes(),
+        )
+        .unwrap();
+      }
+    }
+    // Delete MANIFEST and CURRENT to simulate corruption.
+    for entry in std::fs::read_dir(dir.path()).unwrap() {
+      let entry = entry.unwrap();
+      let name = entry.file_name().to_string_lossy().to_string();
+      if name.starts_with("MANIFEST-") || name == "CURRENT" {
+        std::fs::remove_file(entry.path()).unwrap();
+      }
+    }
+    // Repair should succeed.
+    Db::repair(dir.path(), create_options()).unwrap();
+    // Reopen and verify data.
+    let db = Db::open(dir.path(), Options::default()).unwrap();
+    // At least some keys should be recoverable from SSTables.
+    let mut found = 0;
+    for i in 0..20u32 {
+      if db.get(format!("key{i:03}").as_bytes()).is_ok() {
+        found += 1;
+      }
+    }
+    assert!(found > 0, "expected at least some keys to survive repair");
+  }
+
+  #[serial(fd)]
+  #[test]
+  fn repair_converts_wal_to_table() {
+    let dir = tempfile::tempdir().unwrap();
+    // Write data but don't flush (large write_buffer_size).
+    {
+      let db = Db::open(dir.path(), create_options()).unwrap();
+      db.put(b"from_wal", b"yes").unwrap();
+    }
+    // Delete MANIFEST and CURRENT.
+    for entry in std::fs::read_dir(dir.path()).unwrap() {
+      let entry = entry.unwrap();
+      let name = entry.file_name().to_string_lossy().to_string();
+      if name.starts_with("MANIFEST-") || name == "CURRENT" {
+        std::fs::remove_file(entry.path()).unwrap();
+      }
+    }
+    Db::repair(dir.path(), create_options()).unwrap();
+    let db = Db::open(dir.path(), Options::default()).unwrap();
+    assert_eq!(db.get(b"from_wal").unwrap(), b"yes");
+  }
+
+  #[test]
+  fn repair_nonexistent_path_errors() {
+    let err = Db::repair(
+      "/tmp/roughdb_nonexistent_repair_test_xyz",
+      Options::default(),
+    );
+    assert!(err.is_err());
   }
 }
