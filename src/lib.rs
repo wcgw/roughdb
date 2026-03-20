@@ -1337,9 +1337,14 @@ impl Db {
       // If we triggered a flush, wait for the background thread to complete it.
       // This preserves the original synchronous-flush behaviour seen by callers.
       if triggered_flush {
-        while state.imm.is_some() || state.pending_flush.is_some() {
+        while (state.imm.is_some() || state.pending_flush.is_some())
+          && state.background_error.is_none()
+        {
           state = self.inner.write_condvar.wait(state).unwrap();
         }
+        // A background error means the flush failed.  The write itself already
+        // succeeded (WAL + memtable), so we don't propagate the error here —
+        // the next write will see it in make_room_for_write.
       }
     }
     drop(state);
