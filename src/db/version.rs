@@ -137,13 +137,14 @@ impl Version {
   /// See `db/version_set.cc: VersionSet::ApproximateOffsetOf`.
   pub(crate) fn approximate_offset_of(&self, ikey: &[u8], tc: &TableCache) -> u64 {
     use crate::table::format::cmp_internal_keys;
+    let cmp = &*tc.comparator();
     let mut result = 0u64;
     for level in 0..NUM_LEVELS {
       for meta in &self.files[level] {
-        if cmp_internal_keys(&meta.largest, ikey) <= std::cmp::Ordering::Equal {
+        if cmp_internal_keys(&meta.largest, ikey, cmp) <= std::cmp::Ordering::Equal {
           // Entire file is before ikey.
           result += meta.file_size;
-        } else if cmp_internal_keys(&meta.smallest, ikey) > std::cmp::Ordering::Equal {
+        } else if cmp_internal_keys(&meta.smallest, ikey, cmp) > std::cmp::Ordering::Equal {
           // Entire file is after ikey; L1+ files are sorted so no later file
           // in this level can contain ikey.
           if level > 0 {

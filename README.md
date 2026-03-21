@@ -169,6 +169,9 @@ RoughDB is in active development. The on-disk format is LevelDB-compatible.
 - Table cache — LRU open-file-handle cache bounded by `Options::max_open_files`
 - Block cache — LRU byte-capacity cache with per-table IDs; `ReadOptions::fill_cache`
 - `ForwardIter` — stdlib `Iterator` adapter via `DbIter::forward()` for ergonomic forward scans
+- Custom comparators — `Options::comparator` accepts any `Arc<dyn Comparator>` for non-lexicographic
+  key ordering; `BytewiseComparator` is the default. Comparator name stored in MANIFEST; mismatch on
+  reopen is rejected
 - Info logging via the [`log`](https://crates.io/crates/log) crate — compaction progress, flush
   lifecycle, recovery details, backpressure events, and errors
 
@@ -180,9 +183,6 @@ RoughDB is in active development. The on-disk format is LevelDB-compatible.
 
 **Not yet implemented:**
 
-- **Custom comparators** — keys are always compared bytewise; `Options::comparator` does not
-  exist. Applications that require a custom sort order (e.g. reverse, integer, prefix) cannot use
-  RoughDB.
 - **`Env` abstraction** — file I/O is hardcoded to the local POSIX filesystem. There is no way to
   inject a custom storage backend (in-memory, encrypted, cloud, etc.).
 

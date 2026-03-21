@@ -46,6 +46,7 @@ pub(crate) struct TableBuilder {
   /// Name of the filter policy, for the metaindex key `"filter.<name>"`.
   filter_policy_name: Option<String>,
   compression: CompressionType,
+  comparator: Arc<dyn crate::comparator::Comparator>,
 }
 
 impl TableBuilder {
@@ -63,6 +64,7 @@ impl TableBuilder {
     restart_interval: usize,
     filter_policy: Option<Arc<dyn FilterPolicy>>,
     compression: CompressionType,
+    comparator: Arc<dyn crate::comparator::Comparator>,
   ) -> Self {
     let (filter_writer, filter_policy_name) = match filter_policy {
       Some(policy) => {
@@ -86,6 +88,7 @@ impl TableBuilder {
       filter_writer,
       filter_policy_name,
       compression,
+      comparator,
     }
   }
 
@@ -94,11 +97,14 @@ impl TableBuilder {
     debug_assert!(!self.closed);
 
     // If the previous data block was flushed, emit its index entry now.
-    // The separator key is just `last_key` (no FindShortestSeparator for Phase 3).
+    // Shorten last_key to the shortest separator in [last_key, key) so the index
+    // block is more compressible.  Port of LevelDB's FindShortestSeparator call.
     if let Some(handle) = self.pending_handle.take() {
+      let mut sep = std::mem::take(&mut self.last_key);
+      self.comparator.find_shortest_separator(&mut sep, key);
       let mut handle_enc = [0u8; 20];
       let n = handle.encode_to(&mut handle_enc);
-      self.index_block.add(&self.last_key, &handle_enc[..n]);
+      self.index_block.add(&sep, &handle_enc[..n]);
     }
 
     // Add the USER KEY to the filter (not the full internal key).
@@ -138,8 +144,10 @@ impl TableBuilder {
       self.flush_data_block()?;
     }
 
-    // Emit the index entry for the last data block.
+    // Emit the index entry for the last data block.  Use FindShortSuccessor
+    // to shorten the key — there is no next data block to bound against.
     if let Some(handle) = self.pending_handle.take() {
+      self.comparator.find_short_successor(&mut self.last_key);
       let mut handle_enc = [0u8; 20];
       let n = handle.encode_to(&mut handle_enc);
       self.index_block.add(&self.last_key, &handle_enc[..n]);
@@ -261,7 +269,14 @@ mod tests {
   fn build_table(pairs: &[(&[u8], &[u8])]) -> (tempfile::NamedTempFile, u64) {
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let file = tmp.reopen().unwrap();
-    let mut builder = TableBuilder::new(file, 4096, 16, None, CompressionType::NoCompression);
+    let mut builder = TableBuilder::new(
+      file,
+      4096,
+      16,
+      None,
+      CompressionType::NoCompression,
+      Arc::new(crate::comparator::BytewiseComparator),
+    );
     for (seq, &(k, v)) in pairs.iter().enumerate() {
       let ikey = make_internal_key(k, seq as u64 + 1, 1);
       builder.add(&ikey, v).unwrap();
@@ -274,7 +289,14 @@ mod tests {
   fn empty_table_finish() {
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let file = tmp.reopen().unwrap();
-    let builder = TableBuilder::new(file, 4096, 16, None, CompressionType::NoCompression);
+    let builder = TableBuilder::new(
+      file,
+      4096,
+      16,
+      None,
+      CompressionType::NoCompression,
+      Arc::new(crate::comparator::BytewiseComparator),
+    );
     let size = builder.finish().unwrap();
     // Should at least have metaindex block + trailer + index block + trailer + footer.
     assert!(size >= FOOTER_ENCODED_LENGTH as u64);
@@ -284,7 +306,14 @@ mod tests {
   fn single_entry_round_trip() {
     let (tmp, size) = build_table(&[(b"hello", b"world")]);
     let file = tmp.reopen().unwrap();
-    let table = Table::open(file, size, None, None).unwrap();
+    let table = Table::open(
+      file,
+      size,
+      None,
+      None,
+      std::sync::Arc::new(crate::comparator::BytewiseComparator),
+    )
+    .unwrap();
     assert!(matches!(table.get(b"hello", false, true).unwrap(), L::Value(v) if v == b"world"));
     assert!(matches!(
       table.get(b"missing", false, true).unwrap(),
@@ -297,7 +326,14 @@ mod tests {
     let pairs: Vec<(&[u8], &[u8])> = vec![(b"a", b"1"), (b"b", b"2"), (b"c", b"3"), (b"d", b"4")];
     let (tmp, size) = build_table(&pairs);
     let file = tmp.reopen().unwrap();
-    let table = Table::open(file, size, None, None).unwrap();
+    let table = Table::open(
+      file,
+      size,
+      None,
+      None,
+      std::sync::Arc::new(crate::comparator::BytewiseComparator),
+    )
+    .unwrap();
     for (k, v) in &pairs {
       assert!(matches!(table.get(k, false, true).unwrap(), L::Value(ref val) if val == v));
     }
@@ -316,14 +352,28 @@ mod tests {
       .collect();
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let file = tmp.reopen().unwrap();
-    let mut builder = TableBuilder::new(file, 64, 4, None, CompressionType::NoCompression);
+    let mut builder = TableBuilder::new(
+      file,
+      64,
+      4,
+      None,
+      CompressionType::NoCompression,
+      Arc::new(crate::comparator::BytewiseComparator),
+    );
     for (seq, (k, v)) in pairs.iter().enumerate() {
       let ikey = make_internal_key(k, seq as u64 + 1, 1);
       builder.add(&ikey, v).unwrap();
     }
     let size = builder.finish().unwrap();
     let file = tmp.reopen().unwrap();
-    let table = Table::open(file, size, None, None).unwrap();
+    let table = Table::open(
+      file,
+      size,
+      None,
+      None,
+      std::sync::Arc::new(crate::comparator::BytewiseComparator),
+    )
+    .unwrap();
     for (k, v) in &pairs {
       assert!(matches!(table.get(k, false, true).unwrap(), L::Value(ref val) if val == v));
     }
@@ -335,7 +385,14 @@ mod tests {
   ) -> (tempfile::NamedTempFile, u64) {
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let file = tmp.reopen().unwrap();
-    let mut builder = TableBuilder::new(file, 4096, 16, None, compression);
+    let mut builder = TableBuilder::new(
+      file,
+      4096,
+      16,
+      None,
+      compression,
+      Arc::new(crate::comparator::BytewiseComparator),
+    );
     for (seq, &(k, v)) in pairs.iter().enumerate() {
       let ikey = make_internal_key(k, seq as u64 + 1, 1);
       builder.add(&ikey, v).unwrap();
@@ -348,7 +405,14 @@ mod tests {
   fn snappy_compression_round_trip() {
     let pairs: Vec<(&[u8], &[u8])> = vec![(b"foo", b"bar"), (b"key", b"value")];
     let (tmp, size) = build_table_with_compression(&pairs, CompressionType::Snappy);
-    let table = Table::open(tmp.reopen().unwrap(), size, None, None).unwrap();
+    let table = Table::open(
+      tmp.reopen().unwrap(),
+      size,
+      None,
+      None,
+      std::sync::Arc::new(crate::comparator::BytewiseComparator),
+    )
+    .unwrap();
     for (k, v) in &pairs {
       assert!(matches!(table.get(k, false, true).unwrap(), L::Value(ref val) if val == v));
     }
@@ -358,7 +422,14 @@ mod tests {
   fn zstd_compression_round_trip() {
     let pairs: Vec<(&[u8], &[u8])> = vec![(b"alpha", b"one"), (b"beta", b"two")];
     let (tmp, size) = build_table_with_compression(&pairs, CompressionType::Zstd(1));
-    let table = Table::open(tmp.reopen().unwrap(), size, None, None).unwrap();
+    let table = Table::open(
+      tmp.reopen().unwrap(),
+      size,
+      None,
+      None,
+      std::sync::Arc::new(crate::comparator::BytewiseComparator),
+    )
+    .unwrap();
     for (k, v) in &pairs {
       assert!(matches!(table.get(k, false, true).unwrap(), L::Value(ref val) if val == v));
     }

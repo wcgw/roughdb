@@ -73,7 +73,10 @@ impl VersionSet {
   /// - Writes `CURRENT` pointing to that file.
   ///
   /// File numbering: 1 = WAL, 2 = MANIFEST, 3+ = SSTables.
-  pub(crate) fn create(path: &Path) -> Result<Self, Error> {
+  pub(crate) fn create(
+    path: &Path,
+    comparator: &dyn crate::comparator::Comparator,
+  ) -> Result<Self, Error> {
     let manifest_number = 2u64;
     let manifest_path = path.join(manifest_filename(manifest_number));
 
@@ -82,6 +85,7 @@ impl VersionSet {
 
     // Write the initial VersionEdit so recovery always finds a valid sequence.
     let mut edit = VersionEdit::new();
+    edit.comparator_name = Some(comparator.name().to_owned());
     edit.next_file_number = Some(3); // SSTables start at 3
     edit.last_sequence = Some(0);
     edit.log_number = Some(1);
@@ -106,7 +110,11 @@ impl VersionSet {
   /// assembles the initial `Version` (metadata only — tables are opened lazily
   /// by the `TableCache` on first access).  Returns a `VersionSet` ready for
   /// `log_and_apply`.
-  pub(crate) fn recover(path: &Path, paranoid_checks: bool) -> Result<Self, Error> {
+  pub(crate) fn recover(
+    path: &Path,
+    paranoid_checks: bool,
+    comparator: &dyn crate::comparator::Comparator,
+  ) -> Result<Self, Error> {
     let manifest_name = read_current_file(path)?;
     let manifest_path = path.join(&manifest_name);
 
@@ -118,8 +126,22 @@ impl VersionSet {
     let mut reader = LogReader::new(manifest_file_for_read, None, paranoid_checks, 0);
 
     let mut builder = Builder::new();
+    let mut first_edit = true;
     while let Some(record) = reader.read_record() {
       let edit = VersionEdit::decode(&record)?;
+      // The first edit in the MANIFEST records the comparator name.
+      // Verify it matches the comparator the caller is using.
+      if first_edit {
+        if let Some(ref stored_name) = edit.comparator_name {
+          let expected = comparator.name();
+          if stored_name != expected {
+            return Err(Error::InvalidArgument(format!(
+              "comparator mismatch: DB uses {stored_name}, caller uses {expected}"
+            )));
+          }
+        }
+        first_edit = false;
+      }
       builder.apply(&edit);
     }
 
@@ -189,6 +211,7 @@ impl VersionSet {
 
     // Keep L1–L6 sorted by smallest user key so binary search and overlap
     // checks work correctly.  L0 files are intentionally newest-first.
+    let cmp = tc.comparator();
     for level_files in new_files.iter_mut().skip(1) {
       level_files.sort_by(|a, b| {
         let ak = if a.smallest.len() >= 8 {
@@ -201,7 +224,7 @@ impl VersionSet {
         } else {
           &b.smallest
         };
-        ak.cmp(bk)
+        cmp.compare(ak, bk)
       });
     }
 
@@ -386,6 +409,7 @@ mod tests {
       opts.max_open_files - NUM_NON_TABLE_CACHE_FILES,
       None,
       None,
+      std::sync::Arc::new(crate::comparator::BytewiseComparator),
     )
   }
 
@@ -404,6 +428,7 @@ mod tests {
       opts.block_restart_interval,
       opts.filter_policy.clone(),
       opts.compression,
+      Arc::clone(&opts.comparator),
     );
     for &(uk, seq, vt, val) in entries {
       builder.add(&make_internal_key(uk, seq, vt), val).unwrap();
@@ -415,7 +440,7 @@ mod tests {
   #[test]
   fn create_writes_current_file() {
     let dir = tempfile::tempdir().unwrap();
-    VersionSet::create(dir.path()).unwrap();
+    VersionSet::create(dir.path(), &crate::comparator::BytewiseComparator).unwrap();
 
     let content = std::fs::read_to_string(dir.path().join("CURRENT")).unwrap();
     assert_eq!(content, "MANIFEST-000002\n");
@@ -425,7 +450,7 @@ mod tests {
   #[test]
   fn log_and_apply_persists() {
     let dir = tempfile::tempdir().unwrap();
-    let mut vs = VersionSet::create(dir.path()).unwrap();
+    let mut vs = VersionSet::create(dir.path(), &crate::comparator::BytewiseComparator).unwrap();
     let tc = make_tc(dir.path());
 
     // Simulate flushing file 3.
@@ -442,7 +467,8 @@ mod tests {
 
     // Drop and recover — the file must still appear.
     drop(vs);
-    let vs2 = VersionSet::recover(dir.path(), false).unwrap();
+    let vs2 =
+      VersionSet::recover(dir.path(), false, &crate::comparator::BytewiseComparator).unwrap();
     let cur2 = vs2.current();
     assert_eq!(cur2.files[0].len(), 1);
     assert_eq!(cur2.files[0][0].number, 3);
@@ -451,7 +477,7 @@ mod tests {
   #[test]
   fn recover_reopens_tables() {
     let dir = tempfile::tempdir().unwrap();
-    let mut vs = VersionSet::create(dir.path()).unwrap();
+    let mut vs = VersionSet::create(dir.path(), &crate::comparator::BytewiseComparator).unwrap();
     let tc = make_tc(dir.path());
 
     let (fnum, fsize) = write_sst(dir.path(), 3, &[(b"key", 1, 1, b"val")]);
@@ -461,7 +487,8 @@ mod tests {
     vs.log_and_apply(&mut edit, &tc).unwrap();
     drop(vs);
 
-    let vs2 = VersionSet::recover(dir.path(), false).unwrap();
+    let vs2 =
+      VersionSet::recover(dir.path(), false, &crate::comparator::BytewiseComparator).unwrap();
     let tc2 = make_tc(dir.path());
     let cur = vs2.current();
     use crate::table::reader::LookupResult;
@@ -474,7 +501,7 @@ mod tests {
   #[test]
   fn sequence_survives_reopen() {
     let dir = tempfile::tempdir().unwrap();
-    let mut vs = VersionSet::create(dir.path()).unwrap();
+    let mut vs = VersionSet::create(dir.path(), &crate::comparator::BytewiseComparator).unwrap();
     let tc = make_tc(dir.path());
 
     vs.set_last_sequence(42);
@@ -483,7 +510,8 @@ mod tests {
     vs.log_and_apply(&mut edit, &tc).unwrap();
     drop(vs);
 
-    let vs2 = VersionSet::recover(dir.path(), false).unwrap();
+    let vs2 =
+      VersionSet::recover(dir.path(), false, &crate::comparator::BytewiseComparator).unwrap();
     assert_eq!(vs2.last_sequence(), 42);
   }
 }

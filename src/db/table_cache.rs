@@ -11,6 +11,7 @@
 //    limitations under the License.
 
 use crate::cache::BlockCache;
+use crate::comparator::Comparator;
 use crate::error::Error;
 use crate::filter::FilterPolicy;
 use crate::table::reader::Table;
@@ -28,6 +29,7 @@ struct Inner {
   path: PathBuf,
   filter_policy: Option<Arc<dyn FilterPolicy>>,
   block_cache: Option<Arc<BlockCache>>,
+  comparator: Arc<dyn Comparator>,
   /// Maximum number of open `Table` handles the cache will hold at once.
   capacity: usize,
   /// LRU order: front = least-recently used, back = most-recently used.
@@ -64,6 +66,7 @@ impl Inner {
       file_size,
       self.filter_policy.clone(),
       self.block_cache.clone(),
+      Arc::clone(&self.comparator),
     )?);
 
     self.order.push_back(number);
@@ -124,15 +127,22 @@ impl TableCache {
     capacity: usize,
     filter_policy: Option<Arc<dyn FilterPolicy>>,
     block_cache: Option<Arc<BlockCache>>,
+    comparator: Arc<dyn Comparator>,
   ) -> Self {
     TableCache(Arc::new(Mutex::new(Inner {
       path: path.to_owned(),
       filter_policy,
       block_cache,
+      comparator,
       capacity: capacity.max(1),
       order: VecDeque::new(),
       map: HashMap::new(),
     })))
+  }
+
+  /// Return the comparator used by this cache.
+  pub(crate) fn comparator(&self) -> Arc<dyn Comparator> {
+    Arc::clone(&self.0.lock().unwrap().comparator)
   }
 
   /// Return (or lazily open) the `Table` for `number`.
@@ -163,7 +173,14 @@ mod tests {
   fn write_sst(dir: &Path, number: u64, entries: &[(&[u8], &[u8])]) -> u64 {
     let path = dir.join(format!("{number:06}.ldb"));
     let file = File::create(&path).unwrap();
-    let mut b = TableBuilder::new(file, 4096, 16, None, CompressionType::NoCompression);
+    let mut b = TableBuilder::new(
+      file,
+      4096,
+      16,
+      None,
+      CompressionType::NoCompression,
+      Arc::new(crate::comparator::BytewiseComparator),
+    );
     for &(k, v) in entries {
       b.add(&make_internal_key(k, 1, 1), v).unwrap();
     }
@@ -174,7 +191,13 @@ mod tests {
   fn get_or_open_opens_sst() {
     let dir = tempfile::tempdir().unwrap();
     let size = write_sst(dir.path(), 3, &[(b"hello", b"world")]);
-    let tc = TableCache::new(dir.path(), 10, None, None);
+    let tc = TableCache::new(
+      dir.path(),
+      10,
+      None,
+      None,
+      Arc::new(crate::comparator::BytewiseComparator),
+    );
     let table = tc.get_or_open(3, size).unwrap();
     use crate::table::reader::LookupResult;
     assert!(
@@ -188,8 +211,23 @@ mod tests {
     let size = write_sst(dir.path(), 3, &[(b"k", b"v")]);
     // Open manually, then insert — cache should return the same Arc.
     let file = File::open(dir.path().join("000003.ldb")).unwrap();
-    let table = Arc::new(Table::open(file, size, None, None).unwrap());
-    let tc = TableCache::new(dir.path(), 10, None, None);
+    let table = Arc::new(
+      Table::open(
+        file,
+        size,
+        None,
+        None,
+        Arc::new(crate::comparator::BytewiseComparator),
+      )
+      .unwrap(),
+    );
+    let tc = TableCache::new(
+      dir.path(),
+      10,
+      None,
+      None,
+      Arc::new(crate::comparator::BytewiseComparator),
+    );
     tc.insert(3, Arc::clone(&table));
     let got = tc.get_or_open(3, size).unwrap();
     // Same underlying pointer.
@@ -200,7 +238,13 @@ mod tests {
   fn evict_removes_entry() {
     let dir = tempfile::tempdir().unwrap();
     let size = write_sst(dir.path(), 3, &[(b"k", b"v")]);
-    let tc = TableCache::new(dir.path(), 10, None, None);
+    let tc = TableCache::new(
+      dir.path(),
+      10,
+      None,
+      None,
+      Arc::new(crate::comparator::BytewiseComparator),
+    );
     tc.get_or_open(3, size).unwrap();
     tc.evict(3);
     // After eviction, get_or_open re-opens from disk (still works).
@@ -214,7 +258,13 @@ mod tests {
     let s3 = write_sst(dir.path(), 3, &[(b"a", b"1")]);
     let s4 = write_sst(dir.path(), 4, &[(b"b", b"2")]);
     let s5 = write_sst(dir.path(), 5, &[(b"c", b"3")]);
-    let tc = TableCache::new(dir.path(), 2, None, None);
+    let tc = TableCache::new(
+      dir.path(),
+      2,
+      None,
+      None,
+      Arc::new(crate::comparator::BytewiseComparator),
+    );
     tc.get_or_open(3, s3).unwrap(); // cache: [3]
     tc.get_or_open(4, s4).unwrap(); // cache: [3, 4]
     tc.get_or_open(5, s5).unwrap(); // capacity exceeded → evict 3; cache: [4, 5]

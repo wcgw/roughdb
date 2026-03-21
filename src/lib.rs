@@ -123,6 +123,8 @@ use std::sync::{Arc, Mutex};
 
 pub mod cache;
 pub use cache::BlockCache;
+pub mod comparator;
+pub use comparator::{BytewiseComparator, Comparator};
 pub mod error;
 pub use error::Error;
 pub mod filter;
@@ -640,14 +642,15 @@ impl Db {
       cache_capacity,
       options.filter_policy.clone(),
       options.block_cache.clone(),
+      Arc::clone(&options.comparator),
     );
 
     let (version_set, mem, last_sequence) = if db_exists {
       // ── Existing database: MANIFEST-driven recovery ──────────────────────
       log::info!("opening existing database at {}", path.display());
-      let mut vs = VersionSet::recover(path, options.paranoid_checks)?;
+      let mut vs = VersionSet::recover(path, options.paranoid_checks, &*options.comparator)?;
       let manifest_last_seq = vs.last_sequence();
-      let mem = Arc::new(Memtable::default());
+      let mem = Arc::new(Memtable::new(Arc::clone(&options.comparator)));
 
       // Replay WAL records newer than what is already in the SSTables.
       // Use the log number recorded in the MANIFEST (set by WAL rotation).
@@ -679,10 +682,14 @@ impl Db {
     } else {
       // ── New database: create MANIFEST and WAL ────────────────────────────
       log::info!("creating new database at {}", path.display());
-      let vs = VersionSet::create(path)?;
+      let vs = VersionSet::create(path, &*options.comparator)?;
       // Initial WAL is always 000001.log (log_number = 1 from VersionSet::create).
       std::fs::File::create(path.join("000001.log"))?;
-      (Some(vs), Arc::new(Memtable::default()), 0)
+      (
+        Some(vs),
+        Arc::new(Memtable::new(Arc::clone(&options.comparator))),
+        0,
+      )
     };
 
     // Open (or reopen) the current WAL for subsequent writes.
@@ -1052,7 +1059,12 @@ impl Db {
       }
     }
 
-    let inner = DbIterator::new(Box::new(MergingIterator::new(children)), sequence);
+    let cmp = Arc::clone(&self.inner.options.comparator);
+    let inner = DbIterator::new(
+      Box::new(MergingIterator::new(children, Arc::clone(&cmp))),
+      sequence,
+      cmp,
+    );
     Ok(DbIter { inner })
   }
 
@@ -1137,6 +1149,7 @@ impl Db {
         None => return Ok(()),
       };
       let version = vs.current();
+      let cmp = &*self.inner.options.comparator;
       let mut max = 0usize;
       for level in 0..NUM_LEVELS {
         let has = version.files[level].iter().any(|m| {
@@ -1145,6 +1158,7 @@ impl Db {
             ikey_user_key(&m.largest),
             begin,
             end,
+            cmp,
           )
         });
         if has {
@@ -1222,7 +1236,7 @@ impl Db {
 
     // Rotate mem → imm and schedule the background flush.
     let path = self.inner.persistence.as_ref().unwrap().dir.as_path();
-    let prep = begin_flush(path, &mut g)?;
+    let prep = begin_flush(path, &mut g, &self.inner.options.comparator)?;
     g.imm = Some(Arc::clone(&prep.old_mem));
     g.pending_flush = Some(prep);
     maybe_schedule_compaction(&self.inner, &mut g);
@@ -1396,7 +1410,7 @@ impl Db {
         && state.mem.approximate_memory_usage() >= self.inner.options.write_buffer_size
       {
         let path = persistence.dir.as_path();
-        match begin_flush(path, &mut state) {
+        match begin_flush(path, &mut state, &self.inner.options.comparator) {
           Ok(prep) => {
             state.imm = Some(Arc::clone(&prep.old_mem));
             state.pending_flush = Some(prep);
@@ -1489,7 +1503,7 @@ impl Db {
         }
       };
       let mut reader = LogReader::new(file, None, false, 0);
-      let mem = Memtable::default();
+      let mem = Memtable::new(Arc::clone(&options.comparator));
 
       while let Some(record) = reader.read_record() {
         let batch = match WriteBatch::from_contents(record) {
@@ -1526,6 +1540,7 @@ impl Db {
           options.block_restart_interval,
           options.filter_policy.clone(),
           options.compression,
+          Arc::clone(&options.comparator),
         );
         let mut it = mem.iter();
         it.seek_to_first();
@@ -1565,7 +1580,13 @@ impl Db {
           continue;
         }
       };
-      let table = match Table::open(file, file_size, options.filter_policy.clone(), None) {
+      let table = match Table::open(
+        file,
+        file_size,
+        options.filter_policy.clone(),
+        None,
+        Arc::clone(&options.comparator),
+      ) {
         Ok(t) => t,
         Err(e) => {
           log::warn!("repair: cannot open SSTable {}: {e}", sst_path.display());
@@ -1622,6 +1643,7 @@ impl Db {
     let max_sequence = tables.iter().map(|t| t.max_sequence).max().unwrap_or(0);
 
     let mut edit = VersionEdit::new();
+    edit.comparator_name = Some(options.comparator.name().to_owned());
     edit.log_number = Some(0);
     edit.next_file_number = Some(next_file_number);
     edit.last_sequence = Some(max_sequence);
@@ -1725,7 +1747,7 @@ fn make_room_for_write<'a>(
         inner.options.write_buffer_size,
       );
       let path = inner.persistence.as_ref().unwrap().dir.as_path();
-      let prep = begin_flush(path, &mut g)?;
+      let prep = begin_flush(path, &mut g, &inner.options.comparator)?;
       g.imm = Some(Arc::clone(&prep.old_mem));
       g.pending_flush = Some(prep);
       maybe_schedule_compaction(inner, &mut g);
@@ -1843,7 +1865,11 @@ fn bg_worker(inner: Arc<DbInner>) {
 /// `finish_flush` still calls `vs.set_log_number` and `log_and_apply` to
 /// commit the new log number and SSTable to the MANIFEST, so that on reopen
 /// the correct WAL is replayed.
-fn begin_flush(path: &std::path::Path, state: &mut DbState) -> Result<FlushPrep, Error> {
+fn begin_flush(
+  path: &std::path::Path,
+  state: &mut DbState,
+  comparator: &Arc<dyn crate::comparator::Comparator>,
+) -> Result<FlushPrep, Error> {
   let vs = state
     .version_set
     .as_mut()
@@ -1857,7 +1883,8 @@ fn begin_flush(path: &std::path::Path, state: &mut DbState) -> Result<FlushPrep,
   // Activate the new WAL immediately; preserve the old WAL so finish_flush
   // can delete it after log_and_apply commits the rotation to the MANIFEST.
   let _old_log = state.log.replace(new_log);
-  let old_mem = std::mem::take(&mut state.mem);
+  let new_mem = Arc::new(Memtable::new(Arc::clone(comparator)));
+  let old_mem = std::mem::replace(&mut state.mem, new_mem);
   state.imm = None; // should already be None; be explicit
                     // Capture last_sequence now so finish_flush stores the correct value in the
                     // MANIFEST.  Writes that happen to the new WAL after begin_flush will have
@@ -1896,6 +1923,7 @@ fn write_flush(prep: FlushPrep, opts: &Options) -> Result<FlushResult, Error> {
     opts.block_restart_interval,
     opts.filter_policy.clone(),
     opts.compression,
+    Arc::clone(&opts.comparator),
   );
   let mut smallest = Vec::new();
   let mut largest = Vec::new();
@@ -1922,6 +1950,7 @@ fn write_flush(prep: FlushPrep, opts: &Options) -> Result<FlushResult, Error> {
     file_size,
     opts.filter_policy.clone(),
     opts.block_cache.clone(),
+    Arc::clone(&opts.comparator),
   )?);
   let smallest_user_key = ikey_user_key(&smallest).to_vec();
   let largest_user_key = ikey_user_key(&largest).to_vec();
@@ -1971,6 +2000,7 @@ fn finish_flush(
         &result.smallest_user_key,
         &result.largest_user_key,
         opts.max_file_size as u64,
+        &*opts.comparator,
       ),
       _ => 0,
     }
@@ -2029,8 +2059,15 @@ fn ikey_user_key(ikey: &[u8]) -> &[u8] {
 }
 
 /// True if the user-key ranges [a_s..a_l] and [b_s..b_l] overlap.
-fn key_ranges_overlap(a_s: &[u8], a_l: &[u8], b_s: &[u8], b_l: &[u8]) -> bool {
-  ikey_user_key(a_s) <= ikey_user_key(b_l) && ikey_user_key(b_s) <= ikey_user_key(a_l)
+fn key_ranges_overlap(
+  a_s: &[u8],
+  a_l: &[u8],
+  b_s: &[u8],
+  b_l: &[u8],
+  cmp: &dyn crate::comparator::Comparator,
+) -> bool {
+  cmp.compare(ikey_user_key(a_s), ikey_user_key(b_l)).is_le()
+    && cmp.compare(ikey_user_key(b_s), ikey_user_key(a_l)).is_le()
 }
 
 // ── Geometry helpers ──────────────────────────────────────────────────────────
@@ -2038,15 +2075,24 @@ fn key_ranges_overlap(a_s: &[u8], a_l: &[u8], b_s: &[u8], b_l: &[u8]) -> bool {
 /// User-key range union of a non-empty slice of files.
 ///
 /// Returns `(smallest_internal_key, largest_internal_key)` spanning all files.
-fn get_range(files: &[Arc<FileMetaData>]) -> (Vec<u8>, Vec<u8>) {
+fn get_range(
+  files: &[Arc<FileMetaData>],
+  cmp: &dyn crate::comparator::Comparator,
+) -> (Vec<u8>, Vec<u8>) {
   debug_assert!(!files.is_empty());
   let mut smallest = files[0].smallest.clone();
   let mut largest = files[0].largest.clone();
   for f in files.iter().skip(1) {
-    if ikey_user_key(&f.smallest) < ikey_user_key(&smallest) {
+    if cmp
+      .compare(ikey_user_key(&f.smallest), ikey_user_key(&smallest))
+      .is_lt()
+    {
       smallest = f.smallest.clone();
     }
-    if ikey_user_key(&f.largest) > ikey_user_key(&largest) {
+    if cmp
+      .compare(ikey_user_key(&f.largest), ikey_user_key(&largest))
+      .is_gt()
+    {
       largest = f.largest.clone();
     }
   }
@@ -2054,21 +2100,25 @@ fn get_range(files: &[Arc<FileMetaData>]) -> (Vec<u8>, Vec<u8>) {
 }
 
 /// Union of the key ranges of two slices of files (either may be empty).
-fn get_range2(a: &[Arc<FileMetaData>], b: &[Arc<FileMetaData>]) -> (Vec<u8>, Vec<u8>) {
+fn get_range2(
+  a: &[Arc<FileMetaData>],
+  b: &[Arc<FileMetaData>],
+  cmp: &dyn crate::comparator::Comparator,
+) -> (Vec<u8>, Vec<u8>) {
   if b.is_empty() {
-    return get_range(a);
+    return get_range(a, cmp);
   }
   if a.is_empty() {
-    return get_range(b);
+    return get_range(b, cmp);
   }
-  let (s1, l1) = get_range(a);
-  let (s2, l2) = get_range(b);
-  let smallest = if ikey_user_key(&s1) <= ikey_user_key(&s2) {
+  let (s1, l1) = get_range(a, cmp);
+  let (s2, l2) = get_range(b, cmp);
+  let smallest = if cmp.compare(ikey_user_key(&s1), ikey_user_key(&s2)).is_le() {
     s1
   } else {
     s2
   };
-  let largest = if ikey_user_key(&l1) >= ikey_user_key(&l2) {
+  let largest = if cmp.compare(ikey_user_key(&l1), ikey_user_key(&l2)).is_ge() {
     l1
   } else {
     l2
@@ -2093,6 +2143,7 @@ fn get_overlapping_inputs(
   level: usize,
   begin_uk: &[u8],
   end_uk: &[u8],
+  cmp: &dyn crate::comparator::Comparator,
 ) -> Vec<Arc<FileMetaData>> {
   let mut result: Vec<Arc<FileMetaData>> = Vec::new();
   let mut lo = begin_uk.to_vec();
@@ -2105,16 +2156,16 @@ fn get_overlapping_inputs(
     for f in &version.files[level] {
       let f_lo = ikey_user_key(&f.smallest);
       let f_hi = ikey_user_key(&f.largest);
-      if f_hi < lo.as_slice() || f_lo > hi.as_slice() {
+      if cmp.compare(f_hi, lo.as_slice()).is_lt() || cmp.compare(f_lo, hi.as_slice()).is_gt() {
         continue; // no overlap
       }
       result.push(Arc::clone(f));
       if level == 0 {
         // Expand range to cover this file.
-        if f_lo < lo.as_slice() {
+        if cmp.compare(f_lo, lo.as_slice()).is_lt() {
           lo = f_lo.to_vec();
         }
-        if f_hi > hi.as_slice() {
+        if cmp.compare(f_hi, hi.as_slice()).is_gt() {
           hi = f_hi.to_vec();
         }
       }
@@ -2137,15 +2188,16 @@ fn overlap_in_level(
   level: usize,
   smallest_uk: &[u8],
   largest_uk: &[u8],
+  cmp: &dyn crate::comparator::Comparator,
 ) -> bool {
   for f in &version.files[level] {
     let f_lo = ikey_user_key(&f.smallest);
     let f_hi = ikey_user_key(&f.largest);
-    if f_hi >= smallest_uk && f_lo <= largest_uk {
+    if cmp.compare(f_hi, smallest_uk).is_ge() && cmp.compare(f_lo, largest_uk).is_le() {
       return true;
     }
     // L1+: files are sorted by smallest key; once f_lo > largest_uk no later file can overlap.
-    if level > 0 && f_lo > largest_uk {
+    if level > 0 && cmp.compare(f_lo, largest_uk).is_gt() {
       break;
     }
   }
@@ -2175,15 +2227,16 @@ fn pick_level_for_memtable_output(
   smallest_uk: &[u8],
   largest_uk: &[u8],
   max_file_size: u64,
+  cmp: &dyn crate::comparator::Comparator,
 ) -> usize {
   use crate::db::version::NUM_LEVELS;
   const MAX_MEM_COMPACT_LEVEL: usize = 2;
 
   let mut level = 0;
-  if !overlap_in_level(version, 0, smallest_uk, largest_uk) {
+  if !overlap_in_level(version, 0, smallest_uk, largest_uk, cmp) {
     // No L0 overlap — consider pushing deeper.
     while level < MAX_MEM_COMPACT_LEVEL {
-      if overlap_in_level(version, level + 1, smallest_uk, largest_uk) {
+      if overlap_in_level(version, level + 1, smallest_uk, largest_uk, cmp) {
         break;
       }
       if level + 2 < NUM_LEVELS {
@@ -2194,6 +2247,7 @@ fn pick_level_for_memtable_output(
           level + 2,
           smallest_uk,
           largest_uk,
+          cmp,
         ));
         if grandparent_bytes > max_grandparent_overlap_bytes(max_file_size) {
           break;
@@ -2215,6 +2269,7 @@ fn add_boundary_inputs(
   version: &crate::db::version::Version,
   level: usize,
   compaction_files: &mut Vec<Arc<FileMetaData>>,
+  cmp: &dyn crate::comparator::Comparator,
 ) {
   use crate::table::format::cmp_internal_keys;
 
@@ -2222,7 +2277,7 @@ fn add_boundary_inputs(
     // Find the largest internal key in the current compaction set.
     let largest = match compaction_files
       .iter()
-      .max_by(|a, b| cmp_internal_keys(&a.largest, &b.largest))
+      .max_by(|a, b| cmp_internal_keys(&a.largest, &b.largest, cmp))
     {
       Some(f) => f.largest.clone(),
       None => return,
@@ -2237,11 +2292,11 @@ fn add_boundary_inputs(
       .iter()
       .filter(|f| {
         let f_uk = ikey_user_key(&f.smallest);
-        f_uk == largest_uk.as_slice()
-          && cmp_internal_keys(&f.smallest, &largest) == std::cmp::Ordering::Greater
+        cmp.compare(f_uk, largest_uk.as_slice()).is_eq()
+          && cmp_internal_keys(&f.smallest, &largest, cmp) == std::cmp::Ordering::Greater
           && !compaction_files.iter().any(|c| c.number == f.number)
       })
-      .min_by(|a, b| cmp_internal_keys(&a.smallest, &b.smallest));
+      .min_by(|a, b| cmp_internal_keys(&a.smallest, &b.smallest, cmp));
 
     match boundary {
       Some(f) => compaction_files.push(Arc::clone(f)),
@@ -2312,35 +2367,36 @@ fn setup_other_inputs(
   opts: &Options,
 ) {
   use crate::db::version::NUM_LEVELS;
+  let cmp = &*opts.comparator;
 
   let level = spec.level;
-  add_boundary_inputs(version, level, &mut spec.inputs[0]);
+  add_boundary_inputs(version, level, &mut spec.inputs[0], cmp);
 
-  let (smallest, largest) = get_range(&spec.inputs[0]);
+  let (smallest, largest) = get_range(&spec.inputs[0], cmp);
   let smallest_uk = ikey_user_key(&smallest).to_vec();
   let largest_uk = ikey_user_key(&largest).to_vec();
 
-  spec.inputs[1] = get_overlapping_inputs(version, level + 1, &smallest_uk, &largest_uk);
-  add_boundary_inputs(version, level + 1, &mut spec.inputs[1]);
+  spec.inputs[1] = get_overlapping_inputs(version, level + 1, &smallest_uk, &largest_uk, cmp);
+  add_boundary_inputs(version, level + 1, &mut spec.inputs[1], cmp);
 
-  let (all_start, all_limit) = get_range2(&spec.inputs[0], &spec.inputs[1]);
+  let (all_start, all_limit) = get_range2(&spec.inputs[0], &spec.inputs[1], cmp);
   let all_start_uk = ikey_user_key(&all_start).to_vec();
   let all_limit_uk = ikey_user_key(&all_limit).to_vec();
 
   // Try to expand inputs[0] without expanding inputs[1].
   if !spec.inputs[1].is_empty() {
-    let mut expanded0 = get_overlapping_inputs(version, level, &all_start_uk, &all_limit_uk);
-    add_boundary_inputs(version, level, &mut expanded0);
+    let mut expanded0 = get_overlapping_inputs(version, level, &all_start_uk, &all_limit_uk, cmp);
+    add_boundary_inputs(version, level, &mut expanded0, cmp);
 
     let inputs1_size = total_file_size(&spec.inputs[1]);
     let expanded0_size = total_file_size(&expanded0);
     let expand_limit = 25 * opts.max_file_size as u64;
 
     if expanded0.len() > spec.inputs[0].len() && inputs1_size + expanded0_size < expand_limit {
-      let (exp_start, exp_limit) = get_range(&expanded0);
+      let (exp_start, exp_limit) = get_range(&expanded0, cmp);
       let exp_start_uk = ikey_user_key(&exp_start).to_vec();
       let exp_limit_uk = ikey_user_key(&exp_limit).to_vec();
-      let expanded1 = get_overlapping_inputs(version, level + 1, &exp_start_uk, &exp_limit_uk);
+      let expanded1 = get_overlapping_inputs(version, level + 1, &exp_start_uk, &exp_limit_uk, cmp);
       // Only accept the expansion if it doesn't pull in more L+1 files.
       if expanded1.len() == spec.inputs[1].len() {
         spec.inputs[0] = expanded0;
@@ -2351,15 +2407,15 @@ fn setup_other_inputs(
 
   // Populate grandparents (level+2 files overlapping the compaction range).
   if level + 2 < NUM_LEVELS {
-    let (final_start, final_limit) = get_range2(&spec.inputs[0], &spec.inputs[1]);
+    let (final_start, final_limit) = get_range2(&spec.inputs[0], &spec.inputs[1], cmp);
     let final_start_uk = ikey_user_key(&final_start).to_vec();
     let final_limit_uk = ikey_user_key(&final_limit).to_vec();
     spec.grandparents =
-      get_overlapping_inputs(version, level + 2, &final_start_uk, &final_limit_uk);
+      get_overlapping_inputs(version, level + 2, &final_start_uk, &final_limit_uk, cmp);
   }
 
   // Update compact_pointer: advance past largest key of inputs[0].
-  let (_, new_largest) = get_range(&spec.inputs[0]);
+  let (_, new_largest) = get_range(&spec.inputs[0], cmp);
   spec.edit.compact_pointers.push((level as i32, new_largest));
 }
 
@@ -2373,10 +2429,14 @@ fn setup_other_inputs(
 /// Port of LevelDB `Compaction::ShouldStopBefore`.
 fn should_stop_before(spec: &mut CompactionSpec, ikey: &[u8], opts: &Options) -> bool {
   use crate::table::format::cmp_internal_keys;
+  let cmp = &*opts.comparator;
   let limit = max_grandparent_overlap_bytes(opts.max_file_size as u64) as i64;
   while spec.grandparent_index < spec.grandparents.len()
-    && cmp_internal_keys(ikey, &spec.grandparents[spec.grandparent_index].largest)
-      == std::cmp::Ordering::Greater
+    && cmp_internal_keys(
+      ikey,
+      &spec.grandparents[spec.grandparent_index].largest,
+      cmp,
+    ) == std::cmp::Ordering::Greater
   {
     if spec.seen_key {
       spec.overlapped_bytes += spec.grandparents[spec.grandparent_index].file_size as i64;
@@ -2400,16 +2460,20 @@ fn should_stop_before(spec: &mut CompactionSpec, ikey: &[u8], opts: &Options) ->
 /// at most once per key across the entire compaction — amortised O(1)/key.
 ///
 /// Port of LevelDB `Compaction::IsBaseLevelForKey`.
-fn is_base_level_for_key(spec: &mut CompactionSpec, user_key: &[u8]) -> bool {
+fn is_base_level_for_key(
+  spec: &mut CompactionSpec,
+  user_key: &[u8],
+  cmp: &dyn crate::comparator::Comparator,
+) -> bool {
   use crate::db::version::NUM_LEVELS;
   for lvl in (spec.level + 2)..NUM_LEVELS {
     let files = &spec.input_version.files[lvl];
     while spec.level_ptrs[lvl] < files.len() {
       let f = &files[spec.level_ptrs[lvl]];
       let f_largest_uk = ikey_user_key(&f.largest);
-      if user_key <= f_largest_uk {
+      if cmp.compare(user_key, f_largest_uk).is_le() {
         // user_key is ≤ this file's largest — it may be inside this file.
-        if user_key >= ikey_user_key(&f.smallest) {
+        if cmp.compare(user_key, ikey_user_key(&f.smallest)).is_ge() {
           return false; // user_key falls within this file's range
         }
         break; // user_key is before this file; no later file at this level can match
@@ -2454,6 +2518,7 @@ fn pick_compaction(
   opts: &Options,
   seek_compact: Option<&(Arc<FileMetaData>, usize)>,
 ) -> Option<CompactionSpec> {
+  let cmp = &*opts.comparator;
   // ── Size-triggered (highest priority) ─────────────────────────────────────
   if version.compaction_score >= 1.0 {
     let level = version.compaction_level as usize;
@@ -2466,21 +2531,31 @@ fn pick_compaction(
         .iter()
         .find(|f| {
           compact_pointer[0].is_empty()
-            || ikey_user_key(&f.largest) > ikey_user_key(&compact_pointer[0])
+            || cmp
+              .compare(
+                ikey_user_key(&f.largest),
+                ikey_user_key(&compact_pointer[0]),
+              )
+              .is_gt()
         })
         .or_else(|| version.files[0].first())
         .cloned()?;
 
       let seed_lo = ikey_user_key(&seed.smallest).to_vec();
       let seed_hi = ikey_user_key(&seed.largest).to_vec();
-      spec.inputs[0] = get_overlapping_inputs(version, 0, &seed_lo, &seed_hi);
+      spec.inputs[0] = get_overlapping_inputs(version, 0, &seed_lo, &seed_hi, cmp);
     } else {
       // L1+: pick the first file whose largest key is past compact_pointer[level].
       let file = version.files[level]
         .iter()
         .find(|f| {
           compact_pointer[level].is_empty()
-            || ikey_user_key(&f.largest) > ikey_user_key(&compact_pointer[level])
+            || cmp
+              .compare(
+                ikey_user_key(&f.largest),
+                ikey_user_key(&compact_pointer[level]),
+              )
+              .is_gt()
         })
         .or_else(|| version.files[level].first())
         .cloned()?;
@@ -2530,6 +2605,7 @@ fn finish_compaction_output(
   outputs: &mut Vec<CompactionOutput>,
   filter_policy: Option<Arc<dyn crate::filter::FilterPolicy>>,
   block_cache: Option<Arc<BlockCache>>,
+  comparator: Arc<dyn crate::comparator::Comparator>,
 ) -> Result<(), Error> {
   let file_size = cur.builder.finish()?;
   let read_file = std::fs::File::open(&cur.path)?;
@@ -2538,6 +2614,7 @@ fn finish_compaction_output(
     file_size,
     filter_policy,
     block_cache,
+    comparator,
   )?);
   outputs.push(CompactionOutput {
     file_number: cur.file_number,
@@ -2588,7 +2665,7 @@ fn do_compaction(
     children.push(Box::new(table.new_iterator(opts.paranoid_checks, false)?));
   }
 
-  let mut merger = MergingIterator::new(children);
+  let mut merger = MergingIterator::new(children, Arc::clone(&opts.comparator));
   merger.seek_to_first();
 
   let mut outputs: Vec<CompactionOutput> = Vec::new();
@@ -2611,7 +2688,11 @@ fn do_compaction(
     };
 
     // Track first occurrence of this user key.
-    let first_occurrence = !has_current_user_key || uk != current_user_key.as_slice();
+    let first_occurrence = !has_current_user_key
+      || opts
+        .comparator
+        .compare(uk, current_user_key.as_slice())
+        .is_ne();
     if first_occurrence {
       current_user_key = uk.to_vec();
       has_current_user_key = true;
@@ -2623,7 +2704,10 @@ fn do_compaction(
       // A newer version for this user key was already emitted and is visible
       // to even the oldest active snapshot — this older version is invisible.
       true
-    } else if vtype == 0 && seq <= oldest_snapshot && is_base_level_for_key(spec, uk) {
+    } else if vtype == 0
+      && seq <= oldest_snapshot
+      && is_base_level_for_key(spec, uk, &*opts.comparator)
+    {
       // Tombstone that no snapshot can see below this level — safe to elide.
       true
     } else {
@@ -2643,6 +2727,7 @@ fn do_compaction(
           &mut outputs,
           opts.filter_policy.clone(),
           opts.block_cache.clone(),
+          Arc::clone(&opts.comparator),
         )?;
       }
 
@@ -2656,6 +2741,7 @@ fn do_compaction(
             &mut outputs,
             opts.filter_policy.clone(),
             opts.block_cache.clone(),
+            Arc::clone(&opts.comparator),
           )?;
         }
       }
@@ -2677,6 +2763,7 @@ fn do_compaction(
           opts.block_restart_interval,
           opts.filter_policy.clone(),
           opts.compression,
+          Arc::clone(&opts.comparator),
         );
         current = Some(CompactionOutputFile {
           file_number,
@@ -2700,6 +2787,7 @@ fn do_compaction(
       &mut outputs,
       opts.filter_policy.clone(),
       opts.block_cache.clone(),
+      Arc::clone(&opts.comparator),
     )?;
   }
 
@@ -2768,8 +2856,10 @@ fn file_overlaps_range(
   file_large: &[u8],
   begin: Option<&[u8]>,
   end: Option<&[u8]>,
+  cmp: &dyn crate::comparator::Comparator,
 ) -> bool {
-  begin.is_none_or(|b| file_large >= b) && end.is_none_or(|e| file_small <= e)
+  begin.is_none_or(|b| cmp.compare(file_large, b).is_ge())
+    && end.is_none_or(|e| cmp.compare(file_small, e).is_le())
 }
 
 /// Select files for a range-based compaction of `level` → `level + 1`.
@@ -2782,6 +2872,7 @@ fn pick_range_compaction(
   level: usize,
   begin: Option<&[u8]>,
   end: Option<&[u8]>,
+  cmp: &dyn crate::comparator::Comparator,
 ) -> Option<CompactionInputs> {
   use crate::db::version::NUM_LEVELS;
 
@@ -2797,6 +2888,7 @@ fn pick_range_compaction(
         ikey_user_key(&m.largest),
         begin,
         end,
+        cmp,
       )
     })
     .cloned()
@@ -2809,20 +2901,20 @@ fn pick_range_compaction(
   // Union user-key range of the selected level files.
   let range_small = level_inputs
     .iter()
-    .min_by_key(|m| ikey_user_key(&m.smallest))
+    .min_by(|a, b| cmp.compare(ikey_user_key(&a.smallest), ikey_user_key(&b.smallest)))
     .unwrap()
     .smallest
     .clone();
   let range_large = level_inputs
     .iter()
-    .max_by_key(|m| ikey_user_key(&m.largest))
+    .max_by(|a, b| cmp.compare(ikey_user_key(&a.largest), ikey_user_key(&b.largest)))
     .unwrap()
     .largest
     .clone();
 
   let next_inputs: Vec<Arc<FileMetaData>> = version.files[level + 1]
     .iter()
-    .filter(|m| key_ranges_overlap(&m.smallest, &m.largest, &range_small, &range_large))
+    .filter(|m| key_ranges_overlap(&m.smallest, &m.largest, &range_small, &range_large, cmp))
     .cloned()
     .collect();
 
@@ -2858,7 +2950,8 @@ fn compact_level_range(
     (vs.current(), oldest)
   };
 
-  let (level_inputs, next_inputs) = match pick_range_compaction(&version, level, begin, end) {
+  let cmp = &*opts.comparator;
+  let (level_inputs, next_inputs) = match pick_range_compaction(&version, level, begin, end, cmp) {
     Some(p) => p,
     None => return Ok(false),
   };
@@ -2870,9 +2963,14 @@ fn compact_level_range(
   // No compact-pointer update for manual range compactions.
   // Populate grandparents if level+2 < NUM_LEVELS.
   if level + 2 < crate::db::version::NUM_LEVELS {
-    let (s, l) = get_range2(&spec.inputs[0], &spec.inputs[1]);
-    spec.grandparents =
-      get_overlapping_inputs(&version, level + 2, ikey_user_key(&s), ikey_user_key(&l));
+    let (s, l) = get_range2(&spec.inputs[0], &spec.inputs[1], cmp);
+    spec.grandparents = get_overlapping_inputs(
+      &version,
+      level + 2,
+      ikey_user_key(&s),
+      ikey_user_key(&l),
+      cmp,
+    );
   }
 
   // Phase 2: I/O (no lock).
@@ -4811,7 +4909,7 @@ mod tests {
 
     // Start compaction with only file_a; boundary check should add file_b.
     let mut compaction_files = vec![Arc::clone(&file_a)];
-    crate::add_boundary_inputs(&v, 1, &mut compaction_files);
+    crate::add_boundary_inputs(&v, 1, &mut compaction_files, &crate::BytewiseComparator);
 
     assert_eq!(
       compaction_files.len(),
@@ -4849,7 +4947,12 @@ mod tests {
     }
 
     // Reopen: the MANIFEST should contain compact_pointer records.
-    let vs = crate::db::version_set::VersionSet::recover(dir.path(), false).unwrap();
+    let vs = crate::db::version_set::VersionSet::recover(
+      dir.path(),
+      false,
+      &crate::comparator::BytewiseComparator,
+    )
+    .unwrap();
     // At least one level should have a non-empty compact_pointer (L0 or L1).
     let has_pointer = vs.compact_pointer().iter().any(|p| !p.is_empty());
     assert!(
@@ -5167,16 +5270,17 @@ mod tests {
     let mut spec = CompactionSpec::new(1, Arc::clone(&version));
     spec.inputs[0].push(Arc::clone(&version.files[1][0]));
 
+    let cmp = &crate::BytewiseComparator;
     // "c" is inside file 10 (b..d) → NOT base level.
-    assert!(!is_base_level_for_key(&mut spec, b"c"));
+    assert!(!is_base_level_for_key(&mut spec, b"c", cmp));
     // "q" is inside file 11 (p..r) → NOT base level.
     // Cursor for L3 should have advanced past file 10.
-    assert!(!is_base_level_for_key(&mut spec, b"q"));
+    assert!(!is_base_level_for_key(&mut spec, b"q", cmp));
     // "s" is past both files → IS base level.
-    assert!(is_base_level_for_key(&mut spec, b"s"));
+    assert!(is_base_level_for_key(&mut spec, b"s", cmp));
     // Cursor must now be at the end; a key before the end (but still past both
     // files) should also return true without regressing the cursor.
-    assert!(is_base_level_for_key(&mut spec, b"t"));
+    assert!(is_base_level_for_key(&mut spec, b"t", cmp));
     // The cursor for L3 should be at index 2 (past both files) — check it
     // hasn't regressed.
     assert_eq!(spec.level_ptrs[3], 2);
@@ -5324,7 +5428,7 @@ mod tests {
     let mut ds = super::DbState {
       last_sequence: 0,
       log: None,
-      mem: Arc::new(crate::memtable::Memtable::new()),
+      mem: Arc::new(crate::memtable::Memtable::default()),
       imm: None,
       version_set: None,
       snapshots: Default::default(),
@@ -5388,7 +5492,7 @@ mod tests {
     let mut ds = super::DbState {
       last_sequence: 0,
       log: None,
-      mem: Arc::new(crate::memtable::Memtable::new()),
+      mem: Arc::new(crate::memtable::Memtable::default()),
       imm: None,
       version_set: None,
       snapshots: Default::default(),
@@ -5685,5 +5789,116 @@ mod tests {
       Options::default(),
     );
     assert!(err.is_err());
+  }
+
+  // ── Custom comparator tests ─────────────────────────────────────────────
+
+  /// Reverse-bytewise comparator: keys sorted in descending lexicographic order.
+  #[derive(Debug)]
+  struct ReverseBytewiseComparator;
+
+  impl crate::comparator::Comparator for ReverseBytewiseComparator {
+    fn compare(&self, a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+      b.cmp(a) // reversed
+    }
+    fn name(&self) -> &str {
+      "test.ReverseBytewiseComparator"
+    }
+    fn find_shortest_separator(&self, _start: &mut Vec<u8>, _limit: &[u8]) {}
+    fn find_short_successor(&self, _key: &mut Vec<u8>) {}
+  }
+
+  #[test]
+  fn custom_comparator_in_memory() {
+    let opts = Options {
+      comparator: std::sync::Arc::new(ReverseBytewiseComparator),
+      ..Options::default()
+    };
+    let db = Db {
+      inner: std::sync::Arc::new(crate::DbInner {
+        state: std::sync::Mutex::new(crate::DbState {
+          last_sequence: 0,
+          log: None,
+          mem: std::sync::Arc::new(crate::memtable::Memtable::new(std::sync::Arc::clone(
+            &opts.comparator,
+          ))),
+          imm: None,
+          version_set: None,
+          snapshots: std::collections::BTreeSet::new(),
+          writers: std::collections::VecDeque::new(),
+          next_writer_id: 0,
+          completed: std::collections::HashMap::new(),
+          seek_compact_file: None,
+          compaction_needed: false,
+          background_scheduled: false,
+          background_error: None,
+          pending_flush: None,
+        }),
+        write_condvar: std::sync::Condvar::new(),
+        bg_condvar: std::sync::Condvar::new(),
+        options: opts,
+        persistence: None,
+        shutting_down: std::sync::atomic::AtomicBool::new(false),
+      }),
+      bg_thread: None,
+    };
+    db.put(b"a", b"1").unwrap();
+    db.put(b"b", b"2").unwrap();
+    db.put(b"c", b"3").unwrap();
+
+    // With reverse comparator, iteration should yield c, b, a.
+    let mut it = db.new_iterator(&ReadOptions::default()).unwrap();
+    it.seek_to_first();
+    let keys: Vec<Vec<u8>> = it.forward().map(|r| r.unwrap().0).collect();
+    assert_eq!(keys, vec![b"c".to_vec(), b"b".to_vec(), b"a".to_vec()]);
+  }
+
+  #[serial(fd)]
+  #[test]
+  fn custom_comparator_persistent() {
+    let dir = tempfile::tempdir().unwrap();
+    let opts = Options {
+      create_if_missing: true,
+      comparator: std::sync::Arc::new(ReverseBytewiseComparator),
+      ..Options::default()
+    };
+    {
+      let db = Db::open(dir.path(), opts.clone()).unwrap();
+      db.put(b"a", b"1").unwrap();
+      db.put(b"b", b"2").unwrap();
+      db.put(b"c", b"3").unwrap();
+    }
+    // Reopen with the same comparator.
+    let db = Db::open(dir.path(), opts).unwrap();
+    assert_eq!(db.get(b"b").unwrap(), b"2");
+
+    let mut it = db.new_iterator(&ReadOptions::default()).unwrap();
+    it.seek_to_first();
+    let keys: Vec<Vec<u8>> = it.forward().map(|r| r.unwrap().0).collect();
+    assert_eq!(keys, vec![b"c".to_vec(), b"b".to_vec(), b"a".to_vec()]);
+  }
+
+  #[serial(fd)]
+  #[test]
+  fn comparator_mismatch_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    // Create with reverse comparator.
+    {
+      let opts = Options {
+        create_if_missing: true,
+        comparator: std::sync::Arc::new(ReverseBytewiseComparator),
+        ..Options::default()
+      };
+      let db = Db::open(dir.path(), opts).unwrap();
+      db.put(b"k", b"v").unwrap();
+    }
+    // Reopen with default (bytewise) comparator — should fail.
+    let err = Db::open(dir.path(), Options::default())
+      .err()
+      .expect("expected comparator mismatch error");
+    assert!(
+      matches!(err, Error::InvalidArgument(_)),
+      "expected InvalidArgument for comparator mismatch, got {err:?}"
+    );
   }
 }

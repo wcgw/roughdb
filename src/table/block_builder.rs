@@ -135,7 +135,10 @@ mod tests {
     let data = bb.finish().to_vec();
     // Should have at least the restart count (4 bytes) + one restart offset (4 bytes) = 8.
     assert!(data.len() >= 8);
-    let block = Block::new(data);
+    let block = Block::new(
+      data,
+      std::sync::Arc::new(crate::comparator::BytewiseComparator),
+    );
     let it = block.iter();
     assert!(!it.valid());
   }
@@ -143,7 +146,10 @@ mod tests {
   #[test]
   fn single_entry() {
     let data = build_block(&[(b"key", b"value")], 16);
-    let block = Block::new(data);
+    let block = Block::new(
+      data,
+      std::sync::Arc::new(crate::comparator::BytewiseComparator),
+    );
     let mut it = block.iter();
     it.seek_to_first();
     assert!(it.valid());
@@ -158,7 +164,10 @@ mod tests {
     let pairs: Vec<(&[u8], &[u8])> =
       vec![(b"aa", b"1"), (b"ab", b"2"), (b"ac", b"3"), (b"ba", b"4")];
     let data = build_block(&pairs, 16);
-    let block = Block::new(data);
+    let block = Block::new(
+      data,
+      std::sync::Arc::new(crate::comparator::BytewiseComparator),
+    );
     let mut it = block.iter();
     it.seek_to_first();
     for (expected_k, expected_v) in pairs {
@@ -178,7 +187,10 @@ mod tests {
       .map(|(k, v)| (k.as_slice(), v.as_slice()))
       .collect();
     let data = build_block(&pairs_ref, 3);
-    let block = Block::new(data.clone());
+    let block = Block::new(
+      data.clone(),
+      std::sync::Arc::new(crate::comparator::BytewiseComparator),
+    );
     // Verify all 6 entries readable in order.
     let mut it = block.iter();
     it.seek_to_first();
@@ -200,7 +212,10 @@ mod tests {
       (b"e", b"5"),
     ];
     let data = build_block(&pairs, 2);
-    let block = Block::new(data);
+    let block = Block::new(
+      data,
+      std::sync::Arc::new(crate::comparator::BytewiseComparator),
+    );
     let mut it = block.iter();
     it.seek(b"c");
     assert!(it.valid());
@@ -216,7 +231,10 @@ mod tests {
     bb.reset();
     bb.add(b"new", b"entry");
     let data = bb.finish().to_vec();
-    let block = Block::new(data);
+    let block = Block::new(
+      data,
+      std::sync::Arc::new(crate::comparator::BytewiseComparator),
+    );
     let mut it = block.iter();
     it.seek_to_first();
     assert_eq!(it.key(), b"new");

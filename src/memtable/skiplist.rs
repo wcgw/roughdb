@@ -46,6 +46,7 @@ use std::mem;
 use std::ptr;
 use std::slice;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use std::sync::Arc;
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -258,6 +259,9 @@ pub(crate) struct SkipList {
   rng: Rng,
   /// Cached splice from the last insert, accelerates sequential writes.
   splice: Splice,
+  /// User-key comparator.  Used by `key_after_node` and traversal helpers to
+  /// order entries by user key (with sequence-number tiebreak).
+  comparator: Arc<dyn crate::comparator::Comparator>,
 }
 
 // SAFETY: `SkipList` contains raw node pointers (in `head` and inside
@@ -274,7 +278,7 @@ unsafe impl Send for SkipList {}
 unsafe impl Sync for SkipList {}
 
 impl SkipList {
-  pub fn new(arena: Arena) -> Self {
+  pub fn new(arena: Arena, comparator: Arc<dyn crate::comparator::Comparator>) -> Self {
     // SAFETY: `arena` is valid for the duration of this call.  `data_size = 0`
     // because the sentinel head carries no payload.  `height = MAX_HEIGHT` so
     // every level slot is initialised.  The returned pointer is valid for the
@@ -288,6 +292,7 @@ impl SkipList {
       len: 0,
       rng: Rng::new(0xdead_beef),
       splice: Splice::new(),
+      comparator,
     }
   }
 
@@ -322,7 +327,7 @@ impl SkipList {
     loop {
       // SAFETY: same as `find_first_at_or_after`.
       let next = unsafe { (*x).load_next(level) };
-      if Self::key_after_node(key_data, next) {
+      if self.key_after_node(key_data, next) {
         x = next;
       } else if level == 0 {
         return next; // may be null
@@ -356,7 +361,18 @@ impl SkipList {
   ///
   /// Only ever called with `n != head` (head has no payload).
   #[inline]
-  fn key_after_node(key_data: &[u8], n: *const Node) -> bool {
+  fn key_after_node(&self, key_data: &[u8], n: *const Node) -> bool {
+    Self::key_after_node_cmp(&*self.comparator, key_data, n)
+  }
+
+  /// Static helper: compare using an explicit comparator reference.
+  /// Used by both instance methods and free functions that lack `&self`.
+  #[inline]
+  fn key_after_node_cmp(
+    cmp: &dyn crate::comparator::Comparator,
+    key_data: &[u8],
+    n: *const Node,
+  ) -> bool {
     if n.is_null() {
       return false;
     }
@@ -367,7 +383,13 @@ impl SkipList {
     let node_payload = unsafe { Node::payload(n) };
     let ke = Entry::from_slice(key_data);
     let ne = Entry::from_slice(node_payload);
-    ke.cmp(&ne) == std::cmp::Ordering::Greater
+    let ordering = cmp.compare(ke.key(), ne.key());
+    match ordering {
+      std::cmp::Ordering::Equal => {
+        ne.sequence_id().cmp(&ke.sequence_id()) == std::cmp::Ordering::Greater
+      }
+      _ => ordering == std::cmp::Ordering::Greater,
+    }
   }
 
   // ── Public operations ────────────────────────────────────────────────────
@@ -387,7 +409,7 @@ impl SkipList {
       // allocated height of any node we visit (all nodes have height ≥ 1,
       // and the head is allocated at `MAX_HEIGHT`).
       let next = unsafe { (*x).load_next(level) };
-      if Self::key_after_node(key_data, next) {
+      if self.key_after_node(key_data, next) {
         x = next;
       } else if level == 0 {
         return if next.is_null() {
@@ -473,10 +495,10 @@ impl SkipList {
         let tight = unsafe { (*pn).relaxed_next(h) == nn };
         if !tight {
           h += 1;
-        } else if pn != self.head && !Self::key_after_node(key_data, pn) {
+        } else if pn != self.head && !self.key_after_node(key_data, pn) {
           // Key falls before the cached predecessor: start over.
           h = effective_max;
-        } else if Self::key_after_node(key_data, nn) {
+        } else if self.key_after_node(key_data, nn) {
           // Key falls after the cached successor: start over.
           h = effective_max;
         } else {
@@ -487,7 +509,12 @@ impl SkipList {
     };
 
     if recompute_height > 0 {
-      recompute_splice_levels(key_data, &mut self.splice, recompute_height);
+      recompute_splice_levels(
+        key_data,
+        &mut self.splice,
+        recompute_height,
+        &*self.comparator,
+      );
     }
 
     // ── Link the node into every level ──────────────────────────────────
@@ -528,6 +555,7 @@ fn find_splice_for_level(
   mut before: *mut Node,
   after: *mut Node,
   level: usize,
+  cmp: &dyn crate::comparator::Comparator,
 ) -> (*mut Node, *mut Node) {
   loop {
     // SAFETY: `before` is either `head` or a linked node returned by a prior
@@ -537,7 +565,7 @@ fn find_splice_for_level(
     // linked at every level up to their own height which is ≥ the level they
     // appear at in the list.
     let next = unsafe { (*before).load_next(level) };
-    if next == after || !SkipList::key_after_node(key_data, next) {
+    if next == after || !SkipList::key_after_node_cmp(cmp, key_data, next) {
       return (before, next);
     }
     before = next;
@@ -546,9 +574,14 @@ fn find_splice_for_level(
 
 /// Recompute splice levels `[0, recompute_height)` top-down, using the
 /// already-valid bracket at `splice.prev/next[recompute_height]`.
-fn recompute_splice_levels(key_data: &[u8], splice: &mut Splice, recompute_height: usize) {
+fn recompute_splice_levels(
+  key_data: &[u8],
+  splice: &mut Splice,
+  recompute_height: usize,
+  cmp: &dyn crate::comparator::Comparator,
+) {
   for i in (0..recompute_height).rev() {
-    let (p, n) = find_splice_for_level(key_data, splice.prev[i + 1], splice.next[i + 1], i);
+    let (p, n) = find_splice_for_level(key_data, splice.prev[i + 1], splice.next[i + 1], i, cmp);
     splice.prev[i] = p;
     splice.next[i] = n;
   }
@@ -738,7 +771,10 @@ mod tests {
   use super::*;
 
   fn make_list() -> SkipList {
-    SkipList::new(Arena::default())
+    SkipList::new(
+      Arena::default(),
+      std::sync::Arc::new(crate::comparator::BytewiseComparator),
+    )
   }
 
   fn insert_key(list: &mut SkipList, key: &[u8], seq: u64, value: &[u8]) {

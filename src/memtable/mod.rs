@@ -20,6 +20,8 @@ use skiplist::SkipList;
 use std::cell::UnsafeCell;
 use std::sync::Arc;
 
+use crate::comparator::{BytewiseComparator, Comparator};
+
 #[derive(Debug, PartialEq)]
 pub enum MemtableResult<T> {
   Miss,
@@ -44,6 +46,7 @@ impl<T> MemtableResult<T> {
 
 pub struct Memtable {
   table: UnsafeCell<SkipList>,
+  comparator: Arc<dyn Comparator>,
 }
 
 // SAFETY: all mutations are serialised by the DB-level write mutex in `Db`;
@@ -51,9 +54,10 @@ pub struct Memtable {
 unsafe impl Sync for Memtable {}
 
 impl Memtable {
-  pub fn new() -> Self {
+  pub fn new(comparator: Arc<dyn Comparator>) -> Self {
     Self {
-      table: UnsafeCell::new(SkipList::new(Arena::default())),
+      table: UnsafeCell::new(SkipList::new(Arena::default(), Arc::clone(&comparator))),
+      comparator,
     }
   }
 
@@ -82,7 +86,7 @@ impl Memtable {
     match table.find_first_at_or_after(&sbuf) {
       Some(payload) => {
         let e = Entry::from_slice(payload);
-        if e.key() == key {
+        if self.comparator.compare(e.key(), key) == std::cmp::Ordering::Equal {
           match e.value().map(Vec::from) {
             None => MemtableResult::Deleted,
             Some(val) => MemtableResult::Hit(val),
@@ -127,7 +131,7 @@ impl Memtable {
 
 impl Default for Memtable {
   fn default() -> Self {
-    Self::new()
+    Self::new(Arc::new(BytewiseComparator))
   }
 }
 
@@ -338,13 +342,13 @@ mod tests {
 
   #[test]
   fn creates_memtable() {
-    let table = Memtable::new();
+    let table = Memtable::default();
     assert_eq!(0, unsafe { &*table.table.get() }.len());
   }
 
   #[test]
   fn insert_get() {
-    let table = Memtable::new();
+    let table = Memtable::default();
     table.add(0, b"foo", b"bar");
     assert_eq!(
       b"bar",
@@ -354,7 +358,7 @@ mod tests {
 
   #[test]
   fn replace_get() {
-    let table = Memtable::new();
+    let table = Memtable::default();
     table.add(0, b"foo", b"foo");
     assert_eq!(
       b"foo",
@@ -369,20 +373,20 @@ mod tests {
 
   #[test]
   fn miss_get() {
-    let table = Memtable::new();
+    let table = Memtable::default();
     table.add(0, b"foo", b"bar");
     assert_eq!(table.get(b"bar", u64::MAX), MemtableResult::Miss);
   }
 
   #[test]
   fn miss_empty() {
-    let table = Memtable::new();
+    let table = Memtable::default();
     assert_eq!(table.get(b"foo", u64::MAX), MemtableResult::Miss);
   }
 
   #[test]
   fn hit_deleted() {
-    let table = Memtable::new();
+    let table = Memtable::default();
     table.add(0, b"foo", b"bar");
     table.delete(1, b"foo");
     assert_eq!(table.get(b"foo", u64::MAX), MemtableResult::Deleted);
@@ -390,7 +394,7 @@ mod tests {
 
   #[test]
   fn lifecycle() {
-    let table = Memtable::new();
+    let table = Memtable::default();
     {
       let foo = String::from("foo");
       table.add(0, foo.as_bytes(), foo.as_bytes());
@@ -413,14 +417,14 @@ mod tests {
 
   #[test]
   fn iter_empty_memtable() {
-    let mem = Memtable::new();
+    let mem = Memtable::default();
     let it = mem.iter();
     assert!(!it.valid());
   }
 
   #[test]
   fn iter_single_value() {
-    let mem = Memtable::new();
+    let mem = Memtable::default();
     mem.add(7, b"key", b"val");
     let mut it = mem.iter();
     it.seek_to_first();
@@ -437,7 +441,7 @@ mod tests {
 
   #[test]
   fn iter_tombstone() {
-    let mem = Memtable::new();
+    let mem = Memtable::default();
     mem.delete(3, b"gone");
     let mut it = mem.iter();
     it.seek_to_first();
@@ -454,7 +458,7 @@ mod tests {
 
   #[test]
   fn iter_ordering_user_key_asc_seq_desc() {
-    let mem = Memtable::new();
+    let mem = Memtable::default();
     // Insert in non-sequential order; iterator must yield in sorted order.
     mem.add(1, b"b", b"B1");
     mem.add(2, b"a", b"A2");
@@ -479,7 +483,7 @@ mod tests {
 
   #[test]
   fn approximate_memory_usage_grows() {
-    let mem = Memtable::new();
+    let mem = Memtable::default();
     let before = mem.approximate_memory_usage();
     mem.add(0, b"k", b"v");
     let after = mem.approximate_memory_usage();

@@ -11,6 +11,7 @@
 //    limitations under the License.
 
 use crate::cache::BlockCache;
+use crate::comparator::Comparator;
 use crate::error::Error;
 use crate::filter::FilterPolicy;
 use crate::iter::InternalIterator;
@@ -57,6 +58,8 @@ pub(crate) struct Table {
   cache_id: u64,
   /// Shared block cache, if configured via `Options::block_cache`.
   block_cache: Option<Arc<BlockCache>>,
+  /// Comparator for user-key ordering.
+  comparator: Arc<dyn Comparator>,
 }
 
 impl Table {
@@ -70,6 +73,7 @@ impl Table {
     file_size: u64,
     filter_policy: Option<Arc<dyn FilterPolicy>>,
     block_cache: Option<Arc<BlockCache>>,
+    comparator: Arc<dyn Comparator>,
   ) -> Result<Self, Error> {
     if file_size < FOOTER_ENCODED_LENGTH as u64 {
       return Err(Error::Corruption("SSTable file too small".to_owned()));
@@ -83,7 +87,7 @@ impl Table {
 
     // Read the index block.
     let index_contents = read_block(&file, &footer.index_handle, false)?;
-    let index_block = Block::new(index_contents.data);
+    let index_block = Block::new(index_contents.data, Arc::clone(&comparator));
 
     // Optionally read the filter block from the metaindex.
     let filter = filter_policy.and_then(|policy| {
@@ -102,6 +106,7 @@ impl Table {
       filter,
       cache_id,
       block_cache,
+      comparator,
     })
   }
 
@@ -125,7 +130,7 @@ impl Table {
 
     // Cache miss (or no cache): read from disk.
     let contents = read_block(&self.file, handle, verify)?;
-    let block = Block::new(contents.data);
+    let block = Block::new(contents.data, Arc::clone(&self.comparator));
 
     // Insert into the cache unless the caller asked us not to (e.g. bulk scan).
     if fill_cache {
@@ -186,7 +191,7 @@ impl Table {
           ))
         }
         Some((found_user_key, _seq, vtype)) => {
-          if found_user_key != user_key {
+          if self.comparator.compare(found_user_key, user_key) != std::cmp::Ordering::Equal {
             return Ok(LookupResult::NotInTable);
           }
           match vtype {
@@ -238,6 +243,7 @@ impl Table {
     let file = self.file.try_clone()?;
     let block_cache = self.block_cache.clone();
     let cache_id = self.cache_id;
+    let comparator = Arc::clone(&self.comparator);
     let index_iter: Box<dyn InternalIterator> = Box::new(self.index_block.iter());
     let block_fn: BlockFn = Box::new(move |handle_value: &[u8]| {
       let (handle, _) = BlockHandle::decode_from(handle_value)?;
@@ -251,7 +257,7 @@ impl Table {
 
       // Read from disk.
       let contents = read_block(&file, &handle, verify_checksums)?;
-      let block = Block::new(contents.data);
+      let block = Block::new(contents.data, Arc::clone(&comparator));
 
       if fill_cache {
         if let Some(cache) = &block_cache {
@@ -278,7 +284,7 @@ impl Table {
     while idx.valid() {
       let (handle, _) = BlockHandle::decode_from(idx.value())?;
       let contents = read_block(&self.file, &handle, false)?;
-      let data_block = Block::new(contents.data);
+      let data_block = Block::new(contents.data, Arc::clone(&self.comparator));
       let mut it = data_block.iter();
       it.seek_to_first();
       while it.valid() {
@@ -307,8 +313,12 @@ fn read_filter_block(
   policy: Arc<dyn FilterPolicy>,
 ) -> Result<Option<FilterBlockReader>, Error> {
   // Read the metaindex block (always uncompressed; checksums not required here).
+  // The metaindex uses raw string keys ("filter.<name>"), so BytewiseComparator is correct.
   let meta_contents = read_block(file, metaindex_handle, false)?;
-  let meta_block = Block::new(meta_contents.data);
+  let meta_block = Block::new(
+    meta_contents.data,
+    Arc::new(crate::comparator::BytewiseComparator),
+  );
 
   // Seek the metaindex for the key "filter.<policy_name>".
   let filter_key = format!("filter.{}", policy.name());
@@ -347,6 +357,7 @@ mod tests {
       16,
       None,
       crate::options::CompressionType::NoCompression,
+      Arc::new(crate::comparator::BytewiseComparator),
     );
     for &(uk, seq, vt, val) in pairs {
       let ikey = make_internal_key(uk, seq, vt);
@@ -359,7 +370,14 @@ mod tests {
   #[test]
   fn open_and_get_user_key() {
     let (tmp, size) = write_table_internal(&[(b"hello", 1, 1, b"world")]);
-    let table = Table::open(tmp.reopen().unwrap(), size, None, None).unwrap();
+    let table = Table::open(
+      tmp.reopen().unwrap(),
+      size,
+      None,
+      None,
+      Arc::new(crate::comparator::BytewiseComparator),
+    )
+    .unwrap();
     assert!(
       matches!(table.get(b"hello", false, true).unwrap(), LookupResult::Value(v) if v == b"world")
     );
@@ -368,7 +386,14 @@ mod tests {
   #[test]
   fn get_missing_key() {
     let (tmp, size) = write_table_internal(&[(b"a", 1, 1, b"1")]);
-    let table = Table::open(tmp.reopen().unwrap(), size, None, None).unwrap();
+    let table = Table::open(
+      tmp.reopen().unwrap(),
+      size,
+      None,
+      None,
+      Arc::new(crate::comparator::BytewiseComparator),
+    )
+    .unwrap();
     assert!(matches!(
       table.get(b"z", false, true).unwrap(),
       LookupResult::NotInTable
@@ -379,7 +404,14 @@ mod tests {
   fn get_tombstone_returns_deleted() {
     // vtype=0 is a deletion tombstone — must return Deleted, not NotInTable.
     let (tmp, size) = write_table_internal(&[(b"gone", 1, 0, b"")]);
-    let table = Table::open(tmp.reopen().unwrap(), size, None, None).unwrap();
+    let table = Table::open(
+      tmp.reopen().unwrap(),
+      size,
+      None,
+      None,
+      Arc::new(crate::comparator::BytewiseComparator),
+    )
+    .unwrap();
     assert!(matches!(
       table.get(b"gone", false, true).unwrap(),
       LookupResult::Deleted
@@ -389,7 +421,14 @@ mod tests {
   #[test]
   fn get_newest_version_wins() {
     let (tmp, size) = write_table_internal(&[(b"key", 10, 1, b"new"), (b"key", 5, 1, b"old")]);
-    let table = Table::open(tmp.reopen().unwrap(), size, None, None).unwrap();
+    let table = Table::open(
+      tmp.reopen().unwrap(),
+      size,
+      None,
+      None,
+      Arc::new(crate::comparator::BytewiseComparator),
+    )
+    .unwrap();
     assert!(
       matches!(table.get(b"key", false, true).unwrap(), LookupResult::Value(v) if v == b"new")
     );
@@ -398,7 +437,14 @@ mod tests {
   #[test]
   fn verify_checksums_passes_on_valid_block() {
     let (tmp, size) = write_table_internal(&[(b"k", 1, 1, b"v")]);
-    let table = Table::open(tmp.reopen().unwrap(), size, None, None).unwrap();
+    let table = Table::open(
+      tmp.reopen().unwrap(),
+      size,
+      None,
+      None,
+      Arc::new(crate::comparator::BytewiseComparator),
+    )
+    .unwrap();
     assert!(matches!(
       table.get(b"k", true, true).unwrap(),
       LookupResult::Value(_)
@@ -410,7 +456,13 @@ mod tests {
     let tmp = tempfile::NamedTempFile::new().unwrap();
     std::io::Write::write_all(&mut tmp.reopen().unwrap(), &[0u8; 10]).unwrap();
     assert!(matches!(
-      Table::open(tmp.reopen().unwrap(), 10, None, None),
+      Table::open(
+        tmp.reopen().unwrap(),
+        10,
+        None,
+        None,
+        Arc::new(crate::comparator::BytewiseComparator),
+      ),
       Err(Error::Corruption(_))
     ));
   }
