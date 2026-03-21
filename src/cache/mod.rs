@@ -132,7 +132,13 @@ mod tests {
   use super::*;
 
   fn make_block(size: usize) -> Block {
-    Block::new(vec![0u8; size])
+    // The block content here is not valid for iteration — it's only used
+    // for cache charge accounting in tests.  The last 4 bytes are treated as
+    // the restart count (0 = zero restarts, which is valid).
+    Block::new(
+      vec![0u8; size],
+      std::sync::Arc::new(crate::comparator::BytewiseComparator),
+    )
   }
 
   #[test]

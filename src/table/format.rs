@@ -61,14 +61,18 @@ pub(crate) fn parse_internal_key(ikey: &[u8]) -> Option<(&[u8], u64, u8)> {
 
 /// Compare two SSTable internal keys: user_key ASC, then sequence DESC
 /// (higher sequence number sorts first, so a lookup finds the newest version).
-pub(crate) fn cmp_internal_keys(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+pub(crate) fn cmp_internal_keys(
+  a: &[u8],
+  b: &[u8],
+  cmp: &dyn crate::comparator::Comparator,
+) -> std::cmp::Ordering {
   if a.len() < 8 || b.len() < 8 {
     // Malformed keys; fall back to byte comparison.
     return a.cmp(b);
   }
   let a_user = &a[..a.len() - 8];
   let b_user = &b[..b.len() - 8];
-  let user_cmp = a_user.cmp(b_user);
+  let user_cmp = cmp.compare(a_user, b_user);
   if user_cmp != std::cmp::Ordering::Equal {
     return user_cmp;
   }
@@ -293,17 +297,22 @@ mod tests {
 
   #[test]
   fn cmp_internal_keys_user_key_order() {
+    let cmp = crate::comparator::BytewiseComparator;
     let a = make_internal_key(b"apple", 1, 1);
     let b = make_internal_key(b"banana", 1, 1);
-    assert_eq!(cmp_internal_keys(&a, &b), std::cmp::Ordering::Less);
+    assert_eq!(cmp_internal_keys(&a, &b, &cmp), std::cmp::Ordering::Less);
   }
 
   #[test]
   fn cmp_internal_keys_seq_desc() {
+    let cmp = crate::comparator::BytewiseComparator;
     // Same user key: higher sequence sorts first (Less).
     let newer = make_internal_key(b"key", 10, 1);
     let older = make_internal_key(b"key", 5, 1);
-    assert_eq!(cmp_internal_keys(&newer, &older), std::cmp::Ordering::Less);
+    assert_eq!(
+      cmp_internal_keys(&newer, &older, &cmp),
+      std::cmp::Ordering::Less
+    );
   }
 
   #[test]

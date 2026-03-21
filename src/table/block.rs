@@ -11,6 +11,7 @@
 //    limitations under the License.
 
 use crate::coding::read_varu64;
+use crate::comparator::Comparator;
 use crate::error::Error;
 use crate::iter::InternalIterator;
 use crate::table::format::cmp_internal_keys;
@@ -29,13 +30,15 @@ pub(crate) struct Block {
   restarts_offset: usize,
   /// Number of restart points.
   num_restarts: usize,
+  /// Comparator for user-key ordering.
+  comparator: Arc<dyn Comparator>,
 }
 
 impl Block {
   /// Wrap raw block bytes (as returned by `read_block`, minus trailer).
   ///
   /// Panics if `data` is too short to hold a valid restart count.
-  pub(crate) fn new(data: Vec<u8>) -> Self {
+  pub(crate) fn new(data: Vec<u8>, comparator: Arc<dyn Comparator>) -> Self {
     assert!(data.len() >= 4, "block too short: {} bytes", data.len());
     let num_restarts = u32::from_le_bytes(data[data.len() - 4..].try_into().unwrap()) as usize;
     let restarts_size = num_restarts * 4 + 4; // offsets + count field
@@ -49,6 +52,7 @@ impl Block {
       data: Arc::new(data),
       restarts_offset,
       num_restarts,
+      comparator,
     }
   }
 
@@ -69,6 +73,7 @@ impl Block {
       key: Vec::new(),
       value_start: 0,
       value_len: 0,
+      comparator: Arc::clone(&self.comparator),
     }
   }
 }
@@ -94,6 +99,8 @@ pub(crate) struct BlockIter {
   value_start: usize,
   /// Value slice length.
   value_len: usize,
+  /// Comparator for user-key ordering.
+  comparator: Arc<dyn Comparator>,
 }
 
 impl BlockIter {
@@ -186,7 +193,7 @@ impl InternalIterator for BlockIter {
     while lo + 1 < hi {
       let mid = lo + (hi - lo) / 2;
       let restart_key = self.key_at_restart(mid);
-      match cmp_internal_keys(restart_key.as_slice(), target) {
+      match cmp_internal_keys(restart_key.as_slice(), target, &*self.comparator) {
         std::cmp::Ordering::Less | std::cmp::Ordering::Equal => lo = mid,
         std::cmp::Ordering::Greater => hi = mid,
       }
@@ -194,7 +201,9 @@ impl InternalIterator for BlockIter {
     self.current = self.restart_point(lo);
     self.key.clear();
     self.decode_entry();
-    while self.valid() && cmp_internal_keys(self.key(), target) == std::cmp::Ordering::Less {
+    while self.valid()
+      && cmp_internal_keys(self.key(), target, &*self.comparator) == std::cmp::Ordering::Less
+    {
       self.next();
     }
   }
@@ -272,13 +281,19 @@ mod tests {
     for &(k, v) in pairs {
       bb.add(k, v);
     }
-    Block::new(bb.finish().to_vec())
+    Block::new(
+      bb.finish().to_vec(),
+      Arc::new(crate::comparator::BytewiseComparator),
+    )
   }
 
   #[test]
   fn empty_block_not_valid() {
     let mut bb = BlockBuilder::new(16);
-    let block = Block::new(bb.finish().to_vec());
+    let block = Block::new(
+      bb.finish().to_vec(),
+      Arc::new(crate::comparator::BytewiseComparator),
+    );
     assert!(!block.iter().valid());
   }
 
@@ -356,7 +371,10 @@ mod tests {
   #[test]
   fn seek_to_last_empty_block() {
     let mut bb = BlockBuilder::new(16);
-    let block = Block::new(bb.finish().to_vec());
+    let block = Block::new(
+      bb.finish().to_vec(),
+      Arc::new(crate::comparator::BytewiseComparator),
+    );
     let mut it = block.iter();
     it.seek_to_last();
     assert!(!it.valid());

@@ -359,8 +359,12 @@ what remains is compaction, the full Iterator/Snapshot API, and operational hygi
   `sync=true` writer won't join a non-sync group. Leader pops followers, stores results in `completed`, calls
   `notify_all`; followers retrieve their result by `id` and return. Leader handles flush/compaction after.
   See `db/db_impl.cc: DBImpl::Write`.
-- **Custom comparator**: Wire `Options::comparator` through to all key-comparison sites (skip list, block seek,
-  compaction). Currently hardcoded bytewise. Needed to use RoughDB as a sorted map on non-lexicographic keys.
+- ✅ **Custom comparator**: `Comparator` trait (`src/comparator.rs`) with `compare`, `name`,
+  `find_shortest_separator`, `find_short_successor`. `BytewiseComparator` is the default. `Options::comparator:
+  Arc<dyn Comparator>` threaded through all ~40 comparison sites: skip list entry ordering, `cmp_internal_keys`,
+  `BlockIter::seek`, `MergingIterator`, `DbIterator`, `Table::get`, `TableBuilder` (index separators shortened via
+  `find_shortest_separator`/`find_short_successor`), `VersionSet` file sorting, and all `lib.rs` compaction/overlap
+  helpers. `VersionEdit` encodes/decodes the comparator name; `VersionSet::recover` rejects mismatches.
   See `include/leveldb/comparator.h`.
 - ✅ **`Db::repair(path, options)`**: Scans the database directory for surviving `.ldb` and `.log` files, converts WALs
   to SSTables via `LogReader` → `Memtable` → `TableBuilder`, extracts metadata from all SSTables, writes a fresh

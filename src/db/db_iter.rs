@@ -10,9 +10,11 @@
 //    See the License for the specific language governing permissions and
 //    limitations under the License.
 
+use crate::comparator::Comparator;
 use crate::error::Error;
 use crate::iter::InternalIterator;
 use crate::table::format::{make_internal_key, parse_internal_key};
+use std::sync::Arc;
 
 /// Direction of the last positioning or movement operation.
 #[derive(Debug, PartialEq)]
@@ -59,10 +61,16 @@ pub(crate) struct DbIterator {
   saved_key: Vec<u8>,
   /// In Reverse direction: value bytes of the current entry.
   saved_value: Vec<u8>,
+  /// Comparator for user-key ordering.
+  comparator: Arc<dyn Comparator>,
 }
 
 impl DbIterator {
-  pub(crate) fn new(iter: Box<dyn InternalIterator>, sequence: u64) -> Self {
+  pub(crate) fn new(
+    iter: Box<dyn InternalIterator>,
+    sequence: u64,
+    comparator: Arc<dyn Comparator>,
+  ) -> Self {
     DbIterator {
       iter,
       sequence,
@@ -71,6 +79,7 @@ impl DbIterator {
       direction: Direction::Forward,
       saved_key: Vec::new(),
       saved_value: Vec::new(),
+      comparator,
     }
   }
 
@@ -110,7 +119,7 @@ impl DbIterator {
           }
           1 => {
             // Value: accept unless it is hidden by a prior tombstone.
-            if !skipping || user_key > skip.as_slice() {
+            if !skipping || self.comparator.compare(user_key, skip.as_slice()).is_gt() {
               self.valid = true;
               return;
             }
@@ -163,7 +172,12 @@ impl DbIterator {
         if seq <= self.sequence {
           // Stop when we encounter a value entry for a user key that is
           // strictly smaller than the one we saved (we've found our answer).
-          if value_type != 0 && user_key < self.saved_key.as_slice() {
+          if value_type != 0
+            && self
+              .comparator
+              .compare(user_key, self.saved_key.as_slice())
+              .is_lt()
+          {
             break;
           }
           value_type = vtype;
@@ -312,7 +326,11 @@ impl DbIterator {
           return;
         }
         if let Some((uk, _, _)) = parse_internal_key(self.iter.key()) {
-          if uk < self.saved_key.as_slice() {
+          if self
+            .comparator
+            .compare(uk, self.saved_key.as_slice())
+            .is_lt()
+          {
             break;
           }
         }
@@ -365,6 +383,10 @@ mod tests {
   use crate::table::format::make_internal_key;
   use crate::table::reader::Table;
 
+  fn bytewise_cmp() -> Arc<dyn Comparator> {
+    Arc::new(crate::comparator::BytewiseComparator)
+  }
+
   // ── helpers ────────────────────────────────────────────────────────────────
 
   /// Build an SSTable from internal-key / value pairs and return a boxed
@@ -378,18 +400,23 @@ mod tests {
       16,
       None,
       crate::options::CompressionType::NoCompression,
+      Arc::new(crate::comparator::BytewiseComparator),
     );
     for &(k, seq, vtype, v) in pairs {
       let ikey = make_internal_key(k, seq, vtype);
       builder.add(&ikey, v).unwrap();
     }
     let size = builder.finish().unwrap();
-    let table = Table::open(tmp.reopen().unwrap(), size, None, None).unwrap();
+    let table = Table::open(tmp.reopen().unwrap(), size, None, None, bytewise_cmp()).unwrap();
     Box::new(table.new_iterator(false, true).unwrap())
   }
 
   fn make_db_iter(children: Vec<Box<dyn InternalIterator>>, seq: u64) -> DbIterator {
-    DbIterator::new(Box::new(MergingIterator::new(children)), seq)
+    DbIterator::new(
+      Box::new(MergingIterator::new(children, bytewise_cmp())),
+      seq,
+      bytewise_cmp(),
+    )
   }
 
   // ── tests ──────────────────────────────────────────────────────────────────

@@ -129,6 +129,15 @@ pub struct Options {
   /// Default: 8 MiB.  Call [`BlockCache::new`](crate::BlockCache::new) to
   /// create one with a custom capacity, or share a cache across databases.
   pub block_cache: Option<std::sync::Arc<crate::cache::BlockCache>>,
+
+  // ── Comparator ──────────────────────────────────────────────────────────
+  /// Comparator defining the total order over user keys.
+  ///
+  /// The comparator name is stored in the MANIFEST so that reopening with an incompatible
+  /// comparator is detected.
+  ///
+  /// Default: [`BytewiseComparator`](crate::BytewiseComparator) (lexicographic byte order).
+  pub comparator: std::sync::Arc<dyn crate::comparator::Comparator>,
 }
 
 impl Default for Options {
@@ -148,6 +157,7 @@ impl Default for Options {
       block_cache: Some(std::sync::Arc::new(crate::cache::BlockCache::new(
         crate::cache::DEFAULT_BLOCK_CACHE_CAPACITY,
       ))),
+      comparator: std::sync::Arc::new(crate::comparator::BytewiseComparator),
     }
   }
 }
@@ -173,6 +183,7 @@ impl std::fmt::Debug for Options {
         "block_cache",
         &self.block_cache.as_ref().map(|_| "<BlockCache>"),
       )
+      .field("comparator", &self.comparator.name())
       .finish()
   }
 }

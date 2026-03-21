@@ -10,9 +10,11 @@
 //    See the License for the specific language governing permissions and
 //    limitations under the License.
 
+use crate::comparator::Comparator;
 use crate::error::Error;
 use crate::iter::InternalIterator;
 use crate::table::format::cmp_internal_keys;
+use std::sync::Arc;
 
 /// N-way merge iterator over a set of sorted [`InternalIterator`]s.
 ///
@@ -28,26 +30,33 @@ pub(crate) struct MergingIterator {
   /// Index into `children` of the child currently positioned at the smallest
   /// key.  `None` when no child is valid (iterator exhausted or unpositioned).
   current: Option<usize>,
+  /// Comparator for user-key ordering.
+  comparator: Arc<dyn Comparator>,
 }
 
 impl MergingIterator {
-  pub(crate) fn new(children: Vec<Box<dyn InternalIterator>>) -> Self {
+  pub(crate) fn new(
+    children: Vec<Box<dyn InternalIterator>>,
+    comparator: Arc<dyn Comparator>,
+  ) -> Self {
     MergingIterator {
       children,
       current: None,
+      comparator,
     }
   }
 
   /// Scan all valid children and set `current` to the one with the smallest
   /// key.  Among equal keys the child with the lowest index wins.
   fn find_smallest(&mut self) {
+    let cmp = &*self.comparator;
     self.current = self
       .children
       .iter()
       .enumerate()
       .filter(|(_, c)| c.valid())
       .min_by(|(i, a), (j, b)| {
-        let ord = cmp_internal_keys(a.key(), b.key());
+        let ord = cmp_internal_keys(a.key(), b.key(), cmp);
         // For equal keys, prefer the lower index (newer source).
         if ord == std::cmp::Ordering::Equal {
           i.cmp(j)
@@ -62,13 +71,14 @@ impl MergingIterator {
   /// key.  Among equal keys the child with the lowest index wins (same
   /// tiebreaking as forward direction).
   fn find_largest(&mut self) {
+    let cmp = &*self.comparator;
     self.current = self
       .children
       .iter()
       .enumerate()
       .filter(|(_, c)| c.valid())
       .max_by(|(i, a), (j, b)| {
-        let ord = cmp_internal_keys(a.key(), b.key());
+        let ord = cmp_internal_keys(a.key(), b.key(), cmp);
         // For equal keys, lower index wins: reverse-compare indices so that
         // max_by selects the lower index (it returns the "larger" element).
         if ord == std::cmp::Ordering::Equal {
@@ -148,6 +158,10 @@ mod tests {
   use crate::table::format::{make_internal_key, parse_internal_key};
   use crate::table::reader::Table;
 
+  fn bytewise_cmp() -> Arc<dyn Comparator> {
+    Arc::new(crate::comparator::BytewiseComparator)
+  }
+
   // ── helpers ────────────────────────────────────────────────────────────────
 
   fn user_key(ikey: &[u8]) -> &[u8] {
@@ -167,13 +181,14 @@ mod tests {
       16,
       None,
       crate::options::CompressionType::NoCompression,
+      Arc::new(crate::comparator::BytewiseComparator),
     );
     for (seq, &(k, v)) in pairs.iter().enumerate() {
       let ikey = make_internal_key(k, seq as u64 + 1, 1);
       builder.add(&ikey, v).unwrap();
     }
     let size = builder.finish().unwrap();
-    let table = Table::open(tmp.reopen().unwrap(), size, None, None).unwrap();
+    let table = Table::open(tmp.reopen().unwrap(), size, None, None, bytewise_cmp()).unwrap();
     Box::new(table.new_iterator(false, true).unwrap())
   }
 
@@ -214,10 +229,11 @@ mod tests {
     }
 
     fn seek(&mut self, target: &[u8]) {
+      let cmp = crate::comparator::BytewiseComparator;
       self.pos = self
         .entries
         .iter()
-        .position(|(k, _)| cmp_internal_keys(k, target) != std::cmp::Ordering::Less)
+        .position(|(k, _)| cmp_internal_keys(k, target, &cmp) != std::cmp::Ordering::Less)
         .unwrap_or(usize::MAX);
     }
 
@@ -267,7 +283,7 @@ mod tests {
 
   #[test]
   fn empty_no_children() {
-    let mut it = MergingIterator::new(vec![]);
+    let mut it = MergingIterator::new(vec![], Arc::new(crate::comparator::BytewiseComparator));
     it.seek_to_first();
     assert!(!it.valid());
   }
@@ -279,7 +295,7 @@ mod tests {
       (b"b", 2, b"2"),
       (b"c", 3, b"3"),
     ];
-    let mut it = MergingIterator::new(vec![vec_iter(pairs)]);
+    let mut it = MergingIterator::new(vec![vec_iter(pairs)], bytewise_cmp());
     it.seek_to_first();
     for &(k, _, v) in pairs {
       assert!(it.valid());
@@ -295,7 +311,7 @@ mod tests {
     // child 0: a, c, e — child 1: b, d, f
     let c0 = vec_iter(&[(b"a", 1, b"a0"), (b"c", 3, b"c0"), (b"e", 5, b"e0")]);
     let c1 = vec_iter(&[(b"b", 2, b"b1"), (b"d", 4, b"d1"), (b"f", 6, b"f1")]);
-    let mut it = MergingIterator::new(vec![c0, c1]);
+    let mut it = MergingIterator::new(vec![c0, c1], bytewise_cmp());
     it.seek_to_first();
     let expected: &[(&[u8], &[u8])] = &[
       (b"a", b"a0"),
@@ -319,7 +335,7 @@ mod tests {
     // Both children have key "a" — child 0 (index 0) should win.
     let c0 = vec_iter(&[(b"a", 2, b"newer")]);
     let c1 = vec_iter(&[(b"a", 1, b"older")]);
-    let mut it = MergingIterator::new(vec![c0, c1]);
+    let mut it = MergingIterator::new(vec![c0, c1], bytewise_cmp());
     it.seek_to_first();
     assert!(it.valid());
     assert_eq!(it.value(), b"newer");
@@ -329,7 +345,7 @@ mod tests {
   fn seek_positions_correctly() {
     let c0 = vec_iter(&[(b"a", 1, b"1"), (b"c", 3, b"3"), (b"e", 5, b"5")]);
     let c1 = vec_iter(&[(b"b", 2, b"2"), (b"d", 4, b"4"), (b"f", 6, b"6")]);
-    let mut it = MergingIterator::new(vec![c0, c1]);
+    let mut it = MergingIterator::new(vec![c0, c1], bytewise_cmp());
     let target = make_ikey(b"c", u64::MAX >> 8);
     it.seek(&target);
     assert!(it.valid());
@@ -343,7 +359,7 @@ mod tests {
   #[test]
   fn seek_past_all_keys() {
     let c0 = vec_iter(&[(b"a", 1, b"1")]);
-    let mut it = MergingIterator::new(vec![c0]);
+    let mut it = MergingIterator::new(vec![c0], bytewise_cmp());
     let target = make_ikey(b"z", u64::MAX >> 8);
     it.seek(&target);
     assert!(!it.valid());
@@ -353,7 +369,7 @@ mod tests {
   fn with_sstable_children() {
     let t0 = table_iter(&[(b"alpha", b"A"), (b"gamma", b"G")]);
     let t1 = table_iter(&[(b"beta", b"B"), (b"delta", b"D")]);
-    let mut it = MergingIterator::new(vec![t0, t1]);
+    let mut it = MergingIterator::new(vec![t0, t1], bytewise_cmp());
     it.seek_to_first();
     let mut keys: Vec<Vec<u8>> = Vec::new();
     while it.valid() {
@@ -375,7 +391,7 @@ mod tests {
 
   #[test]
   fn seek_to_last_empty() {
-    let mut it = MergingIterator::new(vec![]);
+    let mut it = MergingIterator::new(vec![], Arc::new(crate::comparator::BytewiseComparator));
     it.seek_to_last();
     assert!(!it.valid());
   }
@@ -383,7 +399,7 @@ mod tests {
   #[test]
   fn seek_to_last_single_child() {
     let c0 = vec_iter(&[(b"a", 1, b"1"), (b"b", 2, b"2"), (b"c", 3, b"3")]);
-    let mut it = MergingIterator::new(vec![c0]);
+    let mut it = MergingIterator::new(vec![c0], bytewise_cmp());
     it.seek_to_last();
     assert!(it.valid());
     assert_eq!(user_key(it.key()), b"c");
@@ -394,7 +410,7 @@ mod tests {
   fn prev_iterates_backward_two_children() {
     let c0 = vec_iter(&[(b"a", 1, b"a0"), (b"c", 3, b"c0"), (b"e", 5, b"e0")]);
     let c1 = vec_iter(&[(b"b", 2, b"b1"), (b"d", 4, b"d1"), (b"f", 6, b"f1")]);
-    let mut it = MergingIterator::new(vec![c0, c1]);
+    let mut it = MergingIterator::new(vec![c0, c1], bytewise_cmp());
     it.seek_to_last();
     let mut keys: Vec<Vec<u8>> = Vec::new();
     while it.valid() {
@@ -420,7 +436,7 @@ mod tests {
     // (higher seq sorts first = is "smaller").  find_largest picks z@1 (c1).
     let c0 = vec_iter(&[(b"z", 2, b"newer")]);
     let c1 = vec_iter(&[(b"z", 1, b"older")]);
-    let mut it = MergingIterator::new(vec![c0, c1]);
+    let mut it = MergingIterator::new(vec![c0, c1], bytewise_cmp());
     it.seek_to_last();
     assert!(it.valid());
     // z@1 is the larger internal key → child 1 wins at the MergingIterator level.
@@ -432,7 +448,7 @@ mod tests {
   fn backward_with_sstable_children() {
     let t0 = table_iter(&[(b"alpha", b"A"), (b"gamma", b"G")]);
     let t1 = table_iter(&[(b"beta", b"B"), (b"delta", b"D")]);
-    let mut it = MergingIterator::new(vec![t0, t1]);
+    let mut it = MergingIterator::new(vec![t0, t1], bytewise_cmp());
     it.seek_to_last();
     let mut keys: Vec<Vec<u8>> = Vec::new();
     while it.valid() {

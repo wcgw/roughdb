@@ -67,6 +67,7 @@ impl FileMetaData {
 /// Written to the MANIFEST log for crash-safe recovery. LevelDB-compatible
 /// tag-based binary encoding (see `encode` / `decode`).
 pub(crate) struct VersionEdit {
+  pub comparator_name: Option<String>,
   pub log_number: Option<u64>,
   pub prev_log_number: Option<u64>,
   pub next_file_number: Option<u64>,
@@ -82,6 +83,7 @@ pub(crate) struct VersionEdit {
 impl VersionEdit {
   pub(crate) fn new() -> Self {
     VersionEdit {
+      comparator_name: None,
       log_number: None,
       prev_log_number: None,
       next_file_number: None,
@@ -107,6 +109,10 @@ impl VersionEdit {
       }};
     }
 
+    if let Some(ref name) = self.comparator_name {
+      push_varint!(TAG_COMPARATOR);
+      encode_bytes(&mut buf, name.as_bytes());
+    }
     if let Some(v) = self.log_number {
       push_varint!(TAG_LOG_NUMBER);
       push_varint!(v);
@@ -243,9 +249,11 @@ impl VersionEdit {
           edit.compact_pointers.push((level as i32, key));
         }
         TAG_COMPARATOR => {
-          // Skip comparator name (length-prefixed bytes).
-          let (_, n) = decode_bytes(&data[pos..])?;
+          let (name_bytes, n) = decode_bytes(&data[pos..])?;
           pos += n;
+          edit.comparator_name = Some(String::from_utf8(name_bytes).map_err(|e| {
+            Error::Corruption(format!("VersionEdit: invalid comparator name: {e}"))
+          })?);
         }
         _ => {
           // Unknown tag: stop parsing (can't skip without knowing field size).
