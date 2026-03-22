@@ -314,9 +314,11 @@ mod tests {
       std::sync::Arc::new(crate::comparator::BytewiseComparator),
     )
     .unwrap();
-    assert!(matches!(table.get(b"hello", false, true).unwrap(), L::Value(v) if v == b"world"));
+    assert!(
+      matches!(table.get(b"hello", u64::MAX, false, true).unwrap(), L::Value(v) if v == b"world")
+    );
     assert!(matches!(
-      table.get(b"missing", false, true).unwrap(),
+      table.get(b"missing", u64::MAX, false, true).unwrap(),
       L::NotInTable
     ));
   }
@@ -335,7 +337,9 @@ mod tests {
     )
     .unwrap();
     for (k, v) in &pairs {
-      assert!(matches!(table.get(k, false, true).unwrap(), L::Value(ref val) if val == v));
+      assert!(
+        matches!(table.get(k, u64::MAX, false, true).unwrap(), L::Value(ref val) if val == v)
+      );
     }
   }
 
@@ -375,7 +379,9 @@ mod tests {
     )
     .unwrap();
     for (k, v) in &pairs {
-      assert!(matches!(table.get(k, false, true).unwrap(), L::Value(ref val) if val == v));
+      assert!(
+        matches!(table.get(k, u64::MAX, false, true).unwrap(), L::Value(ref val) if val == v)
+      );
     }
   }
 
@@ -414,7 +420,9 @@ mod tests {
     )
     .unwrap();
     for (k, v) in &pairs {
-      assert!(matches!(table.get(k, false, true).unwrap(), L::Value(ref val) if val == v));
+      assert!(
+        matches!(table.get(k, u64::MAX, false, true).unwrap(), L::Value(ref val) if val == v)
+      );
     }
   }
 
@@ -431,7 +439,9 @@ mod tests {
     )
     .unwrap();
     for (k, v) in &pairs {
-      assert!(matches!(table.get(k, false, true).unwrap(), L::Value(ref val) if val == v));
+      assert!(
+        matches!(table.get(k, u64::MAX, false, true).unwrap(), L::Value(ref val) if val == v)
+      );
     }
   }
 }

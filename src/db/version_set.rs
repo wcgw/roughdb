@@ -493,7 +493,7 @@ mod tests {
     let cur = vs2.current();
     use crate::table::reader::LookupResult;
     assert!(matches!(
-      cur.get(b"key", 0, false, true, &tc2).unwrap().0,
+      cur.get(b"key", u64::MAX, false, true, &tc2).unwrap().0,
       LookupResult::Value(v) if v == b"val"
     ));
   }

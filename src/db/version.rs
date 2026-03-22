@@ -75,7 +75,7 @@ impl Version {
   pub(crate) fn get(
     &self,
     user_key: &[u8],
-    _sequence: u64,
+    sequence: u64,
     verify_checksums: bool,
     fill_cache: bool,
     tc: &TableCache,
@@ -103,7 +103,7 @@ impl Version {
     for meta in &self.files[0] {
       charge_prev!(meta, 0);
       let table = tc.get_or_open(meta.number, meta.file_size)?;
-      match table.get(user_key, verify_checksums, fill_cache)? {
+      match table.get(user_key, sequence, verify_checksums, fill_cache)? {
         LookupResult::Value(v) => return Ok((LookupResult::Value(v), stats)),
         LookupResult::Deleted => return Ok((LookupResult::Deleted, stats)),
         LookupResult::NotInTable => {}
@@ -115,7 +115,7 @@ impl Version {
       for meta in &self.files[level] {
         charge_prev!(meta, level);
         let table = tc.get_or_open(meta.number, meta.file_size)?;
-        match table.get(user_key, verify_checksums, fill_cache)? {
+        match table.get(user_key, sequence, verify_checksums, fill_cache)? {
           LookupResult::Value(v) => return Ok((LookupResult::Value(v), stats)),
           LookupResult::Deleted => return Ok((LookupResult::Deleted, stats)),
           LookupResult::NotInTable => {}
