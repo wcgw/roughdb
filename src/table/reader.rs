@@ -149,15 +149,16 @@ impl Table {
   pub(crate) fn get(
     &self,
     user_key: &[u8],
+    sequence: u64,
     verify_checksums: bool,
     fill_cache: bool,
   ) -> Result<LookupResult, Error> {
     use crate::table::format::{make_internal_key, parse_internal_key};
 
-    // Construct a lookup internal key: user_key + tag(seq=u64::MAX >> 8, vtype=1).
-    // In internal-key order (seq DESC), this sorts before all real entries for
-    // `user_key`, so `seek(lookup_key)` lands at the newest version.
-    let lookup_key = make_internal_key(user_key, u64::MAX >> 8, 1);
+    // Construct a lookup internal key: user_key + tag(sequence, vtype=kValueTypeForSeek).
+    // In internal-key order (seq DESC), this sorts before all entries for `user_key`
+    // with seq <= `sequence`, so `seek(lookup_key)` lands at the newest visible version.
+    let lookup_key = make_internal_key(user_key, sequence, 1);
 
     // Search the index block for the first data block whose largest key >= lookup_key.
     let mut idx = self.index_block.iter();
@@ -194,6 +195,8 @@ impl Table {
           if self.comparator.compare(found_user_key, user_key) != std::cmp::Ordering::Equal {
             return Ok(LookupResult::NotInTable);
           }
+          // we did find the key, we can ignore `_seq`, as it will be <= `sequence` by definition
+          // no need to recheck for that
           match vtype {
             1 => return Ok(LookupResult::Value(it.value().to_vec())),
             0 => return Ok(LookupResult::Deleted),
@@ -379,7 +382,7 @@ mod tests {
     )
     .unwrap();
     assert!(
-      matches!(table.get(b"hello", false, true).unwrap(), LookupResult::Value(v) if v == b"world")
+      matches!(table.get(b"hello", u64::MAX, false, true).unwrap(), LookupResult::Value(v) if v == b"world")
     );
   }
 
@@ -395,7 +398,7 @@ mod tests {
     )
     .unwrap();
     assert!(matches!(
-      table.get(b"z", false, true).unwrap(),
+      table.get(b"z", u64::MAX, false, true).unwrap(),
       LookupResult::NotInTable
     ));
   }
@@ -413,7 +416,7 @@ mod tests {
     )
     .unwrap();
     assert!(matches!(
-      table.get(b"gone", false, true).unwrap(),
+      table.get(b"gone", u64::MAX, false, true).unwrap(),
       LookupResult::Deleted
     ));
   }
@@ -430,8 +433,35 @@ mod tests {
     )
     .unwrap();
     assert!(
-      matches!(table.get(b"key", false, true).unwrap(), LookupResult::Value(v) if v == b"new")
+      matches!(table.get(b"key", u64::MAX, false, true).unwrap(), LookupResult::Value(v) if v == b"new")
     );
+  }
+
+  #[test]
+  fn get_respects_sequence_number() {
+    // Two versions of "key": seq=10 ("new") and seq=5 ("old").
+    let (tmp, size) = write_table_internal(&[(b"key", 10, 1, b"new"), (b"key", 5, 1, b"old")]);
+    let table = Table::open(
+      tmp.reopen().unwrap(),
+      size,
+      None,
+      None,
+      Arc::new(crate::comparator::BytewiseComparator),
+    )
+    .unwrap();
+    // With sequence=u64::MAX, we see the newest (seq=10).
+    assert!(
+      matches!(table.get(b"key", u64::MAX, false, true).unwrap(), LookupResult::Value(v) if v == b"new")
+    );
+    // With sequence=7, seq=10 is invisible — we see seq=5.
+    assert!(
+      matches!(table.get(b"key", 7, false, true).unwrap(), LookupResult::Value(v) if v == b"old")
+    );
+    // With sequence=3, both versions are invisible.
+    assert!(matches!(
+      table.get(b"key", 3, false, true).unwrap(),
+      LookupResult::NotInTable
+    ));
   }
 
   #[test]
@@ -446,7 +476,7 @@ mod tests {
     )
     .unwrap();
     assert!(matches!(
-      table.get(b"k", true, true).unwrap(),
+      table.get(b"k", u64::MAX, true, true).unwrap(),
       LookupResult::Value(_)
     ));
   }

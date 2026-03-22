@@ -201,7 +201,7 @@ mod tests {
     let table = tc.get_or_open(3, size).unwrap();
     use crate::table::reader::LookupResult;
     assert!(
-      matches!(table.get(b"hello", false, true).unwrap(), LookupResult::Value(v) if v == b"world")
+      matches!(table.get(b"hello", u64::MAX, false, true).unwrap(), LookupResult::Value(v) if v == b"world")
     );
   }
 
