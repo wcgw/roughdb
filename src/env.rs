@@ -67,7 +67,7 @@ pub trait WritableFile: Send {
 /// An exclusive file lock handle.
 ///
 /// The lock is released when this value is dropped.
-pub trait FileLock: Send {}
+pub trait FileLock: Send + Sync {}
 
 // ── FileSystem trait ─────────────────────────────────────────────────────────
 
@@ -316,6 +316,7 @@ impl FileSystem for PosixFileSystem {
 /// Create a [`WritableFile`] from an already-open [`std::fs::File`].
 ///
 /// Intended for tests and interop where a raw `File` handle is available.
+#[cfg(test)]
 pub fn writable_from_file(file: std::fs::File) -> Box<dyn WritableFile> {
   Box::new(PosixWritableFile {
     inner: std::io::BufWriter::new(file),
@@ -325,6 +326,7 @@ pub fn writable_from_file(file: std::fs::File) -> Box<dyn WritableFile> {
 /// Create a [`SequentialFile`] from an already-open [`std::fs::File`].
 ///
 /// Intended for tests and interop where a raw `File` handle is available.
+#[cfg(test)]
 pub fn sequential_from_file(file: std::fs::File) -> Box<dyn SequentialFile> {
   Box::new(PosixSequentialFile { inner: file })
 }
@@ -332,6 +334,7 @@ pub fn sequential_from_file(file: std::fs::File) -> Box<dyn SequentialFile> {
 /// Create a [`RandomAccessFile`] from an already-open [`std::fs::File`].
 ///
 /// Intended for tests and interop where a raw `File` handle is available.
+#[cfg(test)]
 pub fn random_access_from_file(file: std::fs::File) -> Arc<dyn RandomAccessFile> {
   Arc::new(PosixRandomAccessFile { inner: file })
 }

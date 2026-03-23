@@ -484,31 +484,11 @@ impl Iterator for ForwardIter<'_> {
   }
 }
 
-// ── LOCK file ────────────────────────────────────────────────────────────────
-
-/// Acquire an exclusive, non-blocking `flock` on `file`.
-///
-/// Returns `Err(Error::IoError(...))` immediately if another process holds the
-/// lock (`EWOULDBLOCK`), rather than blocking indefinitely.
-///
-/// # Safety
-/// `flock(2)` is async-signal-safe and only modifies kernel state associated
-/// with the file descriptor.
-fn acquire_lock(file: &std::fs::File) -> Result<(), Error> {
-  use std::os::unix::io::AsRawFd;
-  // SAFETY: the fd is valid for the lifetime of `file`; flock does not alias memory.
-  let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-  if ret == 0 {
-    Ok(())
-  } else {
-    Err(Error::IoError(std::io::Error::last_os_error()))
-  }
-}
-
 struct Persistence {
   dir: PathBuf,
   table_cache: TableCache,
-  _lock: std::fs::File,
+  fs: Arc<dyn crate::env::FileSystem>,
+  _lock: Box<dyn crate::env::FileLock>,
 }
 
 // ── DbInner / Db ─────────────────────────────────────────────────────────────
@@ -600,11 +580,10 @@ impl Db {
   ///
   /// `Db::default()` is retained for in-memory / test use (no WAL, no flush).
   pub fn open<P: AsRef<std::path::Path>>(path: P, options: Options) -> Result<Self, Error> {
-    use std::fs::OpenOptions;
-
     let path = path.as_ref();
+    let fs = Arc::clone(&options.file_system);
     let current_path = path.join("CURRENT");
-    let db_exists = current_path.exists();
+    let db_exists = fs.file_exists(&current_path);
 
     if db_exists && options.error_if_exists {
       return Err(Error::InvalidArgument(format!(
@@ -621,18 +600,12 @@ impl Db {
 
     // Create the directory only when we are going to create a new database.
     if !db_exists {
-      std::fs::create_dir_all(path)?;
+      fs.create_dir_all(path)?;
     }
 
-    // Acquire an exclusive non-blocking flock on LOCK before any other I/O.
+    // Acquire an exclusive non-blocking file lock on LOCK before any other I/O.
     // This prevents two processes from corrupting the same database concurrently.
-    let lock_file = OpenOptions::new()
-      .create(true)
-      .truncate(true)
-      .read(true)
-      .write(true)
-      .open(path.join("LOCK"))?;
-    acquire_lock(&lock_file)?;
+    let lock_file = fs.lock_file(&path.join("LOCK"))?;
 
     // Create the table cache for this persistent database.
     let cache_capacity = options
@@ -663,9 +636,7 @@ impl Db {
       // Replay WAL records newer than what is already in the SSTables.
       // Use the log number recorded in the MANIFEST (set by WAL rotation).
       let log_path = path.join(format!("{:06}.log", vs.log_number()));
-      let actual_last_seq = if log_path.exists() {
-        // TODO: This needs abstracted away...
-        let fs = crate::env::PosixFileSystem;
+      let actual_last_seq = if fs.file_exists(&log_path) {
         let file_len = fs.file_size(&log_path)?;
         if file_len > 0 {
           log::info!(
@@ -673,7 +644,7 @@ impl Db {
             vs.log_number(),
             manifest_last_seq
           );
-          let file = fs.open_sequential(&log_path)?;
+          let file = options.file_system.open_sequential(&log_path)?;
           let seq = Self::recover_wal(file, &mem, manifest_last_seq, options.paranoid_checks)?;
           log::info!("WAL replay complete: max_sequence={seq}");
           seq
@@ -694,7 +665,7 @@ impl Db {
       log::info!("creating new database at {}", path.display());
       let vs = VersionSet::create(path, &*options.comparator, &*options.file_system)?;
       // Initial WAL is always 000001.log (log_number = 1 from VersionSet::create).
-      std::fs::File::create(path.join("000001.log"))?;
+      fs.create_writable(&path.join("000001.log"))?;
       (
         Some(vs),
         Arc::new(Memtable::new(Arc::clone(&options.comparator))),
@@ -705,8 +676,6 @@ impl Db {
     // Open (or reopen) the current WAL for subsequent writes.
     let log_number = version_set.as_ref().map_or(1, |vs| vs.log_number());
     let log_path = path.join(format!("{log_number:06}.log"));
-    // TODO: This needs abstracted away...
-    let fs = crate::env::PosixFileSystem;
     let file_len = if fs.file_exists(&log_path) {
       fs.file_size(&log_path)?
     } else {
@@ -734,12 +703,13 @@ impl Db {
       }),
       write_condvar: std::sync::Condvar::new(),
       bg_condvar: std::sync::Condvar::new(),
-      options,
       persistence: Some(Persistence {
         dir: path.to_path_buf(),
         table_cache,
+        fs: Arc::clone(&fs),
         _lock: lock_file,
       }),
+      options,
       shutting_down: AtomicBool::new(false),
     });
     let bg_inner = Arc::clone(&inner);
@@ -1089,40 +1059,32 @@ impl Db {
   /// See `db/db_impl.cc: DestroyDB`.
   pub fn destroy<P: AsRef<std::path::Path>>(path: P) -> Result<(), Error> {
     let path = path.as_ref();
+    let fs: Arc<dyn crate::env::FileSystem> = Arc::new(crate::env::PosixFileSystem);
 
-    if !path.exists() {
+    if !fs.file_exists(path) {
       return Ok(());
     }
 
     // Acquire the lock to confirm no other process has the database open.
     let lock_path = path.join("LOCK");
-    let lock_file = std::fs::OpenOptions::new()
-      .create(true)
-      .truncate(true)
-      .read(true)
-      .write(true)
-      .open(&lock_path)?;
-    acquire_lock(&lock_file)?;
+    let lock = fs.lock_file(&lock_path)?;
 
     // Enumerate and remove every recognised database file (except LOCK — last).
-    for entry in std::fs::read_dir(path)? {
-      let entry = entry?;
-      let name = entry.file_name();
-      let name = name.to_string_lossy();
+    for name in fs.children(path)? {
       if name == "LOCK" {
-        continue; // removed after we release the flock below
+        continue; // removed after we release the lock below
       }
       if parse_db_filename(&name).is_some() {
-        let _ = std::fs::remove_file(entry.path());
+        let _ = fs.remove_file(&path.join(&name));
       }
     }
 
-    // Release the flock by dropping the file, then remove the LOCK file itself.
-    drop(lock_file);
-    let _ = std::fs::remove_file(&lock_path);
+    // Release the lock by dropping, then remove the LOCK file itself.
+    drop(lock);
+    let _ = fs.remove_file(&lock_path);
 
     // Remove the directory if it is now empty; ignore the error if it is not.
-    let _ = std::fs::remove_dir(path);
+    let _ = fs.remove_dir(path);
 
     Ok(())
   }
@@ -1247,8 +1209,9 @@ impl Db {
     }
 
     // Rotate mem → imm and schedule the background flush.
-    let path = self.inner.persistence.as_ref().unwrap().dir.as_path();
-    let prep = begin_flush(path, &mut g, &self.inner.options.comparator)?;
+    let p = self.inner.persistence.as_ref().unwrap();
+    let path = p.dir.as_path();
+    let prep = begin_flush(path, &mut g, &self.inner.options.comparator, &*p.fs)?;
     g.imm = Some(Arc::clone(&prep.old_mem));
     g.pending_flush = Some(prep);
     maybe_schedule_compaction(&self.inner, &mut g);
@@ -1422,7 +1385,12 @@ impl Db {
         && state.mem.approximate_memory_usage() >= self.inner.options.write_buffer_size
       {
         let path = persistence.dir.as_path();
-        match begin_flush(path, &mut state, &self.inner.options.comparator) {
+        match begin_flush(
+          path,
+          &mut state,
+          &self.inner.options.comparator,
+          &*persistence.fs,
+        ) {
           Ok(prep) => {
             state.imm = Some(Arc::clone(&prep.old_mem));
             state.pending_flush = Some(prep);
@@ -1473,13 +1441,14 @@ impl Db {
     use crate::table::format::parse_internal_key;
 
     let path = path.as_ref();
+    let fs = &*options.file_system;
 
     // ── Phase 1: find_files ────────────────────────────────────────────────────
-    let entries = std::fs::read_dir(path).map_err(|e| {
-      Error::IoError(std::io::Error::new(
-        e.kind(),
-        format!("repair: cannot read directory {}: {e}", path.display()),
-      ))
+    let names = fs.children(path).map_err(|e| {
+      Error::IoError(std::io::Error::other(format!(
+        "repair: cannot read directory {}: {e}",
+        path.display()
+      )))
     })?;
 
     let mut logs: Vec<u64> = Vec::new();
@@ -1487,10 +1456,8 @@ impl Db {
     let mut manifests: Vec<String> = Vec::new();
     let mut max_number: u64 = 0;
 
-    for entry in entries.flatten() {
-      let name = entry.file_name();
-      let name = name.to_string_lossy();
-      if let Some((number, kind)) = parse_db_filename(&name) {
+    for name in &names {
+      if let Some((number, kind)) = parse_db_filename(name) {
         if number > max_number {
           max_number = number;
         }
@@ -1507,8 +1474,7 @@ impl Db {
     // ── Phase 2: convert_log_to_table ──────────────────────────────────────────
     for log_num in &logs {
       let log_path = path.join(format!("{log_num:06}.log"));
-      // TODO: This needs abstracted away...
-      let file = match crate::env::PosixFileSystem.open_sequential(&log_path) {
+      let file = match fs.open_sequential(&log_path) {
         Ok(f) => f,
         Err(e) => {
           log::warn!("repair: cannot open WAL {}: {e}", log_path.display());
@@ -1546,9 +1512,9 @@ impl Db {
         let sst_number = next_file_number;
         next_file_number += 1;
         let sst_path = path.join(format!("{sst_number:06}.ldb"));
-        let sst_file = std::fs::File::create(&sst_path)?;
+        let sst_file = fs.create_writable(&sst_path)?;
         let mut builder = TableBuilder::new(
-          crate::env::writable_from_file(sst_file),
+          sst_file,
           options.block_size,
           options.block_restart_interval,
           options.filter_policy.clone(),
@@ -1566,7 +1532,7 @@ impl Db {
         log::info!("repair: converted WAL {log_num:06}.log → SSTable {sst_number:06}.ldb");
       }
 
-      archive_file(path, &format!("{log_num:06}.log"));
+      archive_file(path, &format!("{log_num:06}.log"), fs);
     }
 
     // ── Phase 3: scan_table (extract metadata) ────────────────────────────────
@@ -1579,14 +1545,14 @@ impl Db {
 
     for &num in &table_numbers {
       let sst_path = path.join(format!("{num:06}.ldb"));
-      let file_size = match std::fs::metadata(&sst_path) {
-        Ok(m) => m.len(),
+      let file_size = match fs.file_size(&sst_path) {
+        Ok(s) => s,
         Err(e) => {
           log::warn!("repair: cannot stat {}: {e}", sst_path.display());
           continue;
         }
       };
-      let file = match std::fs::File::open(&sst_path) {
+      let ra_file = match fs.open_random_access(&sst_path) {
         Ok(f) => f,
         Err(e) => {
           log::warn!("repair: cannot open {}: {e}", sst_path.display());
@@ -1594,8 +1560,7 @@ impl Db {
         }
       };
       let table = match Table::open(
-        // TODO: This needs abstracted away...
-        crate::env::random_access_from_file(file),
+        ra_file,
         file_size,
         options.filter_policy.clone(),
         None,
@@ -1666,14 +1631,13 @@ impl Db {
     }
 
     let manifest_path = path.join(crate::db::version_set::manifest_filename(1));
-    // TODO: This needs abstracted away...
-    let manifest_file = crate::env::PosixFileSystem.create_writable(&manifest_path)?;
+    let manifest_file = fs.create_writable(&manifest_path)?;
     let mut manifest_writer = LogWriter::new(manifest_file, 0);
     manifest_writer.add_record(&edit.encode())?;
 
     // Delete old manifests.
     for name in &manifests {
-      let _ = std::fs::remove_file(path.join(name));
+      let _ = fs.remove_file(&path.join(name));
     }
 
     // Write CURRENT pointing at MANIFEST-000001.
@@ -1761,8 +1725,9 @@ fn make_room_for_write<'a>(
         g.mem.approximate_memory_usage(),
         inner.options.write_buffer_size,
       );
-      let path = inner.persistence.as_ref().unwrap().dir.as_path();
-      let prep = begin_flush(path, &mut g, &inner.options.comparator)?;
+      let p = inner.persistence.as_ref().unwrap();
+      let path = p.dir.as_path();
+      let prep = begin_flush(path, &mut g, &inner.options.comparator, &*p.fs)?;
       g.imm = Some(Arc::clone(&prep.old_mem));
       g.pending_flush = Some(prep);
       maybe_schedule_compaction(inner, &mut g);
@@ -1802,6 +1767,7 @@ fn bg_worker(inner: Arc<DbInner>) {
     };
     let path = p.dir.clone();
     let tc = p.table_cache.clone();
+    let fs = Arc::clone(&p.fs);
 
     // ── Flush if pending ──────────────────────────────────────────────────────
     if let Some(prep) = g.pending_flush.take() {
@@ -1823,14 +1789,14 @@ fn bg_worker(inner: Arc<DbInner>) {
       }
       inner.write_condvar.notify_all();
       drop(g);
-      delete_obsolete_files(&path, &inner.state);
+      delete_obsolete_files(&path, &inner.state, &*fs);
       g = inner.state.lock().unwrap();
     } else if !shutting_down {
       // ── Compaction (skipped on shutdown path) ────────────────────────────
       drop(g);
       maybe_compact(&path, &inner.state, &inner.options, &tc);
       inner.write_condvar.notify_all();
-      delete_obsolete_files(&path, &inner.state);
+      delete_obsolete_files(&path, &inner.state, &*fs);
       g = inner.state.lock().unwrap();
     }
 
@@ -1884,6 +1850,7 @@ fn begin_flush(
   path: &std::path::Path,
   state: &mut DbState,
   comparator: &Arc<dyn crate::comparator::Comparator>,
+  fs: &dyn crate::env::FileSystem,
 ) -> Result<FlushPrep, Error> {
   let vs = state
     .version_set
@@ -1894,8 +1861,7 @@ fn begin_flush(
   let new_log_number = vs.next_file_number();
   log::debug!("begin_flush: sst={sst_number}, new_log={new_log_number}, old_log={old_log_number}");
   let new_log_path = path.join(format!("{new_log_number:06}.log"));
-  // TODO: This needs abstracted away...
-  let new_log_file = crate::env::PosixFileSystem.create_writable(&new_log_path)?;
+  let new_log_file = fs.create_writable(&new_log_path)?;
   let new_log = LogWriter::new(new_log_file, 0);
   // Activate the new WAL immediately; preserve the old WAL so finish_flush
   // can delete it after log_and_apply commits the rotation to the MANIFEST.
@@ -1921,7 +1887,6 @@ fn begin_flush(
 /// rotation state through to `finish_flush`.  On error `old_mem` is dropped;
 /// data remains safe in the old WAL (not yet rotated away).
 fn write_flush(prep: FlushPrep, opts: &Options) -> Result<FlushResult, Error> {
-  use std::fs::OpenOptions;
   let FlushPrep {
     sst_number,
     sst_path,
@@ -1930,12 +1895,10 @@ fn write_flush(prep: FlushPrep, opts: &Options) -> Result<FlushResult, Error> {
     last_sequence_at_rotation,
     old_log_path,
   } = prep;
-  let file = OpenOptions::new()
-    .write(true)
-    .create_new(true)
-    .open(&sst_path)?;
+  let fs = &*opts.file_system;
+  let file = fs.create_writable(&sst_path)?;
   let mut builder = TableBuilder::new(
-    crate::env::writable_from_file(file),
+    file,
     opts.block_size,
     opts.block_restart_interval,
     opts.filter_policy.clone(),
@@ -1961,9 +1924,9 @@ fn write_flush(prep: FlushPrep, opts: &Options) -> Result<FlushResult, Error> {
   }
   let file_size = builder.finish()?;
   drop(old_mem);
-  let read_file = std::fs::File::open(&sst_path)?;
+  let read_file = fs.open_random_access(&sst_path)?;
   let table = Arc::new(Table::open(
-    crate::env::random_access_from_file(read_file),
+    read_file,
     file_size,
     opts.filter_policy.clone(),
     opts.block_cache.clone(),
@@ -2043,7 +2006,7 @@ fn finish_flush(
     result.file_size,
   );
   // Best-effort delete — ignore errors (e.g. the path never existed on new DB).
-  let _ = std::fs::remove_file(&result.old_log_path);
+  let _ = opts.file_system.remove_file(&result.old_log_path);
   Ok(())
 }
 
@@ -2623,11 +2586,12 @@ fn finish_compaction_output(
   filter_policy: Option<Arc<dyn crate::filter::FilterPolicy>>,
   block_cache: Option<Arc<BlockCache>>,
   comparator: Arc<dyn crate::comparator::Comparator>,
+  fs: &dyn crate::env::FileSystem,
 ) -> Result<(), Error> {
   let file_size = cur.builder.finish()?;
-  let read_file = std::fs::File::open(&cur.path)?;
+  let read_file = fs.open_random_access(&cur.path)?;
   let table = Arc::new(Table::open(
-    crate::env::random_access_from_file(read_file),
+    read_file,
     file_size,
     filter_policy,
     block_cache,
@@ -2745,6 +2709,7 @@ fn do_compaction(
           opts.filter_policy.clone(),
           opts.block_cache.clone(),
           Arc::clone(&opts.comparator),
+          &*opts.file_system,
         )?;
       }
 
@@ -2759,6 +2724,7 @@ fn do_compaction(
             opts.filter_policy.clone(),
             opts.block_cache.clone(),
             Arc::clone(&opts.comparator),
+            &*opts.file_system,
           )?;
         }
       }
@@ -2770,12 +2736,9 @@ fn do_compaction(
           g.version_set.as_mut().unwrap().next_file_number()
         };
         let sst_path = path.join(format!("{file_number:06}.ldb"));
-        let file = std::fs::OpenOptions::new()
-          .write(true)
-          .create_new(true)
-          .open(&sst_path)?;
+        let file = opts.file_system.create_writable(&sst_path)?;
         let builder = TableBuilder::new(
-          crate::env::writable_from_file(file),
+          file,
           opts.block_size,
           opts.block_restart_interval,
           opts.filter_policy.clone(),
@@ -2805,6 +2768,7 @@ fn do_compaction(
       opts.filter_policy.clone(),
       opts.block_cache.clone(),
       Arc::clone(&opts.comparator),
+      &*opts.file_system,
     )?;
   }
 
@@ -2999,7 +2963,7 @@ fn compact_level_range(
     install_compaction(&mut g, &spec, outputs, tc)?;
   }
 
-  delete_obsolete_files(path, state);
+  delete_obsolete_files(path, state, &*opts.file_system);
   Ok(true)
 }
 
@@ -3129,7 +3093,7 @@ fn maybe_compact(
       log::warn!("trivial move failed: {e}");
     }
     drop(g);
-    delete_obsolete_files(path, state);
+    delete_obsolete_files(path, state, &*opts.file_system);
     return;
   }
 
@@ -3155,7 +3119,7 @@ fn maybe_compact(
     }
   }
 
-  delete_obsolete_files(path, state);
+  delete_obsolete_files(path, state, &*opts.file_system);
 }
 
 // ── DeleteObsoleteFiles ───────────────────────────────────────────────────────
@@ -3201,10 +3165,10 @@ fn parse_db_filename(name: &str) -> Option<(u64, FileKind)> {
 ///
 /// Used by [`Db::repair`] to archive processed WAL files and corrupt SSTables
 /// so they are not re-processed on a subsequent repair attempt.
-fn archive_file(db_path: &std::path::Path, filename: &str) {
+fn archive_file(db_path: &std::path::Path, filename: &str, fs: &dyn crate::env::FileSystem) {
   let lost_dir = db_path.join("lost");
-  let _ = std::fs::create_dir_all(&lost_dir);
-  let _ = std::fs::rename(db_path.join(filename), lost_dir.join(filename));
+  let _ = fs.create_dir_all(&lost_dir);
+  let _ = fs.rename(&db_path.join(filename), &lost_dir.join(filename));
 }
 
 /// Delete database files that are no longer referenced by any live `Version`.
@@ -3216,7 +3180,11 @@ fn archive_file(db_path: &std::path::Path, filename: &str) {
 ///
 /// Errors (missing dir, unlink failures) are silently ignored — GC is
 /// best-effort and failure does not affect correctness.
-fn delete_obsolete_files(path: &std::path::Path, state: &Mutex<DbState>) {
+fn delete_obsolete_files(
+  path: &std::path::Path,
+  state: &Mutex<DbState>,
+  fs: &dyn crate::env::FileSystem,
+) {
   use std::collections::HashSet;
 
   // Step 1: snapshot live-file info under the lock, then release it.
@@ -3232,14 +3200,12 @@ fn delete_obsolete_files(path: &std::path::Path, state: &Mutex<DbState>) {
   };
 
   // Step 2: enumerate the directory and delete obsolete files.
-  let entries = match std::fs::read_dir(path) {
-    Ok(e) => e,
+  let names = match fs.children(path) {
+    Ok(n) => n,
     Err(_) => return,
   };
-  for entry in entries.flatten() {
-    let name = entry.file_name();
-    let name = name.to_string_lossy();
-    if let Some((number, kind)) = parse_db_filename(&name) {
+  for name in &names {
+    if let Some((number, kind)) = parse_db_filename(name) {
       let keep = match kind {
         FileKind::Log => number >= log_number,
         FileKind::Manifest => number >= manifest_number,
@@ -3248,7 +3214,7 @@ fn delete_obsolete_files(path: &std::path::Path, state: &Mutex<DbState>) {
       };
       if !keep {
         log::debug!("deleting obsolete file: {name}");
-        let _ = std::fs::remove_file(entry.path());
+        let _ = fs.remove_file(&path.join(name));
       }
     }
   }
