@@ -11,17 +11,16 @@
 //    limitations under the License.
 
 use crate::coding::{crc32c, crc32c_extend, mask_crc};
+use crate::env::WritableFile;
 use crate::error::Error;
 use crate::logfile::format::{RecordType, BLOCK_SIZE, HEADER_SIZE};
-use std::fs::File;
-use std::io::{BufWriter, Write};
 
-/// WAL log writer. Wraps a `BufWriter<File>` and fragments records into 32 KiB
+/// WAL log writer. Wraps a [`WritableFile`] and fragments records into 32 KiB
 /// blocks, each with a 7-byte header: `[crc32c: u32 LE][len: u16 LE][type: u8]`.
 ///
 /// See `db/log_writer.h/cc`.
 pub(crate) struct Writer {
-  dest: BufWriter<File>,
+  dest: Box<dyn WritableFile>,
   /// Byte offset within the current block (0 .. BLOCK_SIZE).
   block_offset: usize,
   /// Pre-computed CRC32c of each record-type byte (index = RecordType value).
@@ -30,18 +29,18 @@ pub(crate) struct Writer {
 }
 
 impl Writer {
-  /// Create a writer that appends to `file`.
+  /// Create a writer that appends to `dest`.
   ///
   /// `dest_length` is the current byte length of the file; it is used to
   /// resume appending to an existing log without re-reading it.  Pass `0`
   /// for a freshly created file.
-  pub(crate) fn new(file: File, dest_length: u64) -> Self {
+  pub(crate) fn new(dest: Box<dyn WritableFile>, dest_length: u64) -> Self {
     let mut type_crc = [0u32; RecordType::Last as usize + 1];
     for (i, slot) in type_crc.iter_mut().enumerate() {
       *slot = crc32c(&[i as u8]);
     }
     Self {
-      dest: BufWriter::new(file),
+      dest,
       block_offset: (dest_length % BLOCK_SIZE as u64) as usize,
       type_crc,
     }
@@ -60,7 +59,7 @@ impl Writer {
       // and switch to the next block.
       if leftover < HEADER_SIZE {
         if leftover > 0 {
-          self.dest.write_all(&[0u8; HEADER_SIZE - 1][..leftover])?;
+          self.dest.write(&[0u8; HEADER_SIZE - 1][..leftover])?;
         }
         self.block_offset = 0;
       }
@@ -90,7 +89,7 @@ impl Writer {
   /// `WriteOptions::sync` is set.
   pub(crate) fn sync(&mut self) -> Result<(), Error> {
     self.dest.flush()?;
-    self.dest.get_ref().sync_all().map_err(Error::from)
+    self.dest.sync()
   }
 
   /// Write one physical record (header + payload) to the underlying file and
@@ -109,8 +108,8 @@ impl Writer {
     header[5] = (length >> 8) as u8;
     header[6] = record_type as u8;
 
-    self.dest.write_all(&header)?;
-    self.dest.write_all(data)?;
+    self.dest.write(&header)?;
+    self.dest.write(data)?;
     self.dest.flush()?;
 
     self.block_offset += HEADER_SIZE + length;
@@ -128,12 +127,13 @@ mod tests {
   /// inspection.
   fn write_and_read(records: &[&[u8]]) -> Vec<u8> {
     let file = tempfile::tempfile().unwrap();
-    let mut writer = Writer::new(file.try_clone().unwrap(), 0);
+    let read_handle = file.try_clone().unwrap();
+    let mut writer = Writer::new(crate::env::writable_from_file(file), 0);
     for rec in records {
       writer.add_record(rec).unwrap();
     }
     drop(writer);
-    let mut f = file;
+    let mut f = read_handle;
     f.seek(SeekFrom::Start(0)).unwrap();
     let mut buf = Vec::new();
     f.read_to_end(&mut buf).unwrap();
@@ -219,17 +219,21 @@ mod tests {
   fn resume_existing_file() {
     // Write one record, then resume from the file's current length and write another.
     let file = tempfile::tempfile().unwrap();
+    let read_handle = file.try_clone().unwrap();
     let payload_a = b"first";
     {
-      let mut w = Writer::new(file.try_clone().unwrap(), 0);
+      let mut w = Writer::new(crate::env::writable_from_file(file.try_clone().unwrap()), 0);
       w.add_record(payload_a).unwrap();
     }
     let offset = (HEADER_SIZE + payload_a.len()) as u64;
     {
-      let mut w = Writer::new(file.try_clone().unwrap(), offset);
+      let mut w = Writer::new(
+        crate::env::writable_from_file(file.try_clone().unwrap()),
+        offset,
+      );
       w.add_record(b"second").unwrap();
     }
-    let mut f = file;
+    let mut f = read_handle;
     f.seek(SeekFrom::Start(0)).unwrap();
     let mut buf = Vec::new();
     f.read_to_end(&mut buf).unwrap();

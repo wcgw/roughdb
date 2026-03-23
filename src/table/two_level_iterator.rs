@@ -187,7 +187,7 @@ mod tests {
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let file = tmp.reopen().unwrap();
     let mut builder = TableBuilder::new(
-      file,
+      crate::env::writable_from_file(file),
       block_size,
       16,
       None,
@@ -212,7 +212,7 @@ mod tests {
   fn empty_table_not_valid() {
     let (tmp, size) = build_table(&[], 4096);
     let table = Table::open(
-      tmp.reopen().unwrap(),
+      crate::env::random_access_from_file(tmp.reopen().unwrap()),
       size,
       None,
       None,
@@ -229,7 +229,7 @@ mod tests {
     let pairs: &[(&[u8], &[u8])] = &[(b"a", b"1"), (b"b", b"2"), (b"c", b"3")];
     let (tmp, size) = build_table(pairs, 4096);
     let table = Table::open(
-      tmp.reopen().unwrap(),
+      crate::env::random_access_from_file(tmp.reopen().unwrap()),
       size,
       None,
       None,
@@ -252,7 +252,7 @@ mod tests {
     let pairs: &[(&[u8], &[u8])] = &[(b"a", b"1"), (b"b", b"2"), (b"c", b"3")];
     let (tmp, size) = build_table(pairs, 4096);
     let table = Table::open(
-      tmp.reopen().unwrap(),
+      crate::env::random_access_from_file(tmp.reopen().unwrap()),
       size,
       None,
       None,
@@ -273,7 +273,7 @@ mod tests {
     let pairs: &[(&[u8], &[u8])] = &[(b"a", b"1"), (b"b", b"2")];
     let (tmp, size) = build_table(pairs, 4096);
     let table = Table::open(
-      tmp.reopen().unwrap(),
+      crate::env::random_access_from_file(tmp.reopen().unwrap()),
       size,
       None,
       None,
@@ -300,7 +300,7 @@ mod tests {
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let file = tmp.reopen().unwrap();
     let mut builder = TableBuilder::new(
-      file,
+      crate::env::writable_from_file(file),
       64,
       4,
       None,
@@ -313,7 +313,7 @@ mod tests {
     }
     let size = builder.finish().unwrap();
     let table = Table::open(
-      tmp.reopen().unwrap(),
+      crate::env::random_access_from_file(tmp.reopen().unwrap()),
       size,
       None,
       None,
@@ -344,7 +344,7 @@ mod tests {
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let file = tmp.reopen().unwrap();
     let mut builder = TableBuilder::new(
-      file,
+      crate::env::writable_from_file(file),
       64,
       4,
       None,
@@ -357,7 +357,7 @@ mod tests {
     }
     let size = builder.finish().unwrap();
     let table = Table::open(
-      tmp.reopen().unwrap(),
+      crate::env::random_access_from_file(tmp.reopen().unwrap()),
       size,
       None,
       None,

@@ -138,6 +138,15 @@ pub struct Options {
   ///
   /// Default: [`BytewiseComparator`](crate::BytewiseComparator) (lexicographic byte order).
   pub comparator: std::sync::Arc<dyn crate::comparator::Comparator>,
+
+  // ── Filesystem ────────────────────────────────────────────────────────
+  /// Pluggable filesystem backend for all database I/O.
+  ///
+  /// Custom implementations enable in-memory filesystems (for testing), encrypted storage,
+  /// cloud backends, or async I/O — without touching core database logic.
+  ///
+  /// Default: [`PosixFileSystem`](crate::PosixFileSystem) (local filesystem via `std::fs`).
+  pub file_system: std::sync::Arc<dyn crate::env::FileSystem>,
 }
 
 impl Default for Options {
@@ -158,6 +167,7 @@ impl Default for Options {
         crate::cache::DEFAULT_BLOCK_CACHE_CAPACITY,
       ))),
       comparator: std::sync::Arc::new(crate::comparator::BytewiseComparator),
+      file_system: std::sync::Arc::new(crate::env::PosixFileSystem),
     }
   }
 }
@@ -184,6 +194,7 @@ impl std::fmt::Debug for Options {
         &self.block_cache.as_ref().map(|_| "<BlockCache>"),
       )
       .field("comparator", &self.comparator.name())
+      .field("file_system", &"<FileSystem>")
       .finish()
   }
 }

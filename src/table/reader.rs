@@ -12,15 +12,14 @@
 
 use crate::cache::BlockCache;
 use crate::comparator::Comparator;
+use crate::env::RandomAccessFile;
 use crate::error::Error;
 use crate::filter::FilterPolicy;
 use crate::iter::InternalIterator;
 use crate::table::block::Block;
 use crate::table::filter_block::FilterBlockReader;
-use crate::table::format::{read_block, BlockHandle, Footer, FOOTER_ENCODED_LENGTH};
+use crate::table::format::{read_block, read_exact_at, BlockHandle, Footer, FOOTER_ENCODED_LENGTH};
 use crate::table::two_level_iterator::TwoLevelIterator;
-use std::fs::File;
-use std::os::unix::fs::FileExt;
 use std::sync::Arc;
 
 /// Three-way result of a `Table::get` lookup.
@@ -45,7 +44,7 @@ pub(crate) enum LookupResult {
 /// locate data blocks, reading them from disk via `pread` (no seeking —
 /// takes `&self`).  See `table/table.h/cc`.
 pub(crate) struct Table {
-  file: File,
+  file: Arc<dyn RandomAccessFile>,
   index_block: Block,
   /// Offset of the metaindex block within the file.  Used as the "end of data
   /// blocks" sentinel in `approximate_offset_of` — the same heuristic that
@@ -69,7 +68,7 @@ impl Table {
   /// `filter_policy` is `Some` and the metaindex contains a matching filter
   /// block) the filter block into memory.
   pub(crate) fn open(
-    file: File,
+    file: Arc<dyn RandomAccessFile>,
     file_size: u64,
     filter_policy: Option<Arc<dyn FilterPolicy>>,
     block_cache: Option<Arc<BlockCache>>,
@@ -82,16 +81,16 @@ impl Table {
     // Read and decode the footer.
     let footer_offset = file_size - FOOTER_ENCODED_LENGTH as u64;
     let mut footer_buf = [0u8; FOOTER_ENCODED_LENGTH];
-    file.read_exact_at(&mut footer_buf, footer_offset)?;
+    read_exact_at(file.as_ref(), &mut footer_buf, footer_offset)?;
     let footer = Footer::decode(&footer_buf)?;
 
     // Read the index block.
-    let index_contents = read_block(&file, &footer.index_handle, false)?;
+    let index_contents = read_block(file.as_ref(), &footer.index_handle, false)?;
     let index_block = Block::new(index_contents.data, Arc::clone(&comparator));
 
     // Optionally read the filter block from the metaindex.
     let filter = filter_policy.and_then(|policy| {
-      read_filter_block(&file, &footer.metaindex_handle, policy)
+      read_filter_block(file.as_ref(), &footer.metaindex_handle, policy)
         .ok()
         .flatten()
     });
@@ -129,7 +128,7 @@ impl Table {
     }
 
     // Cache miss (or no cache): read from disk.
-    let contents = read_block(&self.file, handle, verify)?;
+    let contents = read_block(self.file.as_ref(), handle, verify)?;
     let block = Block::new(contents.data, Arc::clone(&self.comparator));
 
     // Insert into the cache unless the caller asked us not to (e.g. bulk scan).
@@ -243,7 +242,7 @@ impl Table {
     fill_cache: bool,
   ) -> Result<TwoLevelIterator, Error> {
     use crate::table::two_level_iterator::BlockFn;
-    let file = self.file.try_clone()?;
+    let file = Arc::clone(&self.file);
     let block_cache = self.block_cache.clone();
     let cache_id = self.cache_id;
     let comparator = Arc::clone(&self.comparator);
@@ -259,7 +258,7 @@ impl Table {
       }
 
       // Read from disk.
-      let contents = read_block(&file, &handle, verify_checksums)?;
+      let contents = read_block(file.as_ref(), &handle, verify_checksums)?;
       let block = Block::new(contents.data, Arc::clone(&comparator));
 
       if fill_cache {
@@ -286,7 +285,7 @@ impl Table {
     idx.seek_to_first();
     while idx.valid() {
       let (handle, _) = BlockHandle::decode_from(idx.value())?;
-      let contents = read_block(&self.file, &handle, false)?;
+      let contents = read_block(self.file.as_ref(), &handle, false)?;
       let data_block = Block::new(contents.data, Arc::clone(&self.comparator));
       let mut it = data_block.iter();
       it.seek_to_first();
@@ -311,7 +310,7 @@ impl Table {
 /// Returns `Ok(None)` (rather than an error) on soft failures such as a
 /// truncated or unrecognised metaindex — reading filter blocks is best-effort.
 fn read_filter_block(
-  file: &File,
+  file: &dyn RandomAccessFile,
   metaindex_handle: &BlockHandle,
   policy: Arc<dyn FilterPolicy>,
 ) -> Result<Option<FilterBlockReader>, Error> {
@@ -355,7 +354,7 @@ mod tests {
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let file = tmp.reopen().unwrap();
     let mut b = TableBuilder::new(
-      file,
+      crate::env::writable_from_file(file),
       4096,
       16,
       None,
@@ -374,7 +373,7 @@ mod tests {
   fn open_and_get_user_key() {
     let (tmp, size) = write_table_internal(&[(b"hello", 1, 1, b"world")]);
     let table = Table::open(
-      tmp.reopen().unwrap(),
+      crate::env::random_access_from_file(tmp.reopen().unwrap()),
       size,
       None,
       None,
@@ -390,7 +389,7 @@ mod tests {
   fn get_missing_key() {
     let (tmp, size) = write_table_internal(&[(b"a", 1, 1, b"1")]);
     let table = Table::open(
-      tmp.reopen().unwrap(),
+      crate::env::random_access_from_file(tmp.reopen().unwrap()),
       size,
       None,
       None,
@@ -408,7 +407,7 @@ mod tests {
     // vtype=0 is a deletion tombstone — must return Deleted, not NotInTable.
     let (tmp, size) = write_table_internal(&[(b"gone", 1, 0, b"")]);
     let table = Table::open(
-      tmp.reopen().unwrap(),
+      crate::env::random_access_from_file(tmp.reopen().unwrap()),
       size,
       None,
       None,
@@ -425,7 +424,7 @@ mod tests {
   fn get_newest_version_wins() {
     let (tmp, size) = write_table_internal(&[(b"key", 10, 1, b"new"), (b"key", 5, 1, b"old")]);
     let table = Table::open(
-      tmp.reopen().unwrap(),
+      crate::env::random_access_from_file(tmp.reopen().unwrap()),
       size,
       None,
       None,
@@ -442,7 +441,7 @@ mod tests {
     // Two versions of "key": seq=10 ("new") and seq=5 ("old").
     let (tmp, size) = write_table_internal(&[(b"key", 10, 1, b"new"), (b"key", 5, 1, b"old")]);
     let table = Table::open(
-      tmp.reopen().unwrap(),
+      crate::env::random_access_from_file(tmp.reopen().unwrap()),
       size,
       None,
       None,
@@ -468,7 +467,7 @@ mod tests {
   fn verify_checksums_passes_on_valid_block() {
     let (tmp, size) = write_table_internal(&[(b"k", 1, 1, b"v")]);
     let table = Table::open(
-      tmp.reopen().unwrap(),
+      crate::env::random_access_from_file(tmp.reopen().unwrap()),
       size,
       None,
       None,
@@ -487,7 +486,7 @@ mod tests {
     std::io::Write::write_all(&mut tmp.reopen().unwrap(), &[0u8; 10]).unwrap();
     assert!(matches!(
       Table::open(
-        tmp.reopen().unwrap(),
+        crate::env::random_access_from_file(tmp.reopen().unwrap()),
         10,
         None,
         None,

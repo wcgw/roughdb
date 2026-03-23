@@ -17,7 +17,6 @@ use crate::error::Error;
 use crate::logfile::reader::Reader as LogReader;
 use crate::logfile::writer::Writer as LogWriter;
 use std::collections::{HashMap, HashSet};
-use std::fs::{File, OpenOptions};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -27,14 +26,17 @@ pub(crate) fn manifest_filename(number: u64) -> String {
   format!("MANIFEST-{number:06}")
 }
 
-pub(crate) fn write_current_file(path: &Path, manifest_number: u64) -> Result<(), Error> {
+pub(crate) fn write_current_file(
+  path: &Path,
+  manifest_number: u64,
+  fs: &dyn crate::env::FileSystem,
+) -> Result<(), Error> {
   let content = format!("{}\n", manifest_filename(manifest_number));
-  std::fs::write(path.join("CURRENT"), content)?;
-  Ok(())
+  fs.write_string_to_file(&path.join("CURRENT"), &content)
 }
 
-fn read_current_file(path: &Path) -> Result<String, Error> {
-  let content = std::fs::read_to_string(path.join("CURRENT"))?;
+fn read_current_file(path: &Path, fs: &dyn crate::env::FileSystem) -> Result<String, Error> {
+  let content = fs.read_string_from_file(&path.join("CURRENT"))?;
   let trimmed = content.trim_end_matches('\n');
   if trimmed.is_empty() {
     return Err(Error::Corruption("CURRENT file is empty".to_owned()));
@@ -76,11 +78,12 @@ impl VersionSet {
   pub(crate) fn create(
     path: &Path,
     comparator: &dyn crate::comparator::Comparator,
+    fs: &dyn crate::env::FileSystem,
   ) -> Result<Self, Error> {
     let manifest_number = 2u64;
     let manifest_path = path.join(manifest_filename(manifest_number));
 
-    let file = File::create(&manifest_path)?;
+    let file = fs.create_writable(&manifest_path)?;
     let mut manifest_log = LogWriter::new(file, 0);
 
     // Write the initial VersionEdit so recovery always finds a valid sequence.
@@ -91,7 +94,7 @@ impl VersionSet {
     edit.log_number = Some(1);
     manifest_log.add_record(&edit.encode())?;
 
-    write_current_file(path, manifest_number)?;
+    write_current_file(path, manifest_number, fs)?;
 
     Ok(VersionSet {
       current: Arc::new(Version::new()),
@@ -114,15 +117,16 @@ impl VersionSet {
     path: &Path,
     paranoid_checks: bool,
     comparator: &dyn crate::comparator::Comparator,
+    fs: &dyn crate::env::FileSystem,
   ) -> Result<Self, Error> {
-    let manifest_name = read_current_file(path)?;
+    let manifest_name = read_current_file(path, fs)?;
     let manifest_path = path.join(&manifest_name);
 
     // Extract file number from the manifest name ("MANIFEST-000002" → 2).
     let manifest_number = parse_manifest_number(&manifest_name)?;
 
     // Replay all VersionEdits from the MANIFEST.
-    let manifest_file_for_read = File::open(&manifest_path)?;
+    let manifest_file_for_read = fs.open_sequential(&manifest_path)?;
     let mut reader = LogReader::new(manifest_file_for_read, None, paranoid_checks, 0);
 
     let mut builder = Builder::new();
@@ -158,8 +162,8 @@ impl VersionSet {
     crate::db::version::finalize(&mut files, 4); // 4 = L0_COMPACTION_TRIGGER
 
     // Re-open the MANIFEST for appending (continue after the last record).
-    let manifest_file_for_write = OpenOptions::new().append(true).open(&manifest_path)?;
-    let manifest_len = manifest_file_for_write.metadata()?.len();
+    let manifest_len = fs.file_size(&manifest_path)?;
+    let manifest_file_for_write = fs.open_appendable(&manifest_path)?;
     let manifest_log = LogWriter::new(manifest_file_for_write, manifest_len);
 
     Ok(VersionSet {
@@ -410,6 +414,7 @@ mod tests {
       None,
       None,
       std::sync::Arc::new(crate::comparator::BytewiseComparator),
+      std::sync::Arc::new(crate::env::PosixFileSystem),
     )
   }
 
@@ -423,7 +428,7 @@ mod tests {
       .unwrap();
     let opts = Options::default();
     let mut builder = TableBuilder::new(
-      file,
+      crate::env::writable_from_file(file),
       opts.block_size,
       opts.block_restart_interval,
       opts.filter_policy.clone(),
@@ -440,7 +445,12 @@ mod tests {
   #[test]
   fn create_writes_current_file() {
     let dir = tempfile::tempdir().unwrap();
-    VersionSet::create(dir.path(), &crate::comparator::BytewiseComparator).unwrap();
+    VersionSet::create(
+      dir.path(),
+      &crate::comparator::BytewiseComparator,
+      &crate::env::PosixFileSystem,
+    )
+    .unwrap();
 
     let content = std::fs::read_to_string(dir.path().join("CURRENT")).unwrap();
     assert_eq!(content, "MANIFEST-000002\n");
@@ -450,7 +460,12 @@ mod tests {
   #[test]
   fn log_and_apply_persists() {
     let dir = tempfile::tempdir().unwrap();
-    let mut vs = VersionSet::create(dir.path(), &crate::comparator::BytewiseComparator).unwrap();
+    let mut vs = VersionSet::create(
+      dir.path(),
+      &crate::comparator::BytewiseComparator,
+      &crate::env::PosixFileSystem,
+    )
+    .unwrap();
     let tc = make_tc(dir.path());
 
     // Simulate flushing file 3.
@@ -467,8 +482,13 @@ mod tests {
 
     // Drop and recover — the file must still appear.
     drop(vs);
-    let vs2 =
-      VersionSet::recover(dir.path(), false, &crate::comparator::BytewiseComparator).unwrap();
+    let vs2 = VersionSet::recover(
+      dir.path(),
+      false,
+      &crate::comparator::BytewiseComparator,
+      &crate::env::PosixFileSystem,
+    )
+    .unwrap();
     let cur2 = vs2.current();
     assert_eq!(cur2.files[0].len(), 1);
     assert_eq!(cur2.files[0][0].number, 3);
@@ -477,7 +497,12 @@ mod tests {
   #[test]
   fn recover_reopens_tables() {
     let dir = tempfile::tempdir().unwrap();
-    let mut vs = VersionSet::create(dir.path(), &crate::comparator::BytewiseComparator).unwrap();
+    let mut vs = VersionSet::create(
+      dir.path(),
+      &crate::comparator::BytewiseComparator,
+      &crate::env::PosixFileSystem,
+    )
+    .unwrap();
     let tc = make_tc(dir.path());
 
     let (fnum, fsize) = write_sst(dir.path(), 3, &[(b"key", 1, 1, b"val")]);
@@ -487,8 +512,13 @@ mod tests {
     vs.log_and_apply(&mut edit, &tc).unwrap();
     drop(vs);
 
-    let vs2 =
-      VersionSet::recover(dir.path(), false, &crate::comparator::BytewiseComparator).unwrap();
+    let vs2 = VersionSet::recover(
+      dir.path(),
+      false,
+      &crate::comparator::BytewiseComparator,
+      &crate::env::PosixFileSystem,
+    )
+    .unwrap();
     let tc2 = make_tc(dir.path());
     let cur = vs2.current();
     use crate::table::reader::LookupResult;
@@ -501,7 +531,12 @@ mod tests {
   #[test]
   fn sequence_survives_reopen() {
     let dir = tempfile::tempdir().unwrap();
-    let mut vs = VersionSet::create(dir.path(), &crate::comparator::BytewiseComparator).unwrap();
+    let mut vs = VersionSet::create(
+      dir.path(),
+      &crate::comparator::BytewiseComparator,
+      &crate::env::PosixFileSystem,
+    )
+    .unwrap();
     let tc = make_tc(dir.path());
 
     vs.set_last_sequence(42);
@@ -510,8 +545,13 @@ mod tests {
     vs.log_and_apply(&mut edit, &tc).unwrap();
     drop(vs);
 
-    let vs2 =
-      VersionSet::recover(dir.path(), false, &crate::comparator::BytewiseComparator).unwrap();
+    let vs2 = VersionSet::recover(
+      dir.path(),
+      false,
+      &crate::comparator::BytewiseComparator,
+      &crate::env::PosixFileSystem,
+    )
+    .unwrap();
     assert_eq!(vs2.last_sequence(), 42);
   }
 }

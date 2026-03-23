@@ -102,10 +102,10 @@ Features are listed in dependency order. Each phase must be complete before the 
 - [x] **Format** (`src/logfile/format.rs`): 32 KB blocks. Record header: `[crc32c: u32 LE][len: u16 LE][type: u8]` (7
   bytes). Fragment types: `Zero=0` (pad), `Full=1`, `First=2`, `Middle=3`, `Last=4`. Constants: `BLOCK_SIZE = 32768`,
   `HEADER_SIZE = 7`. See `db/log_format.h`.
-- [x] **`logfile::Writer`** (`src/logfile/writer.rs`): Wraps `BufWriter<File>` directly — no `Env` abstraction yet (deferred to
-  Phase 9). `add_record(&[u8])` fragments the payload across block boundaries; pads trailing fewer-than-7-byte remnants
-  with zeros; pre-computes per-type CRCs on construction. Constructor: `new(file: File, dest_length: u64)` where
-  `dest_length` allows resuming an existing file. See `db/log_writer.h/cc`.
+- [x] **`logfile::Writer`** (`src/logfile/writer.rs`): Wraps a `Box<dyn WritableFile>` (pluggable via `FileSystem` trait).
+  `add_record(&[u8])` fragments the payload across block boundaries; pads trailing fewer-than-7-byte remnants
+  with zeros; pre-computes per-type CRCs on construction. Constructor: `new(dest: Box<dyn WritableFile>, dest_length: u64)`
+  where `dest_length` allows resuming an existing file. See `db/log_writer.h/cc`.
 - [x] **`logfile::Reader`** (`src/logfile/reader.rs`): Wraps `File`. `read_record() -> Option<Vec<u8>>` reassembles
   multi-fragment records into a scratch buffer. Optional CRC verification (`checksum: bool`). Reports corruption via a
   `Reporter` trait (one method: `corruption(bytes: u64, reason: &str)`). Resynchronisation: when `initial_offset > 0`,
@@ -366,6 +366,12 @@ what remains is compaction, the full Iterator/Snapshot API, and operational hygi
   `find_shortest_separator`/`find_short_successor`), `VersionSet` file sorting, and all `lib.rs` compaction/overlap
   helpers. `VersionEdit` encodes/decodes the comparator name; `VersionSet::recover` rejects mismatches.
   See `include/leveldb/comparator.h`.
+- ✅ **`FileSystem` abstraction**: `FileSystem` trait (`src/env.rs`) with `SequentialFile`, `RandomAccessFile`,
+  `WritableFile`, and `FileLock` sub-traits. `PosixFileSystem` is the default (POSIX `std::fs` + `libc::flock`).
+  `Options::file_system: Arc<dyn FileSystem>` threaded through all I/O: `LogWriter`, `LogReader`, `Table`,
+  `TableBuilder`, `TableCache`, `VersionSet`, and all `lib.rs` functions (flush, compaction, repair, destroy, GC).
+  `libc` usage isolated to `PosixFileSystem`. Enables in-memory, encrypted, or cloud storage backends.
+  See `include/rocksdb/file_system.h`.
 - ✅ **`Db::repair(path, options)`**: Scans the database directory for surviving `.ldb` and `.log` files, converts WALs
   to SSTables via `LogReader` → `Memtable` → `TableBuilder`, extracts metadata from all SSTables, writes a fresh
   `MANIFEST-000001` placing all files at L0, and writes `CURRENT`.  Corrupt records/files are skipped and archived to

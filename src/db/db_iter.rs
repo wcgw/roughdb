@@ -395,7 +395,7 @@ mod tests {
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let file = tmp.reopen().unwrap();
     let mut builder = TableBuilder::new(
-      file,
+      crate::env::writable_from_file(file),
       4096,
       16,
       None,
@@ -407,7 +407,14 @@ mod tests {
       builder.add(&ikey, v).unwrap();
     }
     let size = builder.finish().unwrap();
-    let table = Table::open(tmp.reopen().unwrap(), size, None, None, bytewise_cmp()).unwrap();
+    let table = Table::open(
+      crate::env::random_access_from_file(tmp.reopen().unwrap()),
+      size,
+      None,
+      None,
+      bytewise_cmp(),
+    )
+    .unwrap();
     Box::new(table.new_iterator(false, true).unwrap())
   }
 

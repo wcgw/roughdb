@@ -11,9 +11,8 @@
 //    limitations under the License.
 
 use crate::coding::{crc32c, crc32c_extend, unmask_crc};
+use crate::env::SequentialFile;
 use crate::logfile::format::{RecordType, BLOCK_SIZE, HEADER_SIZE};
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
 
 /// Receives corruption notifications from the [`Reader`].
 ///
@@ -22,12 +21,12 @@ pub(crate) trait Reporter {
   fn corruption(&mut self, bytes: u64, reason: &str);
 }
 
-/// WAL log reader. Reads sequentially from a `File`, reassembling fragmented
-/// records and optionally verifying CRC32c checksums.
+/// WAL log reader. Reads sequentially from a [`SequentialFile`], reassembling
+/// fragmented records and optionally verifying CRC32c checksums.
 ///
 /// See `db/log_reader.h/cc`.
 pub(crate) struct Reader {
-  file: File,
+  file: Box<dyn SequentialFile>,
   reporter: Option<Box<dyn Reporter>>,
   checksum: bool,
   /// Raw block buffer; data is valid in `backing[buf_start..buf_end]`.
@@ -65,7 +64,7 @@ impl Reader {
   /// - `initial_offset`: skip all records whose physical start is before this
   ///   file offset.  Pass `0` to read from the beginning.
   pub(crate) fn new(
-    file: File,
+    file: Box<dyn SequentialFile>,
     reporter: Option<Box<dyn Reporter>>,
     checksum: bool,
     initial_offset: u64,
@@ -196,8 +195,8 @@ impl Reader {
     }
     self.end_of_buffer_offset = block_start;
     if block_start > 0 {
-      if let Err(e) = self.file.seek(SeekFrom::Start(block_start)) {
-        self.report_corruption(block_start, &format!("initial seek failed: {e}"));
+      if let Err(e) = self.file.skip(block_start) {
+        self.report_corruption(block_start, &format!("initial skip failed: {e}"));
         return false;
       }
     }
@@ -356,10 +355,11 @@ mod tests {
     }
   }
 
-  /// Write `records` to a temp file and return the file rewound to the start.
-  fn write_records(records: &[&[u8]]) -> File {
+  /// Write `records` to a temp file and return a raw `std::fs::File` handle
+  /// rewound to the start (for corruption tests that need seek/write).
+  fn write_records(records: &[&[u8]]) -> std::fs::File {
     let file = tempfile::tempfile().unwrap();
-    let mut writer = Writer::new(file.try_clone().unwrap(), 0);
+    let mut writer = Writer::new(crate::env::writable_from_file(file.try_clone().unwrap()), 0);
     for r in records {
       writer.add_record(r).unwrap();
     }
@@ -369,18 +369,28 @@ mod tests {
     f
   }
 
-  fn make_reader(file: File, checksum: bool, initial_offset: u64) -> Reader {
-    Reader::new(file, None, checksum, initial_offset)
+  fn make_reader(file: std::fs::File, checksum: bool, initial_offset: u64) -> Reader {
+    Reader::new(
+      crate::env::sequential_from_file(file),
+      None,
+      checksum,
+      initial_offset,
+    )
   }
 
   fn make_reader_with_reporter(
-    file: File,
+    file: std::fs::File,
     checksum: bool,
     initial_offset: u64,
   ) -> (Reader, *mut CorruptionLog) {
     let log = Box::new(CorruptionLog(Vec::new()));
     let ptr = Box::as_ref(&log) as *const _ as *mut CorruptionLog;
-    let reader = Reader::new(file, Some(log), checksum, initial_offset);
+    let reader = Reader::new(
+      crate::env::sequential_from_file(file),
+      Some(log),
+      checksum,
+      initial_offset,
+    );
     (reader, ptr)
   }
 
@@ -426,7 +436,7 @@ mod tests {
     // `length` field itself may be corrupted, making any further parsing unsafe).
     let file = tempfile::tempfile().unwrap();
     {
-      let mut w = Writer::new(file.try_clone().unwrap(), 0);
+      let mut w = Writer::new(crate::env::writable_from_file(file.try_clone().unwrap()), 0);
       w.add_record(b"good").unwrap();
       w.add_record(b"corrupted").unwrap();
     }
@@ -453,7 +463,7 @@ mod tests {
   fn no_checksum_no_report_on_corrupt_data() {
     let file = tempfile::tempfile().unwrap();
     {
-      let mut w = Writer::new(file.try_clone().unwrap(), 0);
+      let mut w = Writer::new(crate::env::writable_from_file(file.try_clone().unwrap()), 0);
       w.add_record(b"data").unwrap();
     }
     // Corrupt the payload.
@@ -475,7 +485,7 @@ mod tests {
   fn torn_write_at_eof_returns_none() {
     let file = tempfile::tempfile().unwrap();
     {
-      let mut w = Writer::new(file.try_clone().unwrap(), 0);
+      let mut w = Writer::new(crate::env::writable_from_file(file.try_clone().unwrap()), 0);
       w.add_record(b"complete").unwrap();
     }
     // Append a truncated header (< 7 bytes) to simulate a torn write.

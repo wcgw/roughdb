@@ -181,10 +181,9 @@ RoughDB is in active development. The on-disk format is LevelDB-compatible.
 - **Iterator-based seek sampling** (`RecordReadSample`) is not implemented. Seek-based compaction
   is triggered by point-lookup misses via `Db::get` but not by iterator scans.
 
-**Not yet implemented:**
-
-- **`Env` abstraction** — file I/O is hardcoded to the local POSIX filesystem. There is no way to
-  inject a custom storage backend (in-memory, encrypted, cloud, etc.).
+- Pluggable `FileSystem` trait (`Options::file_system`) — all database I/O goes through trait
+  objects; `PosixFileSystem` is the default. Enables in-memory, encrypted, or cloud backends
+  without touching core logic
 
 ## License
 
