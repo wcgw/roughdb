@@ -336,6 +336,20 @@ pub fn random_access_from_file(file: std::fs::File) -> Arc<dyn RandomAccessFile>
   Arc::new(PosixRandomAccessFile { inner: file })
 }
 
+#[cfg(test)]
+impl WritableFile for Vec<u8> {
+  fn write(&mut self, data: &[u8]) -> Result<(), crate::Error> {
+    self.extend_from_slice(data);
+    Ok(())
+  }
+  fn flush(&mut self) -> Result<(), crate::Error> {
+    Ok(())
+  }
+  fn sync(&mut self) -> Result<(), crate::Error> {
+    Ok(())
+  }
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

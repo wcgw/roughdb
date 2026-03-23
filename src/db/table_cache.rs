@@ -174,7 +174,7 @@ mod tests {
     let path = dir.join(format!("{number:06}.ldb"));
     let file = File::create(&path).unwrap();
     let mut b = TableBuilder::new(
-      file,
+      crate::env::writable_from_file(file),
       4096,
       16,
       None,

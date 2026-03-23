@@ -395,7 +395,7 @@ mod tests {
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let file = tmp.reopen().unwrap();
     let mut builder = TableBuilder::new(
-      file,
+      crate::env::writable_from_file(file),
       4096,
       16,
       None,

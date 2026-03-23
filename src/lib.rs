@@ -1542,7 +1542,7 @@ impl Db {
         let sst_path = path.join(format!("{sst_number:06}.ldb"));
         let sst_file = std::fs::File::create(&sst_path)?;
         let mut builder = TableBuilder::new(
-          sst_file,
+          crate::env::writable_from_file(sst_file),
           options.block_size,
           options.block_restart_interval,
           options.filter_policy.clone(),
@@ -1929,7 +1929,7 @@ fn write_flush(prep: FlushPrep, opts: &Options) -> Result<FlushResult, Error> {
     .create_new(true)
     .open(&sst_path)?;
   let mut builder = TableBuilder::new(
-    file,
+    crate::env::writable_from_file(file),
     opts.block_size,
     opts.block_restart_interval,
     opts.filter_policy.clone(),
@@ -2769,7 +2769,7 @@ fn do_compaction(
           .create_new(true)
           .open(&sst_path)?;
         let builder = TableBuilder::new(
-          file,
+          crate::env::writable_from_file(file),
           opts.block_size,
           opts.block_restart_interval,
           opts.filter_policy.clone(),

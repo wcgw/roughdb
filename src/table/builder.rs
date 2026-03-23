@@ -10,14 +10,13 @@
 //    See the License for the specific language governing permissions and
 //    limitations under the License.
 
+use crate::env::WritableFile;
 use crate::error::Error;
 use crate::filter::FilterPolicy;
 use crate::options::CompressionType;
 use crate::table::block_builder::BlockBuilder;
 use crate::table::filter_block::FilterBlockWriter;
 use crate::table::format::{write_raw_block, BlockHandle, Footer, FOOTER_ENCODED_LENGTH};
-use std::fs::File;
-use std::io::{BufWriter, Write};
 use std::sync::Arc;
 
 /// Builds an SSTable file from sorted key-value pairs.
@@ -29,7 +28,7 @@ use std::sync::Arc;
 ///
 /// See `include/leveldb/table_builder.h` and `table/table_builder.cc`.
 pub(crate) struct TableBuilder {
-  dest: BufWriter<File>,
+  dest: Box<dyn WritableFile>,
   data_block: BlockBuilder,
   index_block: BlockBuilder,
   /// Offset of the next byte to be written (= current file size).
@@ -59,7 +58,7 @@ impl TableBuilder {
   /// - `compression`: algorithm applied to data blocks; use `CompressionType::Zstd(level)` to
   ///   enable Zstd at a specific level.
   pub(crate) fn new(
-    file: File,
+    dest: Box<dyn WritableFile>,
     block_size: usize,
     restart_interval: usize,
     filter_policy: Option<Arc<dyn FilterPolicy>>,
@@ -74,7 +73,7 @@ impl TableBuilder {
       None => (None, None),
     };
     Self {
-      dest: BufWriter::new(file),
+      dest,
       // Data blocks use the configured restart interval.
       data_block: BlockBuilder::new(restart_interval),
       // Index block uses interval=1 so every key is a restart point (easy binary search).
@@ -161,7 +160,7 @@ impl TableBuilder {
       // Finalise and write the filter block (always uncompressed — LevelDB does not compress it).
       let filter_data = fw.finish();
       let filter_handle = write_raw_block(
-        &mut self.dest,
+        &mut *self.dest,
         &filter_data,
         self.offset,
         CompressionType::NoCompression,
@@ -175,7 +174,7 @@ impl TableBuilder {
       meta.add(filter_key.as_bytes(), &handle_enc[..n]);
       let meta_data = meta.finish().to_vec();
       let mh = write_raw_block(
-        &mut self.dest,
+        &mut *self.dest,
         &meta_data,
         self.offset,
         CompressionType::NoCompression,
@@ -187,7 +186,7 @@ impl TableBuilder {
       let mut empty_meta = BlockBuilder::new(1);
       let meta_data = empty_meta.finish().to_vec();
       let mh = write_raw_block(
-        &mut self.dest,
+        &mut *self.dest,
         &meta_data,
         self.offset,
         CompressionType::NoCompression,
@@ -199,7 +198,7 @@ impl TableBuilder {
     // Write index block (uncompressed — LevelDB does not compress index/meta blocks).
     let index_data = self.index_block.finish().to_vec();
     let index_handle = write_raw_block(
-      &mut self.dest,
+      &mut *self.dest,
       &index_data,
       self.offset,
       CompressionType::NoCompression,
@@ -212,7 +211,7 @@ impl TableBuilder {
       index_handle,
     };
     let footer_bytes = footer.encode();
-    self.dest.write_all(&footer_bytes)?;
+    self.dest.write(&footer_bytes)?;
     self.offset += FOOTER_ENCODED_LENGTH as u64;
 
     self.dest.flush()?;
@@ -244,7 +243,7 @@ impl TableBuilder {
   fn flush_data_block(&mut self) -> Result<(), Error> {
     debug_assert!(!self.data_block.is_empty());
     let block_data = self.data_block.finish().to_vec();
-    let handle = write_raw_block(&mut self.dest, &block_data, self.offset, self.compression)?;
+    let handle = write_raw_block(&mut *self.dest, &block_data, self.offset, self.compression)?;
     self.offset += handle.size + 5; // data bytes + 5-byte trailer
     self.data_block.reset();
     self.pending_handle = Some(handle);
@@ -270,7 +269,7 @@ mod tests {
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let file = tmp.reopen().unwrap();
     let mut builder = TableBuilder::new(
-      file,
+      crate::env::writable_from_file(file),
       4096,
       16,
       None,
@@ -290,7 +289,7 @@ mod tests {
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let file = tmp.reopen().unwrap();
     let builder = TableBuilder::new(
-      file,
+      crate::env::writable_from_file(file),
       4096,
       16,
       None,
@@ -357,7 +356,7 @@ mod tests {
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let file = tmp.reopen().unwrap();
     let mut builder = TableBuilder::new(
-      file,
+      crate::env::writable_from_file(file),
       64,
       4,
       None,
@@ -392,7 +391,7 @@ mod tests {
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let file = tmp.reopen().unwrap();
     let mut builder = TableBuilder::new(
-      file,
+      crate::env::writable_from_file(file),
       4096,
       16,
       None,

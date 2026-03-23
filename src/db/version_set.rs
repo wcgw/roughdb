@@ -426,7 +426,7 @@ mod tests {
       .unwrap();
     let opts = Options::default();
     let mut builder = TableBuilder::new(
-      file,
+      crate::env::writable_from_file(file),
       opts.block_size,
       opts.block_restart_interval,
       opts.filter_policy.clone(),

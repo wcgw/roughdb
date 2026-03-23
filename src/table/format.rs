@@ -251,7 +251,7 @@ pub(crate) fn read_block(
 ///
 /// The trailer is `[type: u8][masked_crc: u32 LE]`.
 pub(crate) fn write_raw_block(
-  dest: &mut impl std::io::Write,
+  dest: &mut dyn crate::env::WritableFile,
   data: &[u8],
   offset: u64,
   compression: CompressionType,
@@ -290,8 +290,8 @@ pub(crate) fn write_raw_block(
   let mut trailer = [0u8; BLOCK_TRAILER_SIZE];
   trailer[0] = compression_type_byte;
   trailer[1..].copy_from_slice(&crc.to_le_bytes());
-  dest.write_all(&block_data)?;
-  dest.write_all(&trailer)?;
+  dest.write(&block_data)?;
+  dest.write(&trailer)?;
   Ok(BlockHandle {
     offset,
     size: block_data.len() as u64,
@@ -382,7 +382,13 @@ mod tests {
       .copied()
       .collect();
     let mut buf: Vec<u8> = Vec::new();
-    let handle = write_raw_block(&mut buf, &data, 0, compression).unwrap();
+    let handle = write_raw_block(
+      &mut buf as &mut dyn crate::env::WritableFile,
+      &data,
+      0,
+      compression,
+    )
+    .unwrap();
 
     // Read it back using a temporary file (read_block requires RandomAccessFile).
     let mut tmp = tempfile::tempfile().unwrap();
@@ -412,7 +418,13 @@ mod tests {
     // Random-looking data: Snappy won't achieve 12.5% savings, so block is stored raw.
     let data: Vec<u8> = (0u8..=255).cycle().take(256).collect();
     let mut buf: Vec<u8> = Vec::new();
-    let _ = write_raw_block(&mut buf, &data, 0, crate::options::CompressionType::Snappy).unwrap();
+    let _ = write_raw_block(
+      &mut buf as &mut dyn crate::env::WritableFile,
+      &data,
+      0,
+      crate::options::CompressionType::Snappy,
+    )
+    .unwrap();
     // Trailer byte should be 0x00 (NoCompression) because the data didn't compress well.
     let trailer_type = buf[buf.len() - BLOCK_TRAILER_SIZE];
     assert_eq!(trailer_type, 0x00, "expected fallback to NoCompression");
