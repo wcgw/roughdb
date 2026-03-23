@@ -10,7 +10,7 @@ Pluggable filesystem backend replacing hardcoded `std::fs` / `libc` I/O.
 - [x] **Step 2: `LogWriter` and `LogReader`** — Change `LogWriter` to wrap `Box<dyn WritableFile>` (instead of
   `BufWriter<File>`) and `LogReader` to wrap `Box<dyn SequentialFile>` (instead of `File`). Update all callers
   (WAL creation, MANIFEST creation, WAL replay, repair).
-- [ ] **Step 3: `Table` reader** — Change `Table::open` to take `Arc<dyn RandomAccessFile>` instead of `File`.
+- [x] **Step 3: `Table` reader** — Change `Table::open` to take `Arc<dyn RandomAccessFile>` instead of `File`.
   `read_block` and footer reads go through the trait. `Table` stores `Arc<dyn RandomAccessFile>`.
 - [ ] **Step 4: `TableBuilder`** — Change constructor to take `Box<dyn WritableFile>` instead of `File`.
 - [ ] **Step 5: `TableCache`** — `get_or_open` calls `fs.open_random_access(path)` instead of `File::open`.

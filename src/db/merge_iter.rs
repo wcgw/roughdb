@@ -188,7 +188,14 @@ mod tests {
       builder.add(&ikey, v).unwrap();
     }
     let size = builder.finish().unwrap();
-    let table = Table::open(tmp.reopen().unwrap(), size, None, None, bytewise_cmp()).unwrap();
+    let table = Table::open(
+      crate::env::random_access_from_file(tmp.reopen().unwrap()),
+      size,
+      None,
+      None,
+      bytewise_cmp(),
+    )
+    .unwrap();
     Box::new(table.new_iterator(false, true).unwrap())
   }
 

@@ -62,7 +62,7 @@ impl Inner {
     let file = File::open(&sst_path)
       .map_err(|e| Error::Corruption(format!("cannot open SSTable {number:06}.ldb: {e}")))?;
     let table = Arc::new(Table::open(
-      file,
+      crate::env::random_access_from_file(file),
       file_size,
       self.filter_policy.clone(),
       self.block_cache.clone(),
@@ -213,7 +213,7 @@ mod tests {
     let file = File::open(dir.path().join("000003.ldb")).unwrap();
     let table = Arc::new(
       Table::open(
-        file,
+        crate::env::random_access_from_file(file),
         size,
         None,
         None,

@@ -23,6 +23,7 @@
 
 use crate::error::Error;
 use std::path::Path;
+use std::sync::Arc;
 
 // ── File traits ──────────────────────────────────────────────────────────────
 
@@ -326,6 +327,13 @@ pub fn writable_from_file(file: std::fs::File) -> Box<dyn WritableFile> {
 /// Intended for tests and interop where a raw `File` handle is available.
 pub fn sequential_from_file(file: std::fs::File) -> Box<dyn SequentialFile> {
   Box::new(PosixSequentialFile { inner: file })
+}
+
+/// Create a [`RandomAccessFile`] from an already-open [`std::fs::File`].
+///
+/// Intended for tests and interop where a raw `File` handle is available.
+pub fn random_access_from_file(file: std::fs::File) -> Arc<dyn RandomAccessFile> {
+  Arc::new(PosixRandomAccessFile { inner: file })
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────

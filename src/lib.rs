@@ -1588,7 +1588,8 @@ impl Db {
         }
       };
       let table = match Table::open(
-        file,
+        // TODO: This needs abstracted away...
+        crate::env::random_access_from_file(file),
         file_size,
         options.filter_policy.clone(),
         None,
@@ -1956,7 +1957,7 @@ fn write_flush(prep: FlushPrep, opts: &Options) -> Result<FlushResult, Error> {
   drop(old_mem);
   let read_file = std::fs::File::open(&sst_path)?;
   let table = Arc::new(Table::open(
-    read_file,
+    crate::env::random_access_from_file(read_file),
     file_size,
     opts.filter_policy.clone(),
     opts.block_cache.clone(),
@@ -2620,7 +2621,7 @@ fn finish_compaction_output(
   let file_size = cur.builder.finish()?;
   let read_file = std::fs::File::open(&cur.path)?;
   let table = Arc::new(Table::open(
-    read_file,
+    crate::env::random_access_from_file(read_file),
     file_size,
     filter_policy,
     block_cache,

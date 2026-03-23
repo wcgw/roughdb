@@ -11,10 +11,29 @@
 //    limitations under the License.
 
 use crate::coding::{crc32c, crc32c_extend, mask_crc, read_varu64, unmask_crc, write_varu64};
+use crate::env::RandomAccessFile;
 use crate::error::Error;
 use crate::options::CompressionType;
-use std::fs::File;
-use std::os::unix::fs::FileExt;
+
+/// Read exactly `buf.len()` bytes from `file` at `offset`, looping on short reads.
+pub(crate) fn read_exact_at(
+  file: &dyn RandomAccessFile,
+  buf: &mut [u8],
+  mut offset: u64,
+) -> Result<(), Error> {
+  let mut remaining = buf;
+  while !remaining.is_empty() {
+    let n = file.read_at(remaining, offset)?;
+    if n == 0 {
+      return Err(Error::Corruption(
+        "unexpected EOF in read_exact_at".to_owned(),
+      ));
+    }
+    offset += n as u64;
+    remaining = &mut remaining[n..];
+  }
+  Ok(())
+}
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -178,13 +197,13 @@ pub(crate) struct BlockContents {
 /// `verify_checksums`: when `true`, computes CRC32c over `[data + type_byte]`
 /// and compares against the masked CRC stored in the trailer.
 pub(crate) fn read_block(
-  file: &File,
+  file: &dyn RandomAccessFile,
   handle: &BlockHandle,
   verify_checksums: bool,
 ) -> Result<BlockContents, Error> {
   let n = handle.size as usize;
   let mut buf = vec![0u8; n + BLOCK_TRAILER_SIZE];
-  file.read_exact_at(&mut buf, handle.offset)?;
+  read_exact_at(file, &mut buf, handle.offset)?;
 
   if verify_checksums {
     let stored_masked = u32::from_le_bytes(buf[n + 1..n + 5].try_into().unwrap());
@@ -365,10 +384,11 @@ mod tests {
     let mut buf: Vec<u8> = Vec::new();
     let handle = write_raw_block(&mut buf, &data, 0, compression).unwrap();
 
-    // Read it back using a temporary file (read_block requires a File).
+    // Read it back using a temporary file (read_block requires RandomAccessFile).
     let mut tmp = tempfile::tempfile().unwrap();
     std::io::Write::write_all(&mut tmp, &buf).unwrap();
-    let contents = read_block(&tmp, &handle, true).unwrap();
+    let ra = crate::env::random_access_from_file(tmp);
+    let contents = read_block(ra.as_ref(), &handle, true).unwrap();
     assert_eq!(contents.data, data);
   }
 
