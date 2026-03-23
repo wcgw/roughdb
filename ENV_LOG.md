@@ -17,9 +17,13 @@ Pluggable filesystem backend replacing hardcoded `std::fs` / `libc` I/O.
   `TableCache` stores `Arc<dyn FileSystem>`.
 - [ ] **Step 6: `VersionSet`** — MANIFEST creation/reading and CURRENT file read/write go through `FileSystem`.
   `VersionSet::create` and `VersionSet::recover` take or store the filesystem handle.
-- [ ] **Step 7: `lib.rs`** — Replace all remaining `std::fs` calls (~30 sites) in `Db::open`, `begin_flush`,
-  `write_flush`, `finish_flush`, `do_compaction`, `delete_obsolete_files`, `Db::destroy`, `Db::repair`, and
-  `acquire_lock`. `Persistence` stores `Arc<dyn FileSystem>`. `libc::flock` moves into `PosixFileSystem::lock_file`.
+- [ ] **Step 7: `lib.rs` + stopgap cleanup** — Replace all remaining `std::fs` calls (~30 sites) in `Db::open`,
+  `begin_flush`, `write_flush`, `finish_flush`, `do_compaction`, `delete_obsolete_files`, `Db::destroy`,
+  `Db::repair`, and `acquire_lock`. `Persistence` stores `Arc<dyn FileSystem>`. `libc::flock` moves into
+  `PosixFileSystem::lock_file`. Also replace all stopgap `PosixFileSystem` / `writable_from_file` /
+  `random_access_from_file` / `sequential_from_file` calls in production code (marked with `TODO`) with
+  `Options::file_system` — threading the `Arc<dyn FileSystem>` from `Options` through `Persistence`, `TableCache`,
+  `VersionSet`, and all free functions that create files. Test code may remain hardcoded to POSIX.
 - [ ] **Step 8: Cleanup** — Remove direct `libc` usage from `lib.rs`. Verify `libc` is only used inside
   `PosixFileSystem`. Run full test suite.
 
