@@ -658,14 +658,16 @@ impl Db {
       // Use the log number recorded in the MANIFEST (set by WAL rotation).
       let log_path = path.join(format!("{:06}.log", vs.log_number()));
       let actual_last_seq = if log_path.exists() {
-        let file = std::fs::File::open(&log_path)?;
-        let file_len = file.metadata()?.len();
+        // TODO: This needs abstracted away...
+        let fs = crate::env::PosixFileSystem;
+        let file_len = fs.file_size(&log_path)?;
         if file_len > 0 {
           log::info!(
             "replaying WAL {:06}.log (manifest_last_seq={})",
             vs.log_number(),
             manifest_last_seq
           );
+          let file = fs.open_sequential(&log_path)?;
           let seq = Self::recover_wal(file, &mem, manifest_last_seq, options.paranoid_checks)?;
           log::info!("WAL replay complete: max_sequence={seq}");
           seq
@@ -697,12 +699,14 @@ impl Db {
     // Open (or reopen) the current WAL for subsequent writes.
     let log_number = version_set.as_ref().map_or(1, |vs| vs.log_number());
     let log_path = path.join(format!("{log_number:06}.log"));
-    let log_file = OpenOptions::new()
-      .read(true)
-      .append(true)
-      .create(true)
-      .open(&log_path)?;
-    let file_len = log_file.metadata()?.len();
+    // TODO: This needs abstracted away...
+    let fs = crate::env::PosixFileSystem;
+    let file_len = if fs.file_exists(&log_path) {
+      fs.file_size(&log_path)?
+    } else {
+      0
+    };
+    let log_file = fs.open_appendable(&log_path)?;
     let log_writer = LogWriter::new(log_file, file_len);
 
     let inner = Arc::new(DbInner {
@@ -746,7 +750,7 @@ impl Db {
   /// Returns the highest sequence number replayed (or `min_sequence` if
   /// nothing was replayed).
   fn recover_wal(
-    file: std::fs::File,
+    file: Box<dyn crate::env::SequentialFile>,
     mem: &Memtable,
     min_sequence: u64,
     paranoid_checks: bool,
@@ -1497,7 +1501,8 @@ impl Db {
     // ── Phase 2: convert_log_to_table ──────────────────────────────────────────
     for log_num in &logs {
       let log_path = path.join(format!("{log_num:06}.log"));
-      let file = match std::fs::File::open(&log_path) {
+      // TODO: This needs abstracted away...
+      let file = match crate::env::PosixFileSystem.open_sequential(&log_path) {
         Ok(f) => f,
         Err(e) => {
           log::warn!("repair: cannot open WAL {}: {e}", log_path.display());
@@ -1654,7 +1659,8 @@ impl Db {
     }
 
     let manifest_path = path.join(crate::db::version_set::manifest_filename(1));
-    let manifest_file = std::fs::File::create(&manifest_path)?;
+    // TODO: This needs abstracted away...
+    let manifest_file = crate::env::PosixFileSystem.create_writable(&manifest_path)?;
     let mut manifest_writer = LogWriter::new(manifest_file, 0);
     manifest_writer.add_record(&edit.encode())?;
 
@@ -1880,7 +1886,9 @@ fn begin_flush(
   let sst_number = vs.next_file_number();
   let new_log_number = vs.next_file_number();
   log::debug!("begin_flush: sst={sst_number}, new_log={new_log_number}, old_log={old_log_number}");
-  let new_log_file = std::fs::File::create(path.join(format!("{new_log_number:06}.log")))?;
+  let new_log_path = path.join(format!("{new_log_number:06}.log"));
+  // TODO: This needs abstracted away...
+  let new_log_file = crate::env::PosixFileSystem.create_writable(&new_log_path)?;
   let new_log = LogWriter::new(new_log_file, 0);
   // Activate the new WAL immediately; preserve the old WAL so finish_flush
   // can delete it after log_and_apply commits the rotation to the MANIFEST.

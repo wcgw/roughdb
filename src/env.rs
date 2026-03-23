@@ -28,11 +28,15 @@ use std::path::Path;
 
 /// A readable file for sequential access (WAL reading, MANIFEST replay).
 ///
-/// Reads proceed from the current position; there is no seek.
+/// Reads proceed from the current position forward.
 pub trait SequentialFile: Send {
   /// Read up to `buf.len()` bytes into `buf`.  Returns the number of bytes
   /// read (0 at EOF).
   fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error>;
+
+  /// Skip `n` bytes from the current position.  This may be faster than
+  /// reading and discarding for backends that support seeking.
+  fn skip(&mut self, n: u64) -> Result<(), Error>;
 }
 
 /// A readable file for random access (SSTable block reads via pread).
@@ -135,8 +139,7 @@ pub trait FileSystem: Send + Sync {
       }
       buf.extend_from_slice(&chunk[..n]);
     }
-    String::from_utf8(buf)
-      .map_err(|e| Error::Corruption(format!("non-UTF-8 file content: {e}")))
+    String::from_utf8(buf).map_err(|e| Error::Corruption(format!("non-UTF-8 file content: {e}")))
   }
 }
 
@@ -158,6 +161,15 @@ impl SequentialFile for PosixSequentialFile {
   fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
     use std::io::Read;
     self.inner.read(buf).map_err(Error::IoError)
+  }
+
+  fn skip(&mut self, n: u64) -> Result<(), Error> {
+    use std::io::{Seek, SeekFrom};
+    self
+      .inner
+      .seek(SeekFrom::Current(n as i64))
+      .map_err(Error::IoError)?;
+    Ok(())
   }
 }
 
@@ -296,6 +308,24 @@ impl FileSystem for PosixFileSystem {
   fn read_string_from_file(&self, path: &Path) -> Result<String, Error> {
     std::fs::read_to_string(path).map_err(Error::IoError)
   }
+}
+
+// ── Convenience wrappers for tests and interop ──────────────────────────────
+
+/// Create a [`WritableFile`] from an already-open [`std::fs::File`].
+///
+/// Intended for tests and interop where a raw `File` handle is available.
+pub fn writable_from_file(file: std::fs::File) -> Box<dyn WritableFile> {
+  Box::new(PosixWritableFile {
+    inner: std::io::BufWriter::new(file),
+  })
+}
+
+/// Create a [`SequentialFile`] from an already-open [`std::fs::File`].
+///
+/// Intended for tests and interop where a raw `File` handle is available.
+pub fn sequential_from_file(file: std::fs::File) -> Box<dyn SequentialFile> {
+  Box::new(PosixSequentialFile { inner: file })
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -441,9 +471,6 @@ mod tests {
     w.flush().unwrap();
     drop(w);
 
-    assert_eq!(
-      fs.read_string_from_file(&path).unwrap(),
-      "hello world"
-    );
+    assert_eq!(fs.read_string_from_file(&path).unwrap(), "hello world");
   }
 }

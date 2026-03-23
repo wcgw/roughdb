@@ -13,11 +13,11 @@
 use crate::db::table_cache::TableCache;
 use crate::db::version::Version;
 use crate::db::version_edit::{FileMetaData, VersionEdit};
+use crate::env::FileSystem;
 use crate::error::Error;
 use crate::logfile::reader::Reader as LogReader;
 use crate::logfile::writer::Writer as LogWriter;
 use std::collections::{HashMap, HashSet};
-use std::fs::{File, OpenOptions};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -80,7 +80,8 @@ impl VersionSet {
     let manifest_number = 2u64;
     let manifest_path = path.join(manifest_filename(manifest_number));
 
-    let file = File::create(&manifest_path)?;
+    // TODO: This needs abstracted away...
+    let file = crate::env::PosixFileSystem.create_writable(&manifest_path)?;
     let mut manifest_log = LogWriter::new(file, 0);
 
     // Write the initial VersionEdit so recovery always finds a valid sequence.
@@ -122,7 +123,8 @@ impl VersionSet {
     let manifest_number = parse_manifest_number(&manifest_name)?;
 
     // Replay all VersionEdits from the MANIFEST.
-    let manifest_file_for_read = File::open(&manifest_path)?;
+    // TODO: This needs abstracted away...
+    let manifest_file_for_read = crate::env::PosixFileSystem.open_sequential(&manifest_path)?;
     let mut reader = LogReader::new(manifest_file_for_read, None, paranoid_checks, 0);
 
     let mut builder = Builder::new();
@@ -158,8 +160,9 @@ impl VersionSet {
     crate::db::version::finalize(&mut files, 4); // 4 = L0_COMPACTION_TRIGGER
 
     // Re-open the MANIFEST for appending (continue after the last record).
-    let manifest_file_for_write = OpenOptions::new().append(true).open(&manifest_path)?;
-    let manifest_len = manifest_file_for_write.metadata()?.len();
+    // TODO: This needs abstracted away...
+    let manifest_len = crate::env::PosixFileSystem.file_size(&manifest_path)?;
+    let manifest_file_for_write = crate::env::PosixFileSystem.open_appendable(&manifest_path)?;
     let manifest_log = LogWriter::new(manifest_file_for_write, manifest_len);
 
     Ok(VersionSet {
