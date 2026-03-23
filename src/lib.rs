@@ -651,7 +651,12 @@ impl Db {
     let (version_set, mem, last_sequence) = if db_exists {
       // ── Existing database: MANIFEST-driven recovery ──────────────────────
       log::info!("opening existing database at {}", path.display());
-      let mut vs = VersionSet::recover(path, options.paranoid_checks, &*options.comparator)?;
+      let mut vs = VersionSet::recover(
+        path,
+        options.paranoid_checks,
+        &*options.comparator,
+        &*options.file_system,
+      )?;
       let manifest_last_seq = vs.last_sequence();
       let mem = Arc::new(Memtable::new(Arc::clone(&options.comparator)));
 
@@ -687,7 +692,7 @@ impl Db {
     } else {
       // ── New database: create MANIFEST and WAL ────────────────────────────
       log::info!("creating new database at {}", path.display());
-      let vs = VersionSet::create(path, &*options.comparator)?;
+      let vs = VersionSet::create(path, &*options.comparator, &*options.file_system)?;
       // Initial WAL is always 000001.log (log_number = 1 from VersionSet::create).
       std::fs::File::create(path.join("000001.log"))?;
       (
@@ -1672,7 +1677,7 @@ impl Db {
     }
 
     // Write CURRENT pointing at MANIFEST-000001.
-    crate::db::version_set::write_current_file(path, 1)?;
+    crate::db::version_set::write_current_file(path, 1, &*options.file_system)?;
 
     log::info!(
       "repair: wrote new manifest with {} tables, max_sequence={max_sequence}",
@@ -4963,6 +4968,7 @@ mod tests {
       dir.path(),
       false,
       &crate::comparator::BytewiseComparator,
+      &crate::env::PosixFileSystem,
     )
     .unwrap();
     // At least one level should have a non-empty compact_pointer (L0 or L1).

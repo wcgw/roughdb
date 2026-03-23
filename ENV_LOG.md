@@ -15,7 +15,7 @@ Pluggable filesystem backend replacing hardcoded `std::fs` / `libc` I/O.
 - [x] **Step 4: `TableBuilder`** — Change constructor to take `Box<dyn WritableFile>` instead of `File`.
 - [x] **Step 5: `TableCache`** — `get_or_open` calls `fs.open_random_access(path)` instead of `File::open`.
   `TableCache` stores `Arc<dyn FileSystem>`.
-- [ ] **Step 6: `VersionSet`** — MANIFEST creation/reading and CURRENT file read/write go through `FileSystem`.
+- [x] **Step 6: `VersionSet`** — MANIFEST creation/reading and CURRENT file read/write go through `FileSystem`.
   `VersionSet::create` and `VersionSet::recover` take or store the filesystem handle.
 - [ ] **Step 7: `lib.rs` + stopgap cleanup** — Replace all remaining `std::fs` calls (~30 sites) in `Db::open`,
   `begin_flush`, `write_flush`, `finish_flush`, `do_compaction`, `delete_obsolete_files`, `Db::destroy`,
