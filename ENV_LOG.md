@@ -4,7 +4,7 @@ Pluggable filesystem backend replacing hardcoded `std::fs` / `libc` I/O.
 
 ## Steps
 
-- [ ] **Step 1: Define traits + `PosixFileSystem`** — Create `src/env.rs` with `SequentialFile`, `RandomAccessFile`,
+- [x] **Step 1: Define traits + `PosixFileSystem`** — Create `src/env.rs` with `SequentialFile`, `RandomAccessFile`,
   `WritableFile`, `FileLock`, `FileSystem` traits and `PosixFileSystem` implementation. Add `Options::file_system:
   Arc<dyn FileSystem>` defaulting to `PosixFileSystem`. No existing code changes beyond the new file and options field.
 - [ ] **Step 2: `LogWriter` and `LogReader`** — Change `LogWriter` to wrap `Box<dyn WritableFile>` (instead of

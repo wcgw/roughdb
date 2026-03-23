@@ -125,6 +125,8 @@ pub mod cache;
 pub use cache::BlockCache;
 pub mod comparator;
 pub use comparator::{BytewiseComparator, Comparator};
+pub mod env;
+pub use env::{FileSystem, PosixFileSystem};
 pub mod error;
 pub use error::Error;
 pub mod filter;
