@@ -13,7 +13,7 @@ Pluggable filesystem backend replacing hardcoded `std::fs` / `libc` I/O.
 - [x] **Step 3: `Table` reader** — Change `Table::open` to take `Arc<dyn RandomAccessFile>` instead of `File`.
   `read_block` and footer reads go through the trait. `Table` stores `Arc<dyn RandomAccessFile>`.
 - [x] **Step 4: `TableBuilder`** — Change constructor to take `Box<dyn WritableFile>` instead of `File`.
-- [ ] **Step 5: `TableCache`** — `get_or_open` calls `fs.open_random_access(path)` instead of `File::open`.
+- [x] **Step 5: `TableCache`** — `get_or_open` calls `fs.open_random_access(path)` instead of `File::open`.
   `TableCache` stores `Arc<dyn FileSystem>`.
 - [ ] **Step 6: `VersionSet`** — MANIFEST creation/reading and CURRENT file read/write go through `FileSystem`.
   `VersionSet::create` and `VersionSet::recover` take or store the filesystem handle.

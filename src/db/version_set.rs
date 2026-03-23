@@ -413,6 +413,7 @@ mod tests {
       None,
       None,
       std::sync::Arc::new(crate::comparator::BytewiseComparator),
+      std::sync::Arc::new(crate::env::PosixFileSystem),
     )
   }
 

@@ -645,6 +645,7 @@ impl Db {
       options.filter_policy.clone(),
       options.block_cache.clone(),
       Arc::clone(&options.comparator),
+      Arc::clone(&options.file_system),
     );
 
     let (version_set, mem, last_sequence) = if db_exists {

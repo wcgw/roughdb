@@ -12,11 +12,11 @@
 
 use crate::cache::BlockCache;
 use crate::comparator::Comparator;
+use crate::env::FileSystem;
 use crate::error::Error;
 use crate::filter::FilterPolicy;
 use crate::table::reader::Table;
 use std::collections::{HashMap, VecDeque};
-use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -27,6 +27,7 @@ pub(crate) const NUM_NON_TABLE_CACHE_FILES: usize = 10;
 
 struct Inner {
   path: PathBuf,
+  fs: Arc<dyn FileSystem>,
   filter_policy: Option<Arc<dyn FilterPolicy>>,
   block_cache: Option<Arc<BlockCache>>,
   comparator: Arc<dyn Comparator>,
@@ -59,10 +60,12 @@ impl Inner {
 
     // Open the SSTable file and parse the footer + index block.
     let sst_path = self.path.join(format!("{number:06}.ldb"));
-    let file = File::open(&sst_path)
+    let file = self
+      .fs
+      .open_random_access(&sst_path)
       .map_err(|e| Error::Corruption(format!("cannot open SSTable {number:06}.ldb: {e}")))?;
     let table = Arc::new(Table::open(
-      crate::env::random_access_from_file(file),
+      file,
       file_size,
       self.filter_policy.clone(),
       self.block_cache.clone(),
@@ -128,9 +131,11 @@ impl TableCache {
     filter_policy: Option<Arc<dyn FilterPolicy>>,
     block_cache: Option<Arc<BlockCache>>,
     comparator: Arc<dyn Comparator>,
+    fs: Arc<dyn FileSystem>,
   ) -> Self {
     TableCache(Arc::new(Mutex::new(Inner {
       path: path.to_owned(),
+      fs,
       filter_policy,
       block_cache,
       comparator,
@@ -166,13 +171,14 @@ impl TableCache {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::env::PosixFileSystem;
   use crate::options::CompressionType;
   use crate::table::builder::TableBuilder;
   use crate::table::format::make_internal_key;
 
   fn write_sst(dir: &Path, number: u64, entries: &[(&[u8], &[u8])]) -> u64 {
     let path = dir.join(format!("{number:06}.ldb"));
-    let file = File::create(&path).unwrap();
+    let file = std::fs::File::create(&path).unwrap();
     let mut b = TableBuilder::new(
       crate::env::writable_from_file(file),
       4096,
@@ -197,6 +203,7 @@ mod tests {
       None,
       None,
       Arc::new(crate::comparator::BytewiseComparator),
+      Arc::new(PosixFileSystem),
     );
     let table = tc.get_or_open(3, size).unwrap();
     use crate::table::reader::LookupResult;
@@ -210,7 +217,7 @@ mod tests {
     let dir = tempfile::tempdir().unwrap();
     let size = write_sst(dir.path(), 3, &[(b"k", b"v")]);
     // Open manually, then insert — cache should return the same Arc.
-    let file = File::open(dir.path().join("000003.ldb")).unwrap();
+    let file = std::fs::File::open(dir.path().join("000003.ldb")).unwrap();
     let table = Arc::new(
       Table::open(
         crate::env::random_access_from_file(file),
@@ -227,6 +234,7 @@ mod tests {
       None,
       None,
       Arc::new(crate::comparator::BytewiseComparator),
+      Arc::new(PosixFileSystem),
     );
     tc.insert(3, Arc::clone(&table));
     let got = tc.get_or_open(3, size).unwrap();
@@ -244,6 +252,7 @@ mod tests {
       None,
       None,
       Arc::new(crate::comparator::BytewiseComparator),
+      Arc::new(PosixFileSystem),
     );
     tc.get_or_open(3, size).unwrap();
     tc.evict(3);
@@ -264,6 +273,7 @@ mod tests {
       None,
       None,
       Arc::new(crate::comparator::BytewiseComparator),
+      Arc::new(PosixFileSystem),
     );
     tc.get_or_open(3, s3).unwrap(); // cache: [3]
     tc.get_or_open(4, s4).unwrap(); // cache: [3, 4]

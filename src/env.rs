@@ -82,7 +82,7 @@ pub trait FileSystem: Send + Sync {
   fn open_sequential(&self, path: &Path) -> Result<Box<dyn SequentialFile>, Error>;
 
   /// Open an existing file for random-access reading (pread).
-  fn open_random_access(&self, path: &Path) -> Result<Box<dyn RandomAccessFile>, Error>;
+  fn open_random_access(&self, path: &Path) -> Result<Arc<dyn RandomAccessFile>, Error>;
 
   /// Open an existing file for appending (used to resume a WAL or MANIFEST).
   fn open_appendable(&self, path: &Path) -> Result<Box<dyn WritableFile>, Error>;
@@ -223,9 +223,9 @@ impl FileSystem for PosixFileSystem {
     Ok(Box::new(PosixSequentialFile { inner: file }))
   }
 
-  fn open_random_access(&self, path: &Path) -> Result<Box<dyn RandomAccessFile>, Error> {
+  fn open_random_access(&self, path: &Path) -> Result<Arc<dyn RandomAccessFile>, Error> {
     let file = std::fs::File::open(path).map_err(Error::IoError)?;
-    Ok(Box::new(PosixRandomAccessFile { inner: file }))
+    Ok(Arc::new(PosixRandomAccessFile { inner: file }))
   }
 
   fn open_appendable(&self, path: &Path) -> Result<Box<dyn WritableFile>, Error> {
