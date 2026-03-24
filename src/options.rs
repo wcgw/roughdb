@@ -147,6 +147,18 @@ pub struct Options {
   ///
   /// Default: [`PosixFileSystem`](crate::PosixFileSystem) (local filesystem via `std::fs`).
   pub file_system: std::sync::Arc<dyn crate::env::FileSystem>,
+
+  // ── Compaction filter ─────────────────────────────────────────────────
+  /// Factory that creates a [`CompactionFilter`](crate::CompactionFilter) for each compaction run.
+  ///
+  /// The filter is invoked for the newest visible version of every key during compaction and can
+  /// keep, remove, or replace its value.  Entries visible to a live snapshot are never filtered.
+  ///
+  /// `None` disables compaction filtering (the default).
+  ///
+  /// See `include/rocksdb/compaction_filter.h`.
+  pub compaction_filter_factory:
+    Option<std::sync::Arc<dyn crate::compaction_filter::CompactionFilterFactory>>,
 }
 
 impl Default for Options {
@@ -167,6 +179,7 @@ impl Default for Options {
         crate::cache::DEFAULT_BLOCK_CACHE_CAPACITY,
       ))),
       comparator: std::sync::Arc::new(crate::comparator::BytewiseComparator),
+      compaction_filter_factory: None,
       file_system: std::sync::Arc::new(crate::env::PosixFileSystem),
     }
   }
@@ -195,6 +208,10 @@ impl std::fmt::Debug for Options {
       )
       .field("comparator", &self.comparator.name())
       .field("file_system", &"<FileSystem>")
+      .field(
+        "compaction_filter_factory",
+        &self.compaction_filter_factory.as_ref().map(|f| f.name()),
+      )
       .finish()
   }
 }

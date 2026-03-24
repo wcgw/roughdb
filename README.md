@@ -178,6 +178,8 @@ RoughDB is in active development. The on-disk format is LevelDB-compatible.
 - Pluggable `FileSystem` trait (`Options::file_system`) — all database I/O goes through trait
   objects; `PosixFileSystem` is the default. Enables in-memory, encrypted, or cloud backends
   without touching core logic
+- Compaction filters — `Options::compaction_filter_factory` supplies a per-compaction callback
+  that can keep, remove, or replace each key's value during compaction (TTL expiry, transforms)
 
 **Known limitations:**
 

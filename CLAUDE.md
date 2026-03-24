@@ -397,13 +397,14 @@ what remains is compaction, the full Iterator/Snapshot API, and operational hygi
 - **`Db::repair` directory locking** (RocksDB): Acquire the `LOCK` file during repair to prevent concurrent access.
   LevelDB does not lock during repair; RocksDB does (`env_->LockFile` in `db/repair.cc`). Our current implementation
   follows LevelDB and does not lock.
-- **`CompactionFilter`** (RocksDB): User-supplied callback invoked for every key during compaction. Returns
-  `Keep`, `Remove`, `ChangeValue`, or `RemoveAndSkipUntil`. Enables TTL expiry, value transformations, and
-  range deletions without a separate scan-and-delete pass. LevelDB has no equivalent — only shadow-key pruning
-  and tombstone elision are built in. See `include/rocksdb/compaction_filter.h`.
-- **`CompactionFilterFactory`** (RocksDB): Creates a `CompactionFilter` per compaction run, allowing the filter
-  to hold per-compaction state (e.g. a snapshot of the current time for TTL checks). Paired with `CompactionFilter`
-  above. See `include/rocksdb/compaction_filter.h: CompactionFilterFactory`.
+- ✅ **`CompactionFilter` / `CompactionFilterFactory`** (RocksDB): `CompactionFilter` trait
+  (`src/compaction_filter.rs`) with `filter(level, key, value, value_type) -> CompactionDecision` returning `Keep`,
+  `Remove`, or `ChangeValue(new_val)`.  `CompactionFilterFactory` creates a fresh filter per compaction run
+  (allows per-compaction mutable state like timestamps for TTL).  `Options::compaction_filter_factory:
+  Option<Arc<dyn CompactionFilterFactory>>` — `None` disables filtering (default).  The filter is called in
+  `do_compaction` for the newest visible version of each key, after shadow-key pruning, before writing to the output
+  SSTable.  Entries visible to a live snapshot are never filtered.
+  See `include/rocksdb/compaction_filter.h`.
 
 ---
 
