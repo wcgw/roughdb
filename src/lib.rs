@@ -123,6 +123,8 @@ use std::sync::{Arc, Mutex};
 
 pub mod cache;
 pub use cache::BlockCache;
+pub mod compaction_filter;
+pub use compaction_filter::{CompactionDecision, CompactionFilter, CompactionFilterFactory};
 pub mod comparator;
 pub use comparator::{BytewiseComparator, Comparator};
 pub mod env;
@@ -1158,11 +1160,11 @@ impl Db {
       max
     };
 
-    // Compact every level from 0 up to (but not including) max_level, pushing
-    // data toward max_level.  If max_level is already the deepest level (6),
-    // cap at NUM_LEVELS-1 since there is no level above it to compact into.
-    let stop = max_level.min(NUM_LEVELS - 1);
-    for level in 0..stop {
+    // Compact every level from 0 up to and including max_level, pushing data
+    // toward deeper levels.  Cap at NUM_LEVELS-2 since level N compacts into
+    // level N+1, and there is no level above NUM_LEVELS-1.
+    let stop = max_level.min(NUM_LEVELS - 2);
+    for level in 0..=stop {
       compact_level_range(
         path,
         &self.inner.state,
@@ -2757,7 +2759,14 @@ fn do_compaction(
   use crate::db::merge_iter::MergingIterator;
   use crate::iter::InternalIterator;
 
-  let _output_level = spec.level + 1;
+  let output_level = spec.level + 1;
+
+  // Create a compaction filter for this run (if configured).
+  let mut compaction_filter: Option<Box<dyn crate::compaction_filter::CompactionFilter>> = opts
+    .compaction_filter_factory
+    .as_ref()
+    .map(|f| f.create_compaction_filter());
+
   log::info!(
     "compaction L{}→L{}: {} + {} files ({} + {} bytes)",
     spec.level,
@@ -2789,7 +2798,7 @@ fn do_compaction(
 
   while merger.valid() {
     let ikey = merger.key().to_vec();
-    let value = merger.value().to_vec();
+    let mut value = merger.value().to_vec();
     merger.next();
 
     let (uk, seq, vtype) = match crate::table::format::parse_internal_key(&ikey) {
@@ -2827,6 +2836,20 @@ fn do_compaction(
     last_sequence_for_key = seq;
 
     if !drop {
+      // Apply the compaction filter to the newest visible version of each key.
+      // Entries still visible to a live snapshot are never filtered (seq > oldest_snapshot).
+      if let Some(ref mut filter) = compaction_filter {
+        if first_occurrence && seq <= oldest_snapshot {
+          match filter.filter(output_level, uk, &value, vtype) {
+            crate::compaction_filter::CompactionDecision::Keep => {}
+            crate::compaction_filter::CompactionDecision::Remove => continue,
+            crate::compaction_filter::CompactionDecision::ChangeValue(new_val) => {
+              value = new_val;
+            }
+          }
+        }
+      }
+
       // Close the current output file early if grandparent overlap is too high.
       // This limits future compaction amplification (Gap 4).
       if current.is_some() && should_stop_before(spec, &ikey, opts) {
@@ -6078,6 +6101,152 @@ mod tests {
         .parse()
         .unwrap();
       assert!(mem_usage > 100, "memtable should have replayed data");
+    }
+  }
+
+  // ── CompactionFilter tests ──────────────────────────────────────────
+
+  /// A filter that removes keys starting with "drop_".
+  struct PrefixDropFilter;
+
+  impl crate::compaction_filter::CompactionFilter for PrefixDropFilter {
+    fn filter(
+      &mut self,
+      _level: usize,
+      key: &[u8],
+      _value: &[u8],
+      _vtype: u8,
+    ) -> crate::CompactionDecision {
+      if key.starts_with(b"drop_") {
+        crate::CompactionDecision::Remove
+      } else {
+        crate::CompactionDecision::Keep
+      }
+    }
+    fn name(&self) -> &str {
+      "test.PrefixDropFilter"
+    }
+  }
+
+  struct PrefixDropFilterFactory;
+
+  impl crate::compaction_filter::CompactionFilterFactory for PrefixDropFilterFactory {
+    fn create_compaction_filter(&self) -> Box<dyn crate::compaction_filter::CompactionFilter> {
+      Box::new(PrefixDropFilter)
+    }
+    fn name(&self) -> &str {
+      "test.PrefixDropFilterFactory"
+    }
+  }
+
+  /// A filter that uppercases all values.
+  struct UppercaseFilter;
+
+  impl crate::compaction_filter::CompactionFilter for UppercaseFilter {
+    fn filter(
+      &mut self,
+      _level: usize,
+      _key: &[u8],
+      value: &[u8],
+      _vtype: u8,
+    ) -> crate::CompactionDecision {
+      let upper: Vec<u8> = value.iter().map(|b| b.to_ascii_uppercase()).collect();
+      if upper != value {
+        crate::CompactionDecision::ChangeValue(upper)
+      } else {
+        crate::CompactionDecision::Keep
+      }
+    }
+    fn name(&self) -> &str {
+      "test.UppercaseFilter"
+    }
+  }
+
+  struct UppercaseFilterFactory;
+
+  impl crate::compaction_filter::CompactionFilterFactory for UppercaseFilterFactory {
+    fn create_compaction_filter(&self) -> Box<dyn crate::compaction_filter::CompactionFilter> {
+      Box::new(UppercaseFilter)
+    }
+    fn name(&self) -> &str {
+      "test.UppercaseFilterFactory"
+    }
+  }
+
+  #[serial(fd)]
+  #[test]
+  fn compaction_filter_removes_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let opts = Options {
+      create_if_missing: true,
+      write_buffer_size: 512,
+      max_file_size: 4 * 1024,
+      block_cache: None,
+      filter_policy: None,
+      compaction_filter_factory: Some(std::sync::Arc::new(PrefixDropFilterFactory)),
+      ..Options::default()
+    };
+    let db = Db::open(dir.path(), opts).unwrap();
+
+    // Write keys — some with "drop_" prefix, some without.
+    for i in 0..20u32 {
+      db.put(format!("drop_{i:03}").as_bytes(), b"bye").unwrap();
+      db.put(format!("keep_{i:03}").as_bytes(), b"hi").unwrap();
+    }
+
+    // Ensure all data is flushed to SSTables before compacting.
+    db.flush(&crate::FlushOptions::default()).unwrap();
+
+    // Force compaction so the filter runs.
+    db.compact_range(None, None).unwrap();
+
+    // "keep_" keys should survive.
+    for i in 0..20u32 {
+      assert_eq!(db.get(format!("keep_{i:03}").as_bytes()).unwrap(), b"hi");
+    }
+    // "drop_" keys should be gone.
+    for i in 0..20u32 {
+      assert!(
+        db.get(format!("drop_{i:03}").as_bytes()).is_err(),
+        "drop_{i:03} should have been removed by compaction filter"
+      );
+    }
+  }
+
+  #[serial(fd)]
+  #[test]
+  fn compaction_filter_changes_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let opts = Options {
+      create_if_missing: true,
+      write_buffer_size: 512,
+      max_file_size: 4 * 1024,
+      block_cache: None,
+      filter_policy: None,
+      compaction_filter_factory: Some(std::sync::Arc::new(UppercaseFilterFactory)),
+      ..Options::default()
+    };
+    let db = Db::open(dir.path(), opts).unwrap();
+
+    for i in 0..20u32 {
+      db.put(
+        format!("key{i:03}").as_bytes(),
+        format!("hello{i:03}").as_bytes(),
+      )
+      .unwrap();
+    }
+
+    db.flush(&crate::FlushOptions::default()).unwrap();
+    db.compact_range(None, None).unwrap();
+
+    for i in 0..20u32 {
+      let val = db.get(format!("key{i:03}").as_bytes()).unwrap();
+      let expected = format!("HELLO{i:03}");
+      assert_eq!(
+        val,
+        expected.as_bytes(),
+        "key{i:03}: expected uppercased value"
+      );
     }
   }
 }
