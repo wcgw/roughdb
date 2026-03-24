@@ -376,9 +376,10 @@ what remains is compaction, the full Iterator/Snapshot API, and operational hygi
   to SSTables via `LogReader` → `Memtable` → `TableBuilder`, extracts metadata from all SSTables, writes a fresh
   `MANIFEST-000001` placing all files at L0, and writes `CURRENT`.  Corrupt records/files are skipped and archived to
   `lost/`.  Port of `db/repair.cc: RepairDB`.
-- **`Options::reuse_logs`**: Experimental LevelDB flag — when set, the existing WAL and MANIFEST files are reused
-  on `Db::open` rather than creating new ones after recovery, saving an `fsync` of `CURRENT`. Low priority.
-  See `db/db_impl.cc: DBImpl::Recover`.
+- ✅ **`Options::reuse_logs`**: When `false` (default), replayed WAL data is flushed to an SSTable during `Db::open`
+  so the next open doesn't need to replay it.  When `true`, the replayed memtable is kept as the active `mem` and
+  the existing WAL is re-opened for appending — faster opens at the cost of replaying the WAL on the next open.
+  See `db/db_impl.cc: DBImpl::RecoverLogFile`.
 - **`Db::flush_wal(sync: bool)` / `Db::sync_wal()`**: RocksDB-style explicit WAL flush. `flush_wal` pushes buffered
   data from the `BufWriter` to the OS page cache; `sync = true` also `fsync`s. Currently `Db::drop` relies on
   `BufWriter`'s implicit flush-on-drop, which silences I/O errors. See `DB::FlushWAL` in `include/rocksdb/db.h`.

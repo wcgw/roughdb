@@ -659,7 +659,23 @@ impl Db {
         vs.set_last_sequence(actual_last_seq);
       }
       let last_seq = vs.last_sequence();
-      (Some(vs), mem, last_seq)
+
+      // When reuse_logs is false and the WAL had data, flush the replayed
+      // memtable to an SSTable so the next open doesn't need to replay it.
+      // When reuse_logs is true (or the WAL was empty), keep the replayed
+      // memtable as the active one and append to the existing WAL.
+      if !options.reuse_logs
+        && actual_last_seq > manifest_last_seq
+        && mem.approximate_memory_usage() > 0
+      {
+        log::info!("flushing replayed WAL data to SSTable (reuse_logs=false)");
+        let flush_result = write_flush_from_mem(&mem, &mut vs, &options, &*fs, path)?;
+        finish_flush_at_open(&mut vs, flush_result, &options, &table_cache)?;
+        let fresh_mem = Arc::new(Memtable::new(Arc::clone(&options.comparator)));
+        (Some(vs), fresh_mem, last_seq)
+      } else {
+        (Some(vs), mem, last_seq)
+      }
     } else {
       // ── New database: create MANIFEST and WAL ────────────────────────────
       log::info!("creating new database at {}", path.display());
@@ -1883,9 +1899,122 @@ fn begin_flush(
   })
 }
 
-/// Phase 2 (no lock held): iterate `old_mem`, write an SSTable, and pass WAL
-/// rotation state through to `finish_flush`.  On error `old_mem` is dropped;
-/// data remains safe in the old WAL (not yet rotated away).
+// ── Open-time flush (reuse_logs=false) ─────────────────────────────────────
+//
+// When reuse_logs is false, replayed WAL data is flushed to an SSTable during
+// Db::open so the next open doesn't need to replay it.  These are simpler than
+// the normal flush path: no WAL rotation, no imm, no background thread.
+
+/// Flush `mem` to a new SSTable during `Db::open` (used when `reuse_logs` is false).
+///
+/// Allocates a file number from `vs`, writes the memtable contents to an SSTable,
+/// and returns a `FlushResult` for `finish_flush_at_open` to install.  Unlike the
+/// normal `write_flush`, this does not involve WAL rotation or the background thread.
+fn write_flush_from_mem(
+  mem: &Memtable,
+  vs: &mut VersionSet,
+  opts: &Options,
+  fs: &dyn crate::env::FileSystem,
+  path: &std::path::Path,
+) -> Result<FlushResult, Error> {
+  let sst_number = vs.next_file_number();
+  let sst_path = path.join(format!("{sst_number:06}.ldb"));
+  let file = fs.create_writable(&sst_path)?;
+  let mut builder = TableBuilder::new(
+    file,
+    opts.block_size,
+    opts.block_restart_interval,
+    opts.filter_policy.clone(),
+    opts.compression,
+    Arc::clone(&opts.comparator),
+  );
+  let mut smallest = Vec::new();
+  let mut largest = Vec::new();
+  {
+    let mut it = mem.iter();
+    it.seek_to_first();
+    let mut first = true;
+    while it.valid() {
+      let ikey = it.key().to_vec();
+      if first {
+        smallest = ikey.clone();
+        first = false;
+      }
+      largest = ikey;
+      builder.add(it.key(), it.value())?;
+      it.advance();
+    }
+  }
+  let file_size = builder.finish()?;
+  let read_file = fs.open_random_access(&sst_path)?;
+  let table = Arc::new(Table::open(
+    read_file,
+    file_size,
+    opts.filter_policy.clone(),
+    opts.block_cache.clone(),
+    Arc::clone(&opts.comparator),
+  )?);
+  let smallest_user_key = ikey_user_key(&smallest).to_vec();
+  let largest_user_key = ikey_user_key(&largest).to_vec();
+  Ok(FlushResult {
+    file_number: sst_number,
+    file_size,
+    smallest,
+    largest,
+    smallest_user_key,
+    largest_user_key,
+    table,
+    // These fields are unused by finish_flush_at_open but required by the struct.
+    new_log_number: vs.log_number(),
+    last_sequence_at_rotation: vs.last_sequence(),
+    old_log_path: std::path::PathBuf::new(),
+  })
+}
+
+/// Install the flushed SSTable into the VersionSet during open.
+fn finish_flush_at_open(
+  vs: &mut VersionSet,
+  result: FlushResult,
+  opts: &Options,
+  tc: &crate::db::table_cache::TableCache,
+) -> Result<(), Error> {
+  tc.insert(result.file_number, result.table);
+  let meta = FileMetaData::new(
+    result.file_number,
+    result.file_size,
+    result.smallest,
+    result.largest,
+  );
+  let output_level = {
+    let version = vs.current();
+    if !result.smallest_user_key.is_empty() {
+      pick_level_for_memtable_output(
+        &version,
+        &result.smallest_user_key,
+        &result.largest_user_key,
+        opts.max_file_size as u64,
+        &*opts.comparator,
+      )
+    } else {
+      0
+    }
+  };
+  let mut edit = VersionEdit::new();
+  edit.new_files.push((output_level as i32, meta));
+  vs.log_and_apply(&mut edit, tc)?;
+  log::info!(
+    "open-time flush: file {} ({} bytes) at L{output_level}",
+    result.file_number,
+    result.file_size,
+  );
+  Ok(())
+}
+
+/// Phase 2 (no lock held): iterate `old_mem`, write an SSTable, and return a
+/// `FlushResult` for `finish_flush` to install.
+///
+/// On error `old_mem` is dropped; data remains safe in the old WAL (not yet
+/// rotated away — `begin_flush` already activated the new WAL).
 fn write_flush(prep: FlushPrep, opts: &Options) -> Result<FlushResult, Error> {
   let FlushPrep {
     sst_number,
@@ -5884,5 +6013,71 @@ mod tests {
       matches!(err, Error::InvalidArgument(_)),
       "expected InvalidArgument for comparator mismatch, got {err:?}"
     );
+  }
+
+  // ── reuse_logs tests ──────────────────────────────────────────────────
+
+  #[serial(fd)]
+  #[test]
+  fn reuse_logs_false_flushes_wal_data_on_open() {
+    let dir = tempfile::tempdir().unwrap();
+    // Write data (won't trigger auto-flush with default 4MiB buffer).
+    {
+      let mut opts = create_options();
+      opts.reuse_logs = false;
+      let db = Db::open(dir.path(), opts).unwrap();
+      db.put(b"key", b"value").unwrap();
+    }
+    // Reopen with reuse_logs=false: replayed WAL data should be flushed
+    // to an SSTable during open.
+    {
+      let opts = Options {
+        reuse_logs: false,
+        ..Default::default()
+      };
+      let db = Db::open(dir.path(), opts).unwrap();
+      assert_eq!(db.get(b"key").unwrap(), b"value");
+      // At least one SSTable should exist (the flushed WAL data).
+      let total_files: usize = (0..7)
+        .map(|l| {
+          db.get_property(&format!("leveldb.num-files-at-level{l}"))
+            .unwrap_or_else(|| "0".into())
+            .parse::<usize>()
+            .unwrap_or(0)
+        })
+        .sum();
+      assert!(
+        total_files >= 1,
+        "expected at least one SSTable after open with reuse_logs=false"
+      );
+    }
+  }
+
+  #[serial(fd)]
+  #[test]
+  fn reuse_logs_true_keeps_wal_data_in_memtable() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+      let mut opts = create_options();
+      opts.reuse_logs = true;
+      let db = Db::open(dir.path(), opts).unwrap();
+      db.put(b"key", b"value").unwrap();
+    }
+    // Reopen with reuse_logs=true: WAL data stays in memtable, no SSTable created.
+    {
+      let opts = Options {
+        reuse_logs: true,
+        ..Default::default()
+      };
+      let db = Db::open(dir.path(), opts).unwrap();
+      assert_eq!(db.get(b"key").unwrap(), b"value");
+      // Memory usage should be > 0 (data in memtable, not flushed).
+      let mem_usage: usize = db
+        .get_property("leveldb.approximate-memory-usage")
+        .unwrap()
+        .parse()
+        .unwrap();
+      assert!(mem_usage > 100, "memtable should have replayed data");
+    }
   }
 }
