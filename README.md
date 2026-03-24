@@ -175,15 +175,14 @@ RoughDB is in active development. The on-disk format is LevelDB-compatible.
 - Info logging via the [`log`](https://crates.io/crates/log) crate — compaction progress, flush
   lifecycle, recovery details, backpressure events, and errors
 
-**Known limitations:**
-
-- **`Options::reuse_logs`** is accepted but ignored.
-- **Iterator-based seek sampling** (`RecordReadSample`) is not implemented. Seek-based compaction
-  is triggered by point-lookup misses via `Db::get` but not by iterator scans.
-
 - Pluggable `FileSystem` trait (`Options::file_system`) — all database I/O goes through trait
   objects; `PosixFileSystem` is the default. Enables in-memory, encrypted, or cloud backends
   without touching core logic
+
+**Known limitations:**
+
+- **Iterator-based seek sampling** (`RecordReadSample`) is not implemented. Seek-based compaction
+  is triggered by point-lookup misses via `Db::get` but not by iterator scans.
 
 ## License
 
