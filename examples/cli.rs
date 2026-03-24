@@ -70,12 +70,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ..Default::default()
   };
   let db = Db::open(&cli.dir, opts)?;
-  let mem_usage: usize = db
-    .get_property("leveldb.approximate-memory-usage")
-    .unwrap()
-    .parse()
-    .unwrap();
-  println!("mem_usage: {mem_usage}");
 
   match cli.command {
     Command::Get { key } => match db.get(&key) {
