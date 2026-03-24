@@ -380,9 +380,15 @@ what remains is compaction, the full Iterator/Snapshot API, and operational hygi
   so the next open doesn't need to replay it.  When `true`, the replayed memtable is kept as the active `mem` and
   the existing WAL is re-opened for appending — faster opens at the cost of replaying the WAL on the next open.
   See `db/db_impl.cc: DBImpl::RecoverLogFile`.
-- **`Db::flush_wal(sync: bool)` / `Db::sync_wal()`**: RocksDB-style explicit WAL flush. `flush_wal` pushes buffered
-  data from the `BufWriter` to the OS page cache; `sync = true` also `fsync`s. Currently `Db::drop` relies on
-  `BufWriter`'s implicit flush-on-drop, which silences I/O errors. See `DB::FlushWAL` in `include/rocksdb/db.h`.
+- **`Db::flush_wal(sync: bool)` / `Db::sync_wal()` + manual flush mode**: RocksDB's WAL writer supports two modes.
+  In auto-flush mode (default, `manual_flush=false`), `emit_physical_record` flushes the buffer to the OS after every
+  `AddRecord` — this is what our `LogWriter` currently does.  In manual-flush mode (`manual_flush=true`), records are
+  only appended to the internal buffer; the caller must explicitly call `DB::FlushWAL` to push data to the OS.  Manual
+  flush mode enables higher write throughput by batching multiple WAL records into a single OS write.
+  `FlushWAL(sync=false)` calls `dest_->Flush()` (push to page cache); `FlushWAL(sync=true)` also `fsync`s.
+  `SyncWAL()` is shorthand for `FlushWAL(true)`.  Implementation: add `manual_flush: bool` to `LogWriter`; when
+  `true`, skip the `self.dest.flush()` in `emit_physical_record`.  Add `Db::flush_wal(sync)` and `Db::sync_wal()`.
+  See `db/log_writer.cc: Writer::AddRecord` (lines 180–183) and `DB::FlushWAL` in `include/rocksdb/db.h`.
 - **WAL file recycling** (RocksDB): Reuse old log files from a pool rather than deleting and recreating them, avoiding
   inode churn on slow filesystems. Uses a 12-byte header (standard 7 bytes + `log_number: u32`) so the reader can
   distinguish recycled files. See `db/log_writer.cc` in RocksDB.
