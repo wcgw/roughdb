@@ -10,7 +10,8 @@
 //    See the License for the specific language governing permissions and
 //    limitations under the License.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use std::hint::black_box;
+use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use roughdb::Db;
 
 /// Number of entries per benchmark iteration — sized to stay within a

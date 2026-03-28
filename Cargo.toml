@@ -19,7 +19,7 @@ zstd = "0.13"
 
 [dev-dependencies]
 clap = { version = "4", features = ["derive"] }
-criterion = "0.5"
+criterion = "0.8"
 tempfile = "3"
 serial_test = "3.4"
 
