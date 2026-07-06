@@ -369,7 +369,7 @@ impl Builder {
     for (level, mut level_files) in by_level.into_iter().enumerate() {
       if level == 0 {
         // L0: newest-first (sort by file number descending).
-        level_files.sort_by(|a, b| b.0.cmp(&a.0));
+        level_files.sort_by_key(|b| std::cmp::Reverse(b.0));
       } else {
         // L1+: sort by smallest key.
         level_files.sort_by(|a, b| a.1.smallest.cmp(&b.1.smallest));
