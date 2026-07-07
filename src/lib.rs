@@ -629,7 +629,7 @@ impl Db {
       let mut vs = VersionSet::recover(
         path,
         options.paranoid_checks,
-        &*options.comparator,
+        Arc::clone(&options.comparator),
         &*options.file_system,
       )?;
       let manifest_last_seq = vs.last_sequence();
@@ -681,7 +681,7 @@ impl Db {
     } else {
       // ── New database: create MANIFEST and WAL ────────────────────────────
       log::info!("creating new database at {}", path.display());
-      let vs = VersionSet::create(path, &*options.comparator, &*options.file_system)?;
+      let vs = VersionSet::create(path, Arc::clone(&options.comparator), &*options.file_system)?;
       // Initial WAL is always 000001.log (log_number = 1 from VersionSet::create).
       fs.create_writable(&path.join("000001.log"))?;
       (
@@ -1049,8 +1049,8 @@ impl Db {
 
     // SSTable files from the current Version, level by level (L0 first).
     if let (Some(version), Some(persistence)) = (version, &self.inner.persistence) {
-      for level_files in &version.files {
-        for meta in level_files {
+      for level in 0..crate::db::version::NUM_LEVELS {
+        for meta in version.files_at(level) {
           let table = persistence
             .table_cache
             .get_or_open(meta.number, meta.file_size)?;
@@ -1144,7 +1144,7 @@ impl Db {
       let cmp = &*self.inner.options.comparator;
       let mut max = 0usize;
       for level in 0..NUM_LEVELS {
-        let has = version.files[level].iter().any(|m| {
+        let has = version.files_at(level).iter().any(|m| {
           file_overlaps_range(
             ikey_user_key(&m.smallest),
             ikey_user_key(&m.largest),
@@ -1716,7 +1716,7 @@ fn make_room_for_write<'a>(
     let l0 = g
       .version_set
       .as_ref()
-      .map_or(0, |vs| vs.current().files[0].len());
+      .map_or(0, |vs| vs.current().num_files(0));
     if allow_delay && l0 >= L0_SLOWDOWN_WRITES_TRIGGER {
       // Slow down at most once per write call.
       log::debug!("L0 file count ({l0}) ≥ {L0_SLOWDOWN_WRITES_TRIGGER}: delaying writes 1ms");
@@ -1995,7 +1995,6 @@ fn finish_flush_at_open(
         &result.smallest_user_key,
         &result.largest_user_key,
         opts.max_file_size as u64,
-        &*opts.comparator,
       )
     } else {
       0
@@ -2111,7 +2110,6 @@ fn finish_flush(
         &result.smallest_user_key,
         &result.largest_user_key,
         opts.max_file_size as u64,
-        &*opts.comparator,
       ),
       _ => 0,
     }
@@ -2237,79 +2235,6 @@ fn total_file_size(files: &[Arc<FileMetaData>]) -> u64 {
   files.iter().map(|f| f.file_size).sum()
 }
 
-/// Files at `level` whose user-key range overlaps `[begin_uk, end_uk]`.
-///
-/// For L0, the result may expand the input range (L0 files can overlap each
-/// other), so the scan repeats until stable.  For L1+, files are
-/// non-overlapping and sorted, so a single linear pass suffices.
-///
-/// `begin_uk` and `end_uk` are bare user keys (no internal key suffix).
-fn get_overlapping_inputs(
-  version: &crate::db::version::Version,
-  level: usize,
-  begin_uk: &[u8],
-  end_uk: &[u8],
-  cmp: &dyn crate::comparator::Comparator,
-) -> Vec<Arc<FileMetaData>> {
-  let mut result: Vec<Arc<FileMetaData>> = Vec::new();
-  let mut lo = begin_uk.to_vec();
-  let mut hi = end_uk.to_vec();
-
-  loop {
-    result.clear();
-    let prev_lo = lo.clone();
-    let prev_hi = hi.clone();
-    for f in &version.files[level] {
-      let f_lo = ikey_user_key(&f.smallest);
-      let f_hi = ikey_user_key(&f.largest);
-      if cmp.compare(f_hi, lo.as_slice()).is_lt() || cmp.compare(f_lo, hi.as_slice()).is_gt() {
-        continue; // no overlap
-      }
-      result.push(Arc::clone(f));
-      if level == 0 {
-        // Expand range to cover this file.
-        if cmp.compare(f_lo, lo.as_slice()).is_lt() {
-          lo = f_lo.to_vec();
-        }
-        if cmp.compare(f_hi, hi.as_slice()).is_gt() {
-          hi = f_hi.to_vec();
-        }
-      }
-    }
-    if level > 0 || (lo == prev_lo && hi == prev_hi) {
-      break;
-    }
-  }
-  result
-}
-
-/// True if any file at `level` has a user-key range overlapping `[smallest_uk, largest_uk]`.
-///
-/// For L0 uses a full scan (files may overlap each other).
-/// For L1+ uses a linear scan; files are non-overlapping and sorted so we can break early.
-///
-/// Port of LevelDB's `Version::OverlapInLevel`.
-fn overlap_in_level(
-  version: &crate::db::version::Version,
-  level: usize,
-  smallest_uk: &[u8],
-  largest_uk: &[u8],
-  cmp: &dyn crate::comparator::Comparator,
-) -> bool {
-  for f in &version.files[level] {
-    let f_lo = ikey_user_key(&f.smallest);
-    let f_hi = ikey_user_key(&f.largest);
-    if cmp.compare(f_hi, smallest_uk).is_ge() && cmp.compare(f_lo, largest_uk).is_le() {
-      return true;
-    }
-    // L1+: files are sorted by smallest key; once f_lo > largest_uk no later file can overlap.
-    if level > 0 && cmp.compare(f_lo, largest_uk).is_gt() {
-      break;
-    }
-  }
-  false
-}
-
 /// Maximum grandparent (level+2) overlap in bytes before flush placement stops pushing deeper.
 ///
 /// Matches LevelDB's `MaxGrandParentOverlapBytes = 10 * TargetFileSize`.
@@ -2333,28 +2258,22 @@ fn pick_level_for_memtable_output(
   smallest_uk: &[u8],
   largest_uk: &[u8],
   max_file_size: u64,
-  cmp: &dyn crate::comparator::Comparator,
 ) -> usize {
   use crate::db::version::NUM_LEVELS;
   const MAX_MEM_COMPACT_LEVEL: usize = 2;
 
   let mut level = 0;
-  if !overlap_in_level(version, 0, smallest_uk, largest_uk, cmp) {
+  if !version.overlaps_level(0, smallest_uk, largest_uk) {
     // No L0 overlap — consider pushing deeper.
     while level < MAX_MEM_COMPACT_LEVEL {
-      if overlap_in_level(version, level + 1, smallest_uk, largest_uk, cmp) {
+      if version.overlaps_level(level + 1, smallest_uk, largest_uk) {
         break;
       }
       if level + 2 < NUM_LEVELS {
         // Check grandparent overlap to avoid creating a file that will cause
         // an expensive compaction at the next level.
-        let grandparent_bytes = total_file_size(&get_overlapping_inputs(
-          version,
-          level + 2,
-          smallest_uk,
-          largest_uk,
-          cmp,
-        ));
+        let grandparent_bytes =
+          total_file_size(&version.overlapping_inputs(level + 2, smallest_uk, largest_uk));
         if grandparent_bytes > max_grandparent_overlap_bytes(max_file_size) {
           break;
         }
@@ -2394,7 +2313,8 @@ fn add_boundary_inputs(
     // the same user key as `largest_uk` but a strictly greater internal key
     // (i.e., same user key, lower sequence number), and isn't already in the
     // compaction set.
-    let boundary = version.files[level]
+    let boundary = version
+      .files_at(level)
       .iter()
       .filter(|f| {
         let f_uk = ikey_user_key(&f.smallest);
@@ -2482,7 +2402,7 @@ fn setup_other_inputs(
   let smallest_uk = ikey_user_key(&smallest).to_vec();
   let largest_uk = ikey_user_key(&largest).to_vec();
 
-  spec.inputs[1] = get_overlapping_inputs(version, level + 1, &smallest_uk, &largest_uk, cmp);
+  spec.inputs[1] = version.overlapping_inputs(level + 1, &smallest_uk, &largest_uk);
   add_boundary_inputs(version, level + 1, &mut spec.inputs[1], cmp);
 
   let (all_start, all_limit) = get_range2(&spec.inputs[0], &spec.inputs[1], cmp);
@@ -2491,7 +2411,7 @@ fn setup_other_inputs(
 
   // Try to expand inputs[0] without expanding inputs[1].
   if !spec.inputs[1].is_empty() {
-    let mut expanded0 = get_overlapping_inputs(version, level, &all_start_uk, &all_limit_uk, cmp);
+    let mut expanded0 = version.overlapping_inputs(level, &all_start_uk, &all_limit_uk);
     add_boundary_inputs(version, level, &mut expanded0, cmp);
 
     let inputs1_size = total_file_size(&spec.inputs[1]);
@@ -2502,7 +2422,7 @@ fn setup_other_inputs(
       let (exp_start, exp_limit) = get_range(&expanded0, cmp);
       let exp_start_uk = ikey_user_key(&exp_start).to_vec();
       let exp_limit_uk = ikey_user_key(&exp_limit).to_vec();
-      let expanded1 = get_overlapping_inputs(version, level + 1, &exp_start_uk, &exp_limit_uk, cmp);
+      let expanded1 = version.overlapping_inputs(level + 1, &exp_start_uk, &exp_limit_uk);
       // Only accept the expansion if it doesn't pull in more L+1 files.
       if expanded1.len() == spec.inputs[1].len() {
         spec.inputs[0] = expanded0;
@@ -2516,8 +2436,7 @@ fn setup_other_inputs(
     let (final_start, final_limit) = get_range2(&spec.inputs[0], &spec.inputs[1], cmp);
     let final_start_uk = ikey_user_key(&final_start).to_vec();
     let final_limit_uk = ikey_user_key(&final_limit).to_vec();
-    spec.grandparents =
-      get_overlapping_inputs(version, level + 2, &final_start_uk, &final_limit_uk, cmp);
+    spec.grandparents = version.overlapping_inputs(level + 2, &final_start_uk, &final_limit_uk);
   }
 
   // Update compact_pointer: advance past largest key of inputs[0].
@@ -2573,7 +2492,7 @@ fn is_base_level_for_key(
 ) -> bool {
   use crate::db::version::NUM_LEVELS;
   for lvl in (spec.level + 2)..NUM_LEVELS {
-    let files = &spec.input_version.files[lvl];
+    let files = spec.input_version.files_at(lvl);
     while spec.level_ptrs[lvl] < files.len() {
       let f = &files[spec.level_ptrs[lvl]];
       let f_largest_uk = ikey_user_key(&f.largest);
@@ -2633,7 +2552,8 @@ fn pick_compaction(
     if level == 0 {
       // For L0, seed with the first file past compact_pointer[0], then expand
       // to all overlapping L0 files (L0 files can overlap each other).
-      let seed = version.files[0]
+      let seed = version
+        .files_at(0)
         .iter()
         .find(|f| {
           compact_pointer[0].is_empty()
@@ -2644,15 +2564,16 @@ fn pick_compaction(
               )
               .is_gt()
         })
-        .or_else(|| version.files[0].first())
+        .or_else(|| version.files_at(0).first())
         .cloned()?;
 
       let seed_lo = ikey_user_key(&seed.smallest).to_vec();
       let seed_hi = ikey_user_key(&seed.largest).to_vec();
-      spec.inputs[0] = get_overlapping_inputs(version, 0, &seed_lo, &seed_hi, cmp);
+      spec.inputs[0] = version.overlapping_inputs(0, &seed_lo, &seed_hi);
     } else {
       // L1+: pick the first file whose largest key is past compact_pointer[level].
-      let file = version.files[level]
+      let file = version
+        .files_at(level)
         .iter()
         .find(|f| {
           compact_pointer[level].is_empty()
@@ -2663,7 +2584,7 @@ fn pick_compaction(
               )
               .is_gt()
         })
-        .or_else(|| version.files[level].first())
+        .or_else(|| version.files_at(level).first())
         .cloned()?;
       spec.inputs[0].push(file);
     }
@@ -3008,7 +2929,8 @@ fn pick_range_compaction(
     return None;
   }
 
-  let level_inputs: Vec<Arc<FileMetaData>> = version.files[level]
+  let level_inputs: Vec<Arc<FileMetaData>> = version
+    .files_at(level)
     .iter()
     .filter(|m| {
       file_overlaps_range(
@@ -3040,7 +2962,8 @@ fn pick_range_compaction(
     .largest
     .clone();
 
-  let next_inputs: Vec<Arc<FileMetaData>> = version.files[level + 1]
+  let next_inputs: Vec<Arc<FileMetaData>> = version
+    .files_at(level + 1)
     .iter()
     .filter(|m| key_ranges_overlap(&m.smallest, &m.largest, &range_small, &range_large, cmp))
     .cloned()
@@ -3092,13 +3015,7 @@ fn compact_level_range(
   // Populate grandparents if level+2 < NUM_LEVELS.
   if level + 2 < crate::db::version::NUM_LEVELS {
     let (s, l) = get_range2(&spec.inputs[0], &spec.inputs[1], cmp);
-    spec.grandparents = get_overlapping_inputs(
-      &version,
-      level + 2,
-      ikey_user_key(&s),
-      ikey_user_key(&l),
-      cmp,
-    );
+    spec.grandparents = version.overlapping_inputs(level + 2, ikey_user_key(&s), ikey_user_key(&l));
   }
 
   // Phase 2: I/O (no lock).
@@ -4227,7 +4144,7 @@ mod tests {
     // be below the compaction trigger.
     let l0_count = {
       let g = db.inner.state.lock().unwrap();
-      g.version_set.as_ref().unwrap().current().files[0].len()
+      g.version_set.as_ref().unwrap().current().files_at(0).len()
     };
     assert!(
       l0_count < crate::L0_COMPACTION_TRIGGER,
@@ -4323,7 +4240,7 @@ mod tests {
       let g = db.inner.state.lock().unwrap();
       let cur = g.version_set.as_ref().unwrap().current();
       (1..crate::db::version::NUM_LEVELS)
-        .map(|l| cur.files[l].len())
+        .map(|l| cur.files_at(l).len())
         .sum()
     };
     assert!(
@@ -4386,7 +4303,7 @@ mod tests {
     db.compact_range(None, None).unwrap();
     let l0_count = {
       let g = db.inner.state.lock().unwrap();
-      g.version_set.as_ref().unwrap().current().files[0].len()
+      g.version_set.as_ref().unwrap().current().files_at(0).len()
     };
     assert_eq!(l0_count, 0, "L0 should be empty after full compact_range");
   }
@@ -5005,12 +4922,13 @@ mod tests {
     use crate::db::version_edit::FileMetaData;
     use crate::table::format::make_internal_key;
 
-    let mut v = crate::db::version::Version::new();
+    let mut v =
+      crate::db::version::Version::new(std::sync::Arc::new(crate::comparator::BytewiseComparator));
     let mut file_number = 10u64;
     for &(level, size) in level_sizes {
       let ikey = make_internal_key(format!("a{file_number}").as_bytes(), file_number, 1);
       let meta = FileMetaData::new(file_number, size, ikey.clone(), ikey);
-      v.files[level].push(meta);
+      v.push_file_for_test(level, meta);
       file_number += 1;
     }
     v
@@ -5020,7 +4938,7 @@ mod tests {
   fn finalize_l0_score_from_file_count() {
     // 4 L0 files / L0_COMPACTION_TRIGGER (4) = score 1.0.
     let mut v = version_with_files(&[(0, 0), (0, 0), (0, 0), (0, 0)]);
-    crate::db::version::finalize(&mut v, 4);
+    crate::db::version::finalize(&mut v);
     assert!(
       (v.compaction_score - 1.0).abs() < 1e-9,
       "expected score 1.0, got {}",
@@ -5034,7 +4952,7 @@ mod tests {
     // 10 MiB at L1 = score exactly 1.0.
     let ten_mib = 10 * 1_048_576u64;
     let mut v = version_with_files(&[(1, ten_mib)]);
-    crate::db::version::finalize(&mut v, 4);
+    crate::db::version::finalize(&mut v);
     assert!(
       (v.compaction_score - 1.0).abs() < 1e-9,
       "expected score 1.0, got {}",
@@ -5058,7 +4976,7 @@ mod tests {
       (0, 0), // 8 L0 files → score 2.0
       (1, five_mib),
     ]);
-    crate::db::version::finalize(&mut v, 4);
+    crate::db::version::finalize(&mut v);
     assert!(v.compaction_score >= 2.0 - 1e-9);
     assert_eq!(v.compaction_level, 0);
   }
@@ -5080,11 +4998,11 @@ mod tests {
     let file_a = FileMetaData::new(10, 100, ikey_high.clone(), ikey_high.clone());
     let file_b = FileMetaData::new(11, 100, ikey_low.clone(), ikey_low.clone());
 
-    let mut v = Version::new();
+    let mut v = Version::new(std::sync::Arc::new(crate::comparator::BytewiseComparator));
     // L1 sorted by smallest: file_a (seq=5) sorts BEFORE file_b (seq=2) because
     // higher seq means lower internal key value (tag sorts descending).
-    v.files[1].push(Arc::clone(&file_a));
-    v.files[1].push(Arc::clone(&file_b));
+    v.push_file_for_test(1, Arc::clone(&file_a));
+    v.push_file_for_test(1, Arc::clone(&file_b));
 
     // Start compaction with only file_a; boundary check should add file_b.
     let mut compaction_files = vec![Arc::clone(&file_a)];
@@ -5129,7 +5047,7 @@ mod tests {
     let vs = crate::db::version_set::VersionSet::recover(
       dir.path(),
       false,
-      &crate::comparator::BytewiseComparator,
+      std::sync::Arc::new(crate::comparator::BytewiseComparator),
       &crate::env::PosixFileSystem,
     )
     .unwrap();
@@ -5174,7 +5092,7 @@ mod tests {
     let (l0, l2) = {
       let g = db.inner.state.lock().unwrap();
       let cur = g.version_set.as_ref().unwrap().current();
-      (cur.files[0].len(), cur.files[2].len())
+      (cur.files_at(0).len(), cur.files_at(2).len())
     };
     assert_eq!(
       l0, 0,
@@ -5258,8 +5176,8 @@ mod tests {
     let (l1_bytes, l2_files) = {
       let g = db.inner.state.lock().unwrap();
       let cur = g.version_set.as_ref().unwrap().current();
-      let l1b: u64 = cur.files[1].iter().map(|f| f.file_size).sum();
-      (l1b, cur.files[2].len())
+      let l1b: u64 = cur.files_at(1).iter().map(|f| f.file_size).sum();
+      (l1b, cur.files_at(2).len())
     };
     // L2 should have received at least one file from an L1→L2 compaction.
     assert!(
@@ -5299,9 +5217,9 @@ mod tests {
       )
     };
 
-    let mut v = Version::new();
+    let mut v = Version::new(std::sync::Arc::new(crate::comparator::BytewiseComparator));
     // One L1 file covering "a".."z"; no L2 files.
-    v.files[1].push(make_meta(10, b"a", b"z"));
+    v.push_file_for_test(1, make_meta(10, b"a", b"z"));
     let version = Arc::new(v);
 
     let opts = Options {
@@ -5311,7 +5229,7 @@ mod tests {
 
     // Build a spec for this file: one L1 input, no L2 inputs, no grandparents.
     let mut spec = CompactionSpec::new(1, Arc::clone(&version));
-    spec.inputs[0].push(Arc::clone(&version.files[1][0]));
+    spec.inputs[0].push(Arc::clone(&version.files_at(1)[0]));
     // inputs[1] and grandparents are empty (no L2 or L3 files).
 
     assert!(
@@ -5356,9 +5274,9 @@ mod tests {
       )
     };
 
-    let mut v = Version::new();
-    v.files[1].push(make_meta(10, b"a", b"z"));
-    v.files[2].push(make_meta(20, b"m", b"p")); // overlapping L2 file
+    let mut v = Version::new(std::sync::Arc::new(crate::comparator::BytewiseComparator));
+    v.push_file_for_test(1, make_meta(10, b"a", b"z"));
+    v.push_file_for_test(2, make_meta(20, b"m", b"p")); // overlapping L2 file
     let version = Arc::new(v);
 
     let opts = Options {
@@ -5367,8 +5285,8 @@ mod tests {
     };
 
     let mut spec = CompactionSpec::new(1, Arc::clone(&version));
-    spec.inputs[0].push(Arc::clone(&version.files[1][0]));
-    spec.inputs[1].push(Arc::clone(&version.files[2][0])); // L2 overlap present
+    spec.inputs[0].push(Arc::clone(&version.files_at(1)[0]));
+    spec.inputs[1].push(Arc::clone(&version.files_at(2)[0])); // L2 overlap present
 
     assert!(
       !is_trivial_move(&spec, &opts),
@@ -5439,16 +5357,16 @@ mod tests {
       )
     };
 
-    let mut v = Version::new();
+    let mut v = Version::new(std::sync::Arc::new(crate::comparator::BytewiseComparator));
     // L1 compaction inputs (level 1).
-    v.files[1].push(make_meta(1, b"a", b"z"));
+    v.push_file_for_test(1, make_meta(1, b"a", b"z"));
     // L3 = level+2 from L1: two non-overlapping files.
-    v.files[3].push(make_meta(10, b"b", b"d")); // covers b..d
-    v.files[3].push(make_meta(11, b"p", b"r")); // covers p..r
+    v.push_file_for_test(3, make_meta(10, b"b", b"d")); // covers b..d
+    v.push_file_for_test(3, make_meta(11, b"p", b"r")); // covers p..r
     let version = Arc::new(v);
 
     let mut spec = CompactionSpec::new(1, Arc::clone(&version));
-    spec.inputs[0].push(Arc::clone(&version.files[1][0]));
+    spec.inputs[0].push(Arc::clone(&version.files_at(1)[0]));
 
     let cmp = &crate::BytewiseComparator;
     // "c" is inside file 10 (b..d) → NOT base level.
@@ -5483,7 +5401,7 @@ mod tests {
       )
     };
 
-    let v = Version::new();
+    let v = Version::new(std::sync::Arc::new(crate::comparator::BytewiseComparator));
     let version = Arc::new(v);
 
     let opts = Options {
@@ -5585,24 +5503,24 @@ mod tests {
       )
     };
 
-    let mut v = Version::new();
+    let mut v = Version::new(std::sync::Arc::new(crate::comparator::BytewiseComparator));
     // Newest file (file 1) covers "a".."m"; older file (file 2) covers "g".."z".
     // L0 is newest-first so file 1 is index 0.
-    v.files[0].push(mk(1, b"a", b"m"));
-    v.files[0].push(mk(2, b"g", b"z"));
+    v.push_file_for_test(0, mk(1, b"a", b"m"));
+    v.push_file_for_test(0, mk(2, b"g", b"z"));
     let version = Arc::new(v);
 
     // We can't do a real table lookup without actual SSTable files, so instead
     // directly call the get stats logic by checking GetStats construction.
     // Simulate: we probed file 1 first (found nothing) then file 2.
     // Blame = file 1 (first consulted, not where we found the answer).
-    let before = version.files[0][0].allowed_seeks.load(Ordering::Relaxed);
+    let before = version.files_at(0)[0].allowed_seeks.load(Ordering::Relaxed);
     assert!(before >= 100, "initial allowed_seeks should be ≥ 100");
 
     // Simulate the update_stats call that Db::get would make.
     use crate::db::version::GetStats;
     let stats = GetStats {
-      seek_file: Some(Arc::clone(&version.files[0][0])),
+      seek_file: Some(Arc::clone(&version.files_at(0)[0])),
       seek_file_level: 0,
     };
     let mut ds = super::DbState {
@@ -5622,7 +5540,7 @@ mod tests {
       pending_flush: None,
     };
     super::update_stats(&mut ds, &stats);
-    let after = version.files[0][0].allowed_seeks.load(Ordering::Relaxed);
+    let after = version.files_at(0)[0].allowed_seeks.load(Ordering::Relaxed);
     assert_eq!(
       after,
       before - 1,
@@ -5654,11 +5572,11 @@ mod tests {
       )
     };
 
-    let mut v = Version::new();
-    v.files[0].push(mk(1));
+    let mut v = Version::new(std::sync::Arc::new(crate::comparator::BytewiseComparator));
+    v.push_file_for_test(0, mk(1));
     let version = Arc::new(v);
 
-    let file = Arc::clone(&version.files[0][0]);
+    let file = Arc::clone(&version.files_at(0)[0]);
     let initial = file.allowed_seeks.load(Ordering::Relaxed);
     assert_eq!(initial, 100);
 
@@ -5734,7 +5652,7 @@ mod tests {
       let g = db.inner.state.lock().unwrap();
       if let Some(vs) = &g.version_set {
         let cur = vs.current();
-        if let Some(f) = cur.files[0].first() {
+        if let Some(f) = cur.files_at(0).first() {
           f.allowed_seeks.store(1, Ordering::Relaxed);
         }
       }

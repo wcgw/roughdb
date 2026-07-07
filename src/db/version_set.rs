@@ -66,6 +66,8 @@ pub(crate) struct VersionSet {
   /// Round-robin compaction cursor per level: the largest internal key last compacted.
   /// Empty vec = not yet set.  Persisted to MANIFEST via TAG_COMPACT_POINTER.
   compact_pointer: [Vec<u8>; crate::db::version::NUM_LEVELS],
+  /// User-key comparator, stamped onto every `Version` this set builds.
+  comparator: Arc<dyn crate::comparator::Comparator>,
 }
 
 impl VersionSet {
@@ -77,7 +79,7 @@ impl VersionSet {
   /// File numbering: 1 = WAL, 2 = MANIFEST, 3+ = SSTables.
   pub(crate) fn create(
     path: &Path,
-    comparator: &dyn crate::comparator::Comparator,
+    comparator: Arc<dyn crate::comparator::Comparator>,
     fs: &dyn crate::env::FileSystem,
   ) -> Result<Self, Error> {
     let manifest_number = 2u64;
@@ -97,13 +99,14 @@ impl VersionSet {
     write_current_file(path, manifest_number, fs)?;
 
     Ok(VersionSet {
-      current: Arc::new(Version::new()),
+      current: Arc::new(Version::new(Arc::clone(&comparator))),
       next_file_number: 3,
       last_sequence: 0,
       log_number: 1,
       manifest_log,
       manifest_number,
       compact_pointer: std::array::from_fn(|_| Vec::new()),
+      comparator,
     })
   }
 
@@ -116,7 +119,7 @@ impl VersionSet {
   pub(crate) fn recover(
     path: &Path,
     paranoid_checks: bool,
-    comparator: &dyn crate::comparator::Comparator,
+    comparator: Arc<dyn crate::comparator::Comparator>,
     fs: &dyn crate::env::FileSystem,
   ) -> Result<Self, Error> {
     let manifest_name = read_current_file(path, fs)?;
@@ -157,9 +160,9 @@ impl VersionSet {
     let compact_pointer: [Vec<u8>; crate::db::version::NUM_LEVELS] =
       std::array::from_fn(|i| builder.compact_pointer[i].clone());
 
-    let mut files = builder.build();
+    let mut files = builder.build(Arc::clone(&comparator));
     // Compute compaction scores on the recovered version.
-    crate::db::version::finalize(&mut files, 4); // 4 = L0_COMPACTION_TRIGGER
+    crate::db::version::finalize(&mut files);
 
     // Re-open the MANIFEST for appending (continue after the last record).
     let manifest_len = fs.file_size(&manifest_path)?;
@@ -174,6 +177,7 @@ impl VersionSet {
       manifest_log,
       manifest_number,
       compact_pointer,
+      comparator,
     })
   }
 
@@ -195,7 +199,7 @@ impl VersionSet {
 
     // Build new Version by cloning current and applying additions/deletions.
     let mut new_files: [Vec<Arc<FileMetaData>>; 7] =
-      std::array::from_fn(|i| self.current.files[i].clone());
+      std::array::from_fn(|i| self.current.files_at(i).to_vec());
 
     for &(level, number) in &edit.deleted_files {
       let level = level as usize;
@@ -215,7 +219,7 @@ impl VersionSet {
 
     // Keep L1–L6 sorted by smallest user key so binary search and overlap
     // checks work correctly.  L0 files are intentionally newest-first.
-    let cmp = tc.comparator();
+    let cmp = &*self.comparator;
     for level_files in new_files.iter_mut().skip(1) {
       level_files.sort_by(|a, b| {
         let ak = crate::table::format::user_key(&a.smallest);
@@ -229,12 +233,8 @@ impl VersionSet {
       self.compact_pointer[*level as usize] = key.clone();
     }
 
-    let mut v = Version {
-      files: new_files,
-      compaction_score: -1.0,
-      compaction_level: -1,
-    };
-    crate::db::version::finalize(&mut v, 4); // 4 = L0_COMPACTION_TRIGGER
+    let mut v = Version::from_files(new_files, Arc::clone(&self.comparator));
+    crate::db::version::finalize(&mut v);
     self.current = Arc::new(v);
     Ok(())
   }
@@ -282,8 +282,8 @@ impl VersionSet {
   /// Called by `delete_obsolete_files` to compute the set of files that must
   /// not be deleted.  Matches LevelDB's `VersionSet::AddLiveFiles`.
   pub(crate) fn add_live_files(&self, live: &mut HashSet<u64>) {
-    for level_files in &self.current.files {
-      for meta in level_files {
+    for level in 0..crate::db::version::NUM_LEVELS {
+      for meta in self.current.files_at(level) {
         live.insert(meta.number);
       }
     }
@@ -349,7 +349,7 @@ impl Builder {
   /// Tables are opened lazily by the `TableCache` on first access — no I/O
   /// here, matching LevelDB's separation between `VersionSet` and
   /// `TableCache`.
-  fn build(self) -> Version {
+  fn build(self, comparator: Arc<dyn crate::comparator::Comparator>) -> Version {
     let mut files: [Vec<Arc<FileMetaData>>; 7] = std::array::from_fn(|_| Vec::new());
 
     // Collect live files per level (stable insertion order for L0).
@@ -363,19 +363,21 @@ impl Builder {
         // L0: newest-first (sort by file number descending).
         level_files.sort_by_key(|b| std::cmp::Reverse(b.0));
       } else {
-        // L1+: sort by smallest key.
-        level_files.sort_by(|a, b| a.1.smallest.cmp(&b.1.smallest));
+        // L1+: sort by smallest user key using the DB comparator (must match
+        // the ordering `log_and_apply` maintains for live versions).
+        level_files.sort_by(|a, b| {
+          comparator.compare(
+            crate::table::format::user_key(&a.1.smallest),
+            crate::table::format::user_key(&b.1.smallest),
+          )
+        });
       }
       for (_, meta) in level_files {
         files[level].push(meta);
       }
     }
 
-    Version {
-      files,
-      compaction_score: -1.0,
-      compaction_level: -1,
-    }
+    Version::from_files(files, comparator)
   }
 }
 
@@ -439,7 +441,7 @@ mod tests {
     let dir = tempfile::tempdir().unwrap();
     VersionSet::create(
       dir.path(),
-      &crate::comparator::BytewiseComparator,
+      std::sync::Arc::new(crate::comparator::BytewiseComparator),
       &crate::env::PosixFileSystem,
     )
     .unwrap();
@@ -454,7 +456,7 @@ mod tests {
     let dir = tempfile::tempdir().unwrap();
     let mut vs = VersionSet::create(
       dir.path(),
-      &crate::comparator::BytewiseComparator,
+      std::sync::Arc::new(crate::comparator::BytewiseComparator),
       &crate::env::PosixFileSystem,
     )
     .unwrap();
@@ -469,21 +471,21 @@ mod tests {
 
     // Current version must have file 3 in L0.
     let cur = vs.current();
-    assert_eq!(cur.files[0].len(), 1);
-    assert_eq!(cur.files[0][0].number, 3);
+    assert_eq!(cur.files_at(0).len(), 1);
+    assert_eq!(cur.files_at(0)[0].number, 3);
 
     // Drop and recover — the file must still appear.
     drop(vs);
     let vs2 = VersionSet::recover(
       dir.path(),
       false,
-      &crate::comparator::BytewiseComparator,
+      std::sync::Arc::new(crate::comparator::BytewiseComparator),
       &crate::env::PosixFileSystem,
     )
     .unwrap();
     let cur2 = vs2.current();
-    assert_eq!(cur2.files[0].len(), 1);
-    assert_eq!(cur2.files[0][0].number, 3);
+    assert_eq!(cur2.files_at(0).len(), 1);
+    assert_eq!(cur2.files_at(0)[0].number, 3);
   }
 
   #[test]
@@ -491,7 +493,7 @@ mod tests {
     let dir = tempfile::tempdir().unwrap();
     let mut vs = VersionSet::create(
       dir.path(),
-      &crate::comparator::BytewiseComparator,
+      std::sync::Arc::new(crate::comparator::BytewiseComparator),
       &crate::env::PosixFileSystem,
     )
     .unwrap();
@@ -507,7 +509,7 @@ mod tests {
     let vs2 = VersionSet::recover(
       dir.path(),
       false,
-      &crate::comparator::BytewiseComparator,
+      std::sync::Arc::new(crate::comparator::BytewiseComparator),
       &crate::env::PosixFileSystem,
     )
     .unwrap();
@@ -525,7 +527,7 @@ mod tests {
     let dir = tempfile::tempdir().unwrap();
     let mut vs = VersionSet::create(
       dir.path(),
-      &crate::comparator::BytewiseComparator,
+      std::sync::Arc::new(crate::comparator::BytewiseComparator),
       &crate::env::PosixFileSystem,
     )
     .unwrap();
@@ -540,7 +542,7 @@ mod tests {
     let vs2 = VersionSet::recover(
       dir.path(),
       false,
-      &crate::comparator::BytewiseComparator,
+      std::sync::Arc::new(crate::comparator::BytewiseComparator),
       &crate::env::PosixFileSystem,
     )
     .unwrap();
