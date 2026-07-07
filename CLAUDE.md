@@ -36,6 +36,26 @@ Db::put/delete/write
 
 The read path checks `mem` → `imm` → each level of SSTables (newest to oldest), stopping at the first hit.
 
+### Module map
+
+- **`src/lib.rs`** — public `Db` API and orchestration only: open/recovery, the write path (write groups,
+  backpressure), the three-phase lock protocol (snapshot under lock → I/O without lock → install under lock), flush,
+  compaction *installation* (`install_compaction`, `install_trivial_move`, `maybe_compact`, `compact_level_range`),
+  and file GC.
+- **`src/db/compaction.rs`** — compaction planning + execution behind a pick → do → install seam.
+  `pick_compaction`/`pick_range_compaction` produce a `Compaction` plan from a `Version` snapshot; `do_compaction`
+  executes it with **no lock and no `DbState` dependency** (output file numbers come from an injected
+  `FnMut() -> u64`). Unit-testable against a hand-built `Version` — no `Db`, no disk.
+- **`src/db/version.rs`** — `Version` is a deep module: `files` is **private**; use `overlapping_inputs`,
+  `overlaps_level`, `files_at`, `num_files`. It owns an `Arc<dyn Comparator>` (as does `VersionSet`), so overlap/range
+  queries never take a comparator parameter. `L0_COMPACTION_TRIGGER` lives here, next to `finalize`.
+- **`src/table/format.rs`** — canonical internal-key helpers: `user_key` (strip the 8-byte tag; never open-code
+  `&ikey[..len-8]`), `make_internal_key`, `encode_internal_key_into` (in-place, for hot paths), `parse_internal_key`,
+  `cmp_internal_keys`. Also `MAX_BLOCK_SIZE` (16 MiB), the allocation cap for block reads and decompression.
+- **`src/env.rs`** — `FileSystem` trait with two adapters: `PosixFileSystem` (production) and `MemFileSystem`
+  (`#[cfg(test)]`, in-memory). Prefer `MemFileSystem` over tempdirs for new DB-lifecycle tests — it is deterministic
+  and disk-free (see `full_db_lifecycle_on_mem_filesystem` in `lib.rs`).
+
 ### Implemented
 
 **Memtable** (`src/memtable/`)
@@ -363,15 +383,16 @@ what remains is compaction, the full Iterator/Snapshot API, and operational hygi
   `find_shortest_separator`, `find_short_successor`. `BytewiseComparator` is the default. `Options::comparator:
   Arc<dyn Comparator>` threaded through all ~40 comparison sites: skip list entry ordering, `cmp_internal_keys`,
   `BlockIter::seek`, `MergingIterator`, `DbIterator`, `Table::get`, `TableBuilder` (index separators shortened via
-  `find_shortest_separator`/`find_short_successor`), `VersionSet` file sorting, and all `lib.rs` compaction/overlap
-  helpers. `VersionEdit` encodes/decodes the comparator name; `VersionSet::recover` rejects mismatches.
+  `find_shortest_separator`/`find_short_successor`), and `VersionSet` file sorting. `Version` and `VersionSet` own an
+  `Arc<dyn Comparator>`, so overlap/range queries and the `db::compaction` helpers take no comparator parameter.
+  `VersionEdit` encodes/decodes the comparator name; `VersionSet::recover` rejects mismatches.
   See `include/leveldb/comparator.h`.
 - ✅ **`FileSystem` abstraction**: `FileSystem` trait (`src/env.rs`) with `SequentialFile`, `RandomAccessFile`,
   `WritableFile`, and `FileLock` sub-traits. `PosixFileSystem` is the default (POSIX `std::fs` + `libc::flock`).
   `Options::file_system: Arc<dyn FileSystem>` threaded through all I/O: `LogWriter`, `LogReader`, `Table`,
   `TableBuilder`, `TableCache`, `VersionSet`, and all `lib.rs` functions (flush, compaction, repair, destroy, GC).
-  `libc` usage isolated to `PosixFileSystem`. Enables in-memory, encrypted, or cloud storage backends.
-  See `include/rocksdb/file_system.h`.
+  `libc` usage isolated to `PosixFileSystem`. A second adapter, `MemFileSystem` (`#[cfg(test)]`), runs the full DB
+  lifecycle in memory for tests; encrypted or cloud backends remain possible. See `include/rocksdb/file_system.h`.
 - ✅ **`Db::repair(path, options)`**: Scans the database directory for surviving `.ldb` and `.log` files, converts WALs
   to SSTables via `LogReader` → `Memtable` → `TableBuilder`, extracts metadata from all SSTables, writes a fresh
   `MANIFEST-000001` placing all files at L0, and writes `CURRENT`.  Corrupt records/files are skipped and archived to
@@ -418,5 +439,12 @@ what remains is compaction, the full Iterator/Snapshot API, and operational hygi
 - Methods or functions only used in tests are gated with `#[cfg(test)]`.
 - Prefer encoding directly into arena/pre-allocated memory (see `Entry` helpers) over intermediate `Vec` allocations on
   hot paths.
+- **Corruption contract**: code that parses bytes read from disk (SSTable blocks, WAL, MANIFEST) must never panic on
+  malformed input — bounds-check and return `Error::Corruption` (or invalidate the iterator with a sticky `status()`).
+  Bound every allocation whose size comes from disk (`MAX_BLOCK_SIZE`). `VersionEdit::decode`, the WAL reader, and
+  `BlockIter` are the reference implementations.
+- **Comparator discipline**: all user-key ordering goes through `Options::comparator` — never raw byte `cmp` on keys
+  or key-containing structs. `Entry` deliberately has no `Ord`/`PartialEq`; skip-list ordering lives in
+  `SkipList::key_after_node_cmp`. When adding a sort or comparison, write a test with a non-bytewise comparator.
 - Run `cargo fmt` on changesets
 - Have text and other files hardwrap at 120 character lines
