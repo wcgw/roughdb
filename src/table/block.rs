@@ -37,23 +37,34 @@ pub(crate) struct Block {
 impl Block {
   /// Wrap raw block bytes (as returned by `read_block`, minus trailer).
   ///
-  /// Panics if `data` is too short to hold a valid restart count.
-  pub(crate) fn new(data: Vec<u8>, comparator: Arc<dyn Comparator>) -> Self {
-    assert!(data.len() >= 4, "block too short: {} bytes", data.len());
+  /// Returns `Error::Corruption` if `data` is too short to hold a valid restart
+  /// array, rather than panicking — the bytes may come from a corrupt SSTable.
+  pub(crate) fn new(data: Vec<u8>, comparator: Arc<dyn Comparator>) -> Result<Self, Error> {
+    if data.len() < 4 {
+      return Err(Error::Corruption(format!(
+        "block too short: {} bytes",
+        data.len()
+      )));
+    }
     let num_restarts = u32::from_le_bytes(data[data.len() - 4..].try_into().unwrap()) as usize;
-    let restarts_size = num_restarts * 4 + 4; // offsets + count field
-    assert!(
-      data.len() >= restarts_size,
-      "block data ({} bytes) too short for {num_restarts} restart points",
-      data.len()
-    );
+    // `num_restarts` comes straight off disk; guard the multiply against overflow.
+    let restarts_size = num_restarts
+      .checked_mul(4)
+      .and_then(|v| v.checked_add(4)) // offsets + count field
+      .ok_or_else(|| Error::Corruption("block restart count overflow".to_owned()))?;
+    if data.len() < restarts_size {
+      return Err(Error::Corruption(format!(
+        "block data ({} bytes) too short for {num_restarts} restart points",
+        data.len()
+      )));
+    }
     let restarts_offset = data.len() - restarts_size;
-    Block {
+    Ok(Block {
       data: Arc::new(data),
       restarts_offset,
       num_restarts,
       comparator,
-    }
+    })
   }
 
   /// Return the raw block data bytes (used by the block cache for charge accounting).
@@ -74,6 +85,7 @@ impl Block {
       value_start: 0,
       value_len: 0,
       comparator: Arc::clone(&self.comparator),
+      status: None,
     }
   }
 }
@@ -101,6 +113,22 @@ pub(crate) struct BlockIter {
   value_len: usize,
   /// Comparator for user-key ordering.
   comparator: Arc<dyn Comparator>,
+  /// Sticky corruption error: set the first time a malformed entry is decoded.
+  /// Once set, the iterator is invalidated and stays that way.
+  status: Option<Error>,
+}
+
+/// Read a varint starting at `pos`, refusing to read past `limit` (the start of
+/// the restart array).  Returns `(value, new_pos)` or `None` on truncation.
+fn read_varu64_at(data: &[u8], pos: usize, limit: usize) -> Option<(u64, usize)> {
+  if pos > limit {
+    return None;
+  }
+  let (value, n) = read_varu64(&data[pos..limit]);
+  if n == 0 {
+    return None; // malformed or truncated varint
+  }
+  Some((value, pos + n))
 }
 
 impl BlockIter {
@@ -112,42 +140,74 @@ impl BlockIter {
   /// Decode the entry at `self.current`, updating `key`, `value_start`, `value_len`.
   ///
   /// Assumes `self.key` already holds the full key from the previous entry
-  /// (or is empty at a restart point).
+  /// (or is empty at a restart point).  A corrupt entry (bad varint, or a
+  /// length that runs past the restart array) invalidates the iterator and
+  /// records a sticky `status`, rather than panicking on an out-of-bounds slice.
   fn decode_entry(&mut self) {
-    let data = &*self.data;
-    let mut pos = self.current;
+    if self.try_decode_entry().is_none() {
+      self.mark_corrupt();
+    }
+  }
 
-    let (shared, n) = read_varu64(&data[pos..]);
-    pos += n;
-    let (unshared, n) = read_varu64(&data[pos..]);
-    pos += n;
-    let (vlen, n) = read_varu64(&data[pos..]);
-    pos += n;
+  /// Fallible core of `decode_entry`; returns `None` on any malformed field.
+  fn try_decode_entry(&mut self) -> Option<()> {
+    let data = &*self.data;
+    let limit = self.restarts_offset;
+
+    let (shared, pos) = read_varu64_at(data, self.current, limit)?;
+    let (unshared, pos) = read_varu64_at(data, pos, limit)?;
+    let (vlen, pos) = read_varu64_at(data, pos, limit)?;
 
     let shared = shared as usize;
     let unshared = unshared as usize;
     let vlen = vlen as usize;
 
-    self.key.truncate(shared);
-    self.key.extend_from_slice(&data[pos..pos + unshared]);
-    pos += unshared;
+    // `shared` can only reference bytes already in the reconstructed key.
+    if shared > self.key.len() {
+      return None;
+    }
+    // The unshared key suffix and the value must both fit before the restarts.
+    let key_end = pos.checked_add(unshared)?;
+    let value_end = key_end.checked_add(vlen)?;
+    if value_end > limit {
+      return None;
+    }
 
-    self.value_start = pos;
+    self.key.truncate(shared);
+    self.key.extend_from_slice(&data[pos..key_end]);
+    self.value_start = key_end;
     self.value_len = vlen;
+    Some(())
   }
 
-  /// Return the key stored at restart point `index` without modifying `self`.
-  fn key_at_restart(&self, index: usize) -> Vec<u8> {
+  /// Invalidate the iterator and record a sticky corruption error.
+  fn mark_corrupt(&mut self) {
+    self.current = self.restarts_offset;
+    // Make `value_start + value_len` land exactly at the restart array so the
+    // forward-scan loops in `seek_to_last`/`prev` terminate immediately.
+    self.value_start = self.restarts_offset;
+    self.value_len = 0;
+    self.key.clear();
+    if self.status.is_none() {
+      self.status = Some(Error::Corruption("corrupt block entry".to_owned()));
+    }
+  }
+
+  /// Return the key stored at restart point `index`, or `None` if the entry
+  /// there is malformed.  Does not modify `self`.
+  fn key_at_restart(&self, index: usize) -> Option<Vec<u8>> {
     let data = &*self.data;
-    let mut pos = self.restart_point(index);
-    // At a restart point shared_len is always 0.
-    let (_shared, n) = read_varu64(&data[pos..]);
-    pos += n;
-    let (unshared, n) = read_varu64(&data[pos..]);
-    pos += n;
-    let (_vlen, n) = read_varu64(&data[pos..]);
-    pos += n;
-    data[pos..pos + unshared as usize].to_vec()
+    let limit = self.restarts_offset;
+    // At a restart point shared_len is always 0, so the unshared suffix is the
+    // full key.
+    let (_shared, pos) = read_varu64_at(data, self.restart_point(index), limit)?;
+    let (unshared, pos) = read_varu64_at(data, pos, limit)?;
+    let (_vlen, pos) = read_varu64_at(data, pos, limit)?;
+    let key_end = pos.checked_add(unshared as usize)?;
+    if key_end > limit {
+      return None;
+    }
+    Some(data[pos..key_end].to_vec())
   }
 }
 
@@ -192,7 +252,13 @@ impl InternalIterator for BlockIter {
     let mut hi = self.num_restarts; // exclusive
     while lo + 1 < hi {
       let mid = lo + (hi - lo) / 2;
-      let restart_key = self.key_at_restart(mid);
+      let restart_key = match self.key_at_restart(mid) {
+        Some(k) => k,
+        None => {
+          self.mark_corrupt();
+          return;
+        }
+      };
       match cmp_internal_keys(restart_key.as_slice(), target, &*self.comparator) {
         std::cmp::Ordering::Less | std::cmp::Ordering::Equal => lo = mid,
         std::cmp::Ordering::Greater => hi = mid,
@@ -267,7 +333,7 @@ impl InternalIterator for BlockIter {
   }
 
   fn status(&self) -> Option<&Error> {
-    None // BlockIter is pure memory; no I/O errors possible.
+    self.status.as_ref()
   }
 }
 
@@ -285,6 +351,7 @@ mod tests {
       bb.finish().to_vec(),
       Arc::new(crate::comparator::BytewiseComparator),
     )
+    .unwrap()
   }
 
   #[test]
@@ -293,7 +360,8 @@ mod tests {
     let block = Block::new(
       bb.finish().to_vec(),
       Arc::new(crate::comparator::BytewiseComparator),
-    );
+    )
+    .unwrap();
     assert!(!block.iter().valid());
   }
 
@@ -374,7 +442,8 @@ mod tests {
     let block = Block::new(
       bb.finish().to_vec(),
       Arc::new(crate::comparator::BytewiseComparator),
-    );
+    )
+    .unwrap();
     let mut it = block.iter();
     it.seek_to_last();
     assert!(!it.valid());
@@ -442,5 +511,113 @@ mod tests {
     }
     let expected: Vec<u8> = (b'a'..=b'i').rev().collect();
     assert_eq!(keys, expected);
+  }
+
+  // ── Corruption handling ───────────────────────────────────────────────────
+  //
+  // A corrupt data block must never panic on an out-of-bounds slice; the
+  // iterator should go invalid and expose a sticky `Corruption` status.
+
+  fn bytewise() -> Arc<dyn Comparator> {
+    Arc::new(crate::comparator::BytewiseComparator)
+  }
+
+  /// Raw bytes of a valid single-entry block `("k" -> "v")`, restart_interval 16.
+  ///
+  /// Layout: `[shared=0][unshared=1][vlen=1]['k']['v'] [restart u32 = 0][count u32 = 1]`.
+  /// So byte 0 = shared, 1 = unshared, 2 = vlen, 3 = key, 4 = value;
+  /// `restarts_offset` = 5.
+  fn single_entry_bytes() -> Vec<u8> {
+    let mut bb = BlockBuilder::new(16);
+    bb.add(b"k", b"v");
+    bb.finish().to_vec()
+  }
+
+  #[test]
+  fn block_new_rejects_too_short() {
+    // Fewer than 4 bytes cannot even hold the restart count.
+    assert!(matches!(
+      Block::new(vec![0u8; 3], bytewise()),
+      Err(Error::Corruption(_))
+    ));
+  }
+
+  #[test]
+  fn block_new_rejects_oversized_restart_count() {
+    // 8 bytes: a (bogus) restart offset followed by a restart count of
+    // 0xFFFF_FFFF, which would require far more data than is present.
+    let mut data = vec![0u8; 4];
+    data.extend_from_slice(&u32::MAX.to_le_bytes());
+    assert!(matches!(
+      Block::new(data, bytewise()),
+      Err(Error::Corruption(_))
+    ));
+  }
+
+  #[test]
+  fn corrupt_unshared_length_marks_invalid() {
+    let mut data = single_entry_bytes();
+    data[1] = 0x7f; // unshared = 127, runs past the 5-byte entry region
+    let block = Block::new(data, bytewise()).unwrap();
+    let mut it = block.iter();
+    it.seek_to_first();
+    assert!(!it.valid());
+    assert!(matches!(it.status(), Some(Error::Corruption(_))));
+  }
+
+  #[test]
+  fn corrupt_value_length_marks_invalid() {
+    let mut data = single_entry_bytes();
+    data[2] = 0x7f; // vlen = 127, runs past the end of the block
+    let block = Block::new(data, bytewise()).unwrap();
+    let mut it = block.iter();
+    it.seek_to_first();
+    assert!(!it.valid());
+    assert!(matches!(it.status(), Some(Error::Corruption(_))));
+  }
+
+  #[test]
+  fn corrupt_shared_length_marks_invalid() {
+    let mut data = single_entry_bytes();
+    data[0] = 0x05; // shared = 5 at a restart point (must be 0; exceeds key len)
+    let block = Block::new(data, bytewise()).unwrap();
+    let mut it = block.iter();
+    it.seek_to_first();
+    assert!(!it.valid());
+    assert!(matches!(it.status(), Some(Error::Corruption(_))));
+  }
+
+  #[test]
+  fn truncated_varint_marks_invalid() {
+    let mut data = single_entry_bytes();
+    // Fill the whole entry region with continuation bytes: the varint never
+    // terminates before the restart array.
+    for b in data.iter_mut().take(5) {
+      *b = 0x80;
+    }
+    let block = Block::new(data, bytewise()).unwrap();
+    let mut it = block.iter();
+    it.seek_to_first();
+    assert!(!it.valid());
+    assert!(matches!(it.status(), Some(Error::Corruption(_))));
+  }
+
+  #[test]
+  fn corrupt_restart_key_in_seek_marks_invalid() {
+    // restart_interval=1 makes every entry a restart point, so `seek`'s binary
+    // search calls `key_at_restart` on an interior entry.  Each entry is
+    // [shared=0][unshared=1][vlen=1][key][val] = 5 bytes; entry 1 starts at
+    // offset 5, its unshared-length byte is at offset 6.
+    let mut bb = BlockBuilder::new(1);
+    bb.add(b"a", b"1");
+    bb.add(b"b", b"2");
+    bb.add(b"c", b"3");
+    let mut data = bb.finish().to_vec();
+    data[6] = 0x7f; // corrupt entry 1's unshared length
+    let block = Block::new(data, bytewise()).unwrap();
+    let mut it = block.iter();
+    it.seek(b"b");
+    assert!(!it.valid());
+    assert!(matches!(it.status(), Some(Error::Corruption(_))));
   }
 }

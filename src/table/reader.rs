@@ -86,7 +86,7 @@ impl Table {
 
     // Read the index block.
     let index_contents = read_block(file.as_ref(), &footer.index_handle, false)?;
-    let index_block = Block::new(index_contents.data, Arc::clone(&comparator));
+    let index_block = Block::new(index_contents.data, Arc::clone(&comparator))?;
 
     // Optionally read the filter block from the metaindex.
     let filter = filter_policy.and_then(|policy| {
@@ -129,7 +129,7 @@ impl Table {
 
     // Cache miss (or no cache): read from disk.
     let contents = read_block(self.file.as_ref(), handle, verify)?;
-    let block = Block::new(contents.data, Arc::clone(&self.comparator));
+    let block = Block::new(contents.data, Arc::clone(&self.comparator))?;
 
     // Insert into the cache unless the caller asked us not to (e.g. bulk scan).
     if fill_cache {
@@ -259,7 +259,7 @@ impl Table {
 
       // Read from disk.
       let contents = read_block(file.as_ref(), &handle, verify_checksums)?;
-      let block = Block::new(contents.data, Arc::clone(&comparator));
+      let block = Block::new(contents.data, Arc::clone(&comparator))?;
 
       if fill_cache {
         if let Some(cache) = &block_cache {
@@ -286,7 +286,7 @@ impl Table {
     while idx.valid() {
       let (handle, _) = BlockHandle::decode_from(idx.value())?;
       let contents = read_block(self.file.as_ref(), &handle, false)?;
-      let data_block = Block::new(contents.data, Arc::clone(&self.comparator));
+      let data_block = Block::new(contents.data, Arc::clone(&self.comparator))?;
       let mut it = data_block.iter();
       it.seek_to_first();
       while it.valid() {
@@ -320,7 +320,7 @@ fn read_filter_block(
   let meta_block = Block::new(
     meta_contents.data,
     Arc::new(crate::comparator::BytewiseComparator),
-  );
+  )?;
 
   // Seek the metaindex for the key "filter.<policy_name>".
   let filter_key = format!("filter.{}", policy.name());

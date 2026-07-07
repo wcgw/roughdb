@@ -139,6 +139,7 @@ mod tests {
       vec![0u8; size],
       std::sync::Arc::new(crate::comparator::BytewiseComparator),
     )
+    .unwrap()
   }
 
   #[test]

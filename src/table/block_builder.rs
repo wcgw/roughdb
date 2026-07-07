@@ -138,7 +138,8 @@ mod tests {
     let block = Block::new(
       data,
       std::sync::Arc::new(crate::comparator::BytewiseComparator),
-    );
+    )
+    .unwrap();
     let it = block.iter();
     assert!(!it.valid());
   }
@@ -149,7 +150,8 @@ mod tests {
     let block = Block::new(
       data,
       std::sync::Arc::new(crate::comparator::BytewiseComparator),
-    );
+    )
+    .unwrap();
     let mut it = block.iter();
     it.seek_to_first();
     assert!(it.valid());
@@ -167,7 +169,8 @@ mod tests {
     let block = Block::new(
       data,
       std::sync::Arc::new(crate::comparator::BytewiseComparator),
-    );
+    )
+    .unwrap();
     let mut it = block.iter();
     it.seek_to_first();
     for (expected_k, expected_v) in pairs {
@@ -190,7 +193,8 @@ mod tests {
     let block = Block::new(
       data.clone(),
       std::sync::Arc::new(crate::comparator::BytewiseComparator),
-    );
+    )
+    .unwrap();
     // Verify all 6 entries readable in order.
     let mut it = block.iter();
     it.seek_to_first();
@@ -215,7 +219,8 @@ mod tests {
     let block = Block::new(
       data,
       std::sync::Arc::new(crate::comparator::BytewiseComparator),
-    );
+    )
+    .unwrap();
     let mut it = block.iter();
     it.seek(b"c");
     assert!(it.valid());
@@ -234,7 +239,8 @@ mod tests {
     let block = Block::new(
       data,
       std::sync::Arc::new(crate::comparator::BytewiseComparator),
-    );
+    )
+    .unwrap();
     let mut it = block.iter();
     it.seek_to_first();
     assert_eq!(it.key(), b"new");

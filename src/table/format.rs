@@ -44,6 +44,12 @@ pub(crate) const TABLE_MAGIC_NUMBER: u64 = 0xdb4775248b80fb57;
 /// Block trailer: 1-byte compression type + 4-byte masked CRC32c.
 pub(crate) const BLOCK_TRAILER_SIZE: usize = 5;
 
+/// Upper bound on a single block's size, both on disk (`BlockHandle::size`) and
+/// after decompression.  A corrupt handle or compressed-length header must not
+/// be able to trigger an unbounded allocation before any checksum is verified.
+/// Matches the ceiling already used for Zstd decompression.
+pub(crate) const MAX_BLOCK_SIZE: usize = 16 * 1024 * 1024;
+
 /// Maximum encoded size of a `BlockHandle` (two varint64s, up to 10 bytes each).
 const MAX_ENCODED_HANDLE_LENGTH: usize = 20;
 
@@ -202,6 +208,11 @@ pub(crate) fn read_block(
   verify_checksums: bool,
 ) -> Result<BlockContents, Error> {
   let n = handle.size as usize;
+  if n > MAX_BLOCK_SIZE {
+    return Err(Error::Corruption(format!(
+      "block size {n} exceeds maximum {MAX_BLOCK_SIZE}"
+    )));
+  }
   let mut buf = vec![0u8; n + BLOCK_TRAILER_SIZE];
   read_exact_at(file, &mut buf, handle.offset)?;
 
@@ -226,6 +237,11 @@ pub(crate) fn read_block(
       // Snappy
       let decompressed = snap::raw::decompress_len(&buf[..n])
         .map_err(|e| Error::Corruption(format!("snappy length decode: {e}")))?;
+      if decompressed > MAX_BLOCK_SIZE {
+        return Err(Error::Corruption(format!(
+          "snappy decompressed size {decompressed} exceeds maximum {MAX_BLOCK_SIZE}"
+        )));
+      }
       let mut out = vec![0u8; decompressed];
       snap::raw::Decoder::new()
         .decompress(&buf[..n], &mut out)
@@ -234,7 +250,7 @@ pub(crate) fn read_block(
     }
     0x02 => {
       // Zstd
-      let out = zstd::bulk::decompress(&buf[..n], 16 * 1024 * 1024)
+      let out = zstd::bulk::decompress(&buf[..n], MAX_BLOCK_SIZE)
         .map_err(|e| Error::Corruption(format!("zstd decompress: {e}")))?;
       Ok(BlockContents { data: out })
     }
@@ -428,5 +444,22 @@ mod tests {
     // Trailer byte should be 0x00 (NoCompression) because the data didn't compress well.
     let trailer_type = buf[buf.len() - BLOCK_TRAILER_SIZE];
     assert_eq!(trailer_type, 0x00, "expected fallback to NoCompression");
+  }
+
+  #[test]
+  fn read_block_rejects_oversized_handle() {
+    // A corrupt handle claiming a size beyond MAX_BLOCK_SIZE must be rejected
+    // before allocating a buffer — the file itself is tiny.
+    let mut tmp = tempfile::tempfile().unwrap();
+    std::io::Write::write_all(&mut tmp, &[0u8; 16]).unwrap();
+    let ra = crate::env::random_access_from_file(tmp);
+    let handle = BlockHandle {
+      offset: 0,
+      size: (MAX_BLOCK_SIZE + 1) as u64,
+    };
+    assert!(matches!(
+      read_block(ra.as_ref(), &handle, false),
+      Err(Error::Corruption(_))
+    ));
   }
 }
