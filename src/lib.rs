@@ -2160,14 +2160,9 @@ const L0_SLOWDOWN_WRITES_TRIGGER: usize = 8;
 const L0_STOP_WRITES_TRIGGER: usize = 12;
 
 /// Extract the user-key prefix from an SSTable internal key.
-/// Internal key format: `user_key || (seq<<8|vtype).to_le_bytes()` (8-byte tag).
-fn ikey_user_key(ikey: &[u8]) -> &[u8] {
-  if ikey.len() >= 8 {
-    &ikey[..ikey.len() - 8]
-  } else {
-    ikey
-  }
-}
+/// Canonical implementation lives in `table::format`; aliased here for the many
+/// compaction/overlap call sites that read more clearly as `ikey_user_key`.
+use crate::table::format::user_key as ikey_user_key;
 
 /// True if the user-key ranges [a_s..a_l] and [b_s..b_l] overlap.
 fn key_ranges_overlap(

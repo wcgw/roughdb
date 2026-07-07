@@ -111,12 +111,7 @@ impl TableBuilder {
     // strips the 8-byte sequence+type suffix before hashing.  We replicate
     // that behaviour here: the filter always stores and queries user keys.
     if let Some(fw) = self.filter_writer.as_mut() {
-      let user_key = if key.len() >= 8 {
-        &key[..key.len() - 8]
-      } else {
-        key
-      };
-      fw.add_key(user_key);
+      fw.add_key(crate::table::format::user_key(key));
     }
 
     self.data_block.add(key, value);

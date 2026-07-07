@@ -218,16 +218,8 @@ impl VersionSet {
     let cmp = tc.comparator();
     for level_files in new_files.iter_mut().skip(1) {
       level_files.sort_by(|a, b| {
-        let ak = if a.smallest.len() >= 8 {
-          &a.smallest[..a.smallest.len() - 8]
-        } else {
-          &a.smallest
-        };
-        let bk = if b.smallest.len() >= 8 {
-          &b.smallest[..b.smallest.len() - 8]
-        } else {
-          &b.smallest
-        };
+        let ak = crate::table::format::user_key(&a.smallest);
+        let bk = crate::table::format::user_key(&b.smallest);
         cmp.compare(ak, bk)
       });
     }
