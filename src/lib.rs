@@ -3861,6 +3861,55 @@ mod tests {
     }
   }
 
+  #[test]
+  fn full_db_lifecycle_on_mem_filesystem() {
+    // The entire database — WAL durability, L0 flush, MANIFEST-driven recovery —
+    // runs with no disk I/O.  This is what makes `FileSystem` a real seam rather
+    // than a hypothetical one: the same in-memory backend is shared across the
+    // reopen, so recovery reads exactly what the first instance wrote.
+    use crate::env::{FileSystem, MemFileSystem};
+    use std::sync::Arc;
+    let fs: Arc<dyn FileSystem> = Arc::new(MemFileSystem::new());
+    let path = std::path::Path::new("/db");
+
+    let opts = |fs: &Arc<dyn FileSystem>| Options {
+      create_if_missing: true,
+      write_buffer_size: 512,
+      file_system: Arc::clone(fs),
+      ..Options::default()
+    };
+
+    {
+      let db = Db::open(path, opts(&fs)).unwrap();
+      for i in 0u32..50 {
+        db.put(format!("k{i:04}").as_bytes(), format!("v{i:04}").as_bytes())
+          .unwrap();
+      }
+      // A flush should have produced at least one SSTable, in memory.
+      let ldb = fs
+        .children(path)
+        .unwrap()
+        .into_iter()
+        .filter(|n| n.ends_with(".ldb"))
+        .count();
+      assert!(ldb >= 1, "expected an in-memory flush to an SSTable");
+      db.put(b"unflushed", b"tail").unwrap();
+    }
+
+    // Reopen against the same backend: flushed keys come back via MANIFEST
+    // recovery, the tail key via WAL replay — all without touching disk.
+    let db = Db::open(path, opts(&fs)).unwrap();
+    for i in 0u32..50 {
+      let expected = format!("v{i:04}");
+      assert_eq!(
+        db.get(format!("k{i:04}").as_bytes()).unwrap(),
+        expected.as_bytes(),
+        "key k{i:04} missing after in-memory reopen"
+      );
+    }
+    assert_eq!(db.get(b"unflushed").unwrap(), b"tail");
+  }
+
   // ── new_iterator tests ─────────────────────────────────────────────────────
 
   #[test]

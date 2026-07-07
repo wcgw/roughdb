@@ -353,6 +353,287 @@ impl WritableFile for Vec<u8> {
   }
 }
 
+// ── MemFileSystem (in-memory, for tests) ─────────────────────────────────────
+
+/// In-memory [`FileSystem`] backed by hash maps instead of the local disk.
+///
+/// Intended for fast, deterministic, dependency-free tests: no tempdirs, no
+/// real I/O, no background durability. It is the second [`FileSystem`] adapter
+/// (alongside [`PosixFileSystem`]), which is what turns the trait into a real
+/// seam rather than a hypothetical one.
+///
+/// Semantics chosen to match POSIX closely enough for the database's use:
+/// - Each file is a shared `Vec<u8>` "inode". `create_writable` installs a
+///   fresh (truncated) inode; existing read handles keep the old one, mirroring
+///   POSIX name re-creation.
+/// - `flush`/`sync` are no-ops: an in-memory file is always "durable" within
+///   the process.
+/// - `lock_file` enforces exclusivity within a single `MemFileSystem` instance;
+///   the lock is released when the returned handle is dropped.
+///
+/// Not thread-optimised — a single `Mutex` guards all state — but correct for
+/// concurrent access, which is all the database requires.
+#[cfg(test)]
+pub use memfs::MemFileSystem;
+
+#[cfg(test)]
+mod memfs {
+  use super::*;
+  use std::collections::{HashMap, HashSet};
+  use std::io::ErrorKind;
+  use std::path::PathBuf;
+  use std::sync::Mutex;
+
+  /// Shared, mutable file contents.
+  type Inode = Arc<Mutex<Vec<u8>>>;
+
+  #[derive(Default)]
+  struct State {
+    files: HashMap<PathBuf, Inode>,
+    dirs: HashSet<PathBuf>,
+    locks: HashSet<PathBuf>,
+  }
+
+  pub struct MemFileSystem {
+    state: Arc<Mutex<State>>,
+  }
+
+  impl MemFileSystem {
+    pub fn new() -> Self {
+      MemFileSystem {
+        state: Arc::new(Mutex::new(State::default())),
+      }
+    }
+  }
+
+  impl Default for MemFileSystem {
+    fn default() -> Self {
+      Self::new()
+    }
+  }
+
+  /// Record `path` and all of its ancestor directories as existing.
+  fn ensure_ancestor_dirs(dirs: &mut HashSet<PathBuf>, path: &Path) {
+    let mut cur = path.parent();
+    while let Some(dir) = cur {
+      if dir.as_os_str().is_empty() {
+        break;
+      }
+      dirs.insert(dir.to_path_buf());
+      cur = dir.parent();
+    }
+  }
+
+  fn not_found(path: &Path) -> Error {
+    Error::IoError(std::io::Error::new(
+      ErrorKind::NotFound,
+      format!("no such file: {}", path.display()),
+    ))
+  }
+
+  struct MemSequentialFile {
+    inode: Inode,
+    pos: usize,
+  }
+
+  impl SequentialFile for MemSequentialFile {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
+      let data = self.inode.lock().unwrap();
+      let remaining = data.len().saturating_sub(self.pos);
+      let n = remaining.min(buf.len());
+      buf[..n].copy_from_slice(&data[self.pos..self.pos + n]);
+      self.pos += n;
+      Ok(n)
+    }
+
+    fn skip(&mut self, n: u64) -> Result<(), Error> {
+      self.pos = self.pos.saturating_add(n as usize);
+      Ok(())
+    }
+  }
+
+  struct MemRandomAccessFile {
+    inode: Inode,
+  }
+
+  impl RandomAccessFile for MemRandomAccessFile {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<usize, Error> {
+      let data = self.inode.lock().unwrap();
+      let offset = offset as usize;
+      if offset >= data.len() {
+        return Ok(0);
+      }
+      let n = (data.len() - offset).min(buf.len());
+      buf[..n].copy_from_slice(&data[offset..offset + n]);
+      Ok(n)
+    }
+  }
+
+  struct MemWritableFile {
+    inode: Inode,
+  }
+
+  impl WritableFile for MemWritableFile {
+    fn write(&mut self, data: &[u8]) -> Result<(), Error> {
+      self.inode.lock().unwrap().extend_from_slice(data);
+      Ok(())
+    }
+
+    fn flush(&mut self) -> Result<(), Error> {
+      Ok(()) // in-memory: nothing to push to the OS
+    }
+
+    fn sync(&mut self) -> Result<(), Error> {
+      Ok(()) // in-memory: always durable within the process
+    }
+  }
+
+  struct MemFileLock {
+    state: Arc<Mutex<State>>,
+    path: PathBuf,
+  }
+
+  impl FileLock for MemFileLock {}
+
+  impl Drop for MemFileLock {
+    fn drop(&mut self) {
+      self.state.lock().unwrap().locks.remove(&self.path);
+    }
+  }
+
+  impl FileSystem for MemFileSystem {
+    fn open_sequential(&self, path: &Path) -> Result<Box<dyn SequentialFile>, Error> {
+      let st = self.state.lock().unwrap();
+      let inode = st.files.get(path).ok_or_else(|| not_found(path))?;
+      Ok(Box::new(MemSequentialFile {
+        inode: Arc::clone(inode),
+        pos: 0,
+      }))
+    }
+
+    fn open_random_access(&self, path: &Path) -> Result<Arc<dyn RandomAccessFile>, Error> {
+      let st = self.state.lock().unwrap();
+      let inode = st.files.get(path).ok_or_else(|| not_found(path))?;
+      Ok(Arc::new(MemRandomAccessFile {
+        inode: Arc::clone(inode),
+      }))
+    }
+
+    fn open_appendable(&self, path: &Path) -> Result<Box<dyn WritableFile>, Error> {
+      let mut st = self.state.lock().unwrap();
+      ensure_ancestor_dirs(&mut st.dirs, path);
+      let inode = st
+        .files
+        .entry(path.to_path_buf())
+        .or_insert_with(|| Arc::new(Mutex::new(Vec::new())));
+      Ok(Box::new(MemWritableFile {
+        inode: Arc::clone(inode),
+      }))
+    }
+
+    fn create_writable(&self, path: &Path) -> Result<Box<dyn WritableFile>, Error> {
+      let mut st = self.state.lock().unwrap();
+      ensure_ancestor_dirs(&mut st.dirs, path);
+      // Truncate by installing a fresh inode.
+      let inode = Arc::new(Mutex::new(Vec::new()));
+      st.files.insert(path.to_path_buf(), Arc::clone(&inode));
+      Ok(Box::new(MemWritableFile { inode }))
+    }
+
+    fn file_size(&self, path: &Path) -> Result<u64, Error> {
+      let st = self.state.lock().unwrap();
+      let len = st
+        .files
+        .get(path)
+        .ok_or_else(|| not_found(path))?
+        .lock()
+        .unwrap()
+        .len();
+      Ok(len as u64)
+    }
+
+    fn file_exists(&self, path: &Path) -> bool {
+      let st = self.state.lock().unwrap();
+      st.files.contains_key(path) || st.dirs.contains(path)
+    }
+
+    fn rename(&self, src: &Path, dst: &Path) -> Result<(), Error> {
+      let mut st = self.state.lock().unwrap();
+      let inode = st.files.remove(src).ok_or_else(|| not_found(src))?;
+      ensure_ancestor_dirs(&mut st.dirs, dst);
+      st.files.insert(dst.to_path_buf(), inode);
+      Ok(())
+    }
+
+    fn remove_file(&self, path: &Path) -> Result<(), Error> {
+      let mut st = self.state.lock().unwrap();
+      st.files
+        .remove(path)
+        .map(|_| ())
+        .ok_or_else(|| not_found(path))
+    }
+
+    fn create_dir_all(&self, path: &Path) -> Result<(), Error> {
+      let mut st = self.state.lock().unwrap();
+      st.dirs.insert(path.to_path_buf());
+      ensure_ancestor_dirs(&mut st.dirs, path);
+      Ok(())
+    }
+
+    fn remove_dir(&self, path: &Path) -> Result<(), Error> {
+      let mut st = self.state.lock().unwrap();
+      let non_empty = st.files.keys().any(|p| p.parent() == Some(path))
+        || st.dirs.iter().any(|p| p.parent() == Some(path));
+      if non_empty {
+        return Err(Error::IoError(std::io::Error::other(format!(
+          "directory not empty: {}",
+          path.display()
+        ))));
+      }
+      if !st.dirs.remove(path) {
+        return Err(not_found(path));
+      }
+      Ok(())
+    }
+
+    fn children(&self, path: &Path) -> Result<Vec<String>, Error> {
+      let st = self.state.lock().unwrap();
+      if !st.dirs.contains(path) {
+        return Err(not_found(path));
+      }
+      let mut names = Vec::new();
+      for p in st.files.keys().chain(st.dirs.iter()) {
+        if p.parent() == Some(path) {
+          if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+            names.push(name.to_owned());
+          }
+        }
+      }
+      Ok(names)
+    }
+
+    fn lock_file(&self, path: &Path) -> Result<Box<dyn FileLock>, Error> {
+      let mut st = self.state.lock().unwrap();
+      if st.locks.contains(path) {
+        return Err(Error::IoError(std::io::Error::new(
+          ErrorKind::WouldBlock,
+          format!("lock held: {}", path.display()),
+        )));
+      }
+      // POSIX creates the lock file on disk; mirror that.
+      ensure_ancestor_dirs(&mut st.dirs, path);
+      st.files
+        .entry(path.to_path_buf())
+        .or_insert_with(|| Arc::new(Mutex::new(Vec::new())));
+      st.locks.insert(path.to_path_buf());
+      Ok(Box::new(MemFileLock {
+        state: Arc::clone(&self.state),
+        path: path.to_path_buf(),
+      }))
+    }
+  }
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -497,5 +778,144 @@ mod tests {
     drop(w);
 
     assert_eq!(fs.read_string_from_file(&path).unwrap(), "hello world");
+  }
+
+  // ── MemFileSystem parity tests ────────────────────────────────────────────
+
+  use std::path::Path;
+
+  #[test]
+  fn mem_write_read_sequential() {
+    let fs = MemFileSystem::new();
+    let path = Path::new("/db/test.txt");
+    fs.create_dir_all(Path::new("/db")).unwrap();
+
+    let mut w = fs.create_writable(path).unwrap();
+    w.write(b"hello world").unwrap();
+    w.sync().unwrap();
+    drop(w);
+
+    let mut r = fs.open_sequential(path).unwrap();
+    let mut buf = [0u8; 64];
+    let n = r.read(&mut buf).unwrap();
+    assert_eq!(&buf[..n], b"hello world");
+    // A second read is at EOF.
+    assert_eq!(r.read(&mut buf).unwrap(), 0);
+  }
+
+  #[test]
+  fn mem_random_access() {
+    let fs = MemFileSystem::new();
+    let path = Path::new("/db/test.bin");
+
+    let mut w = fs.create_writable(path).unwrap();
+    w.write(b"abcdefghij").unwrap();
+    drop(w);
+
+    let r = fs.open_random_access(path).unwrap();
+    let mut buf = [0u8; 3];
+    let n = r.read_at(&mut buf, 4).unwrap();
+    assert_eq!(&buf[..n], b"efg");
+    // Reading at/after EOF yields 0.
+    assert_eq!(r.read_at(&mut buf, 100).unwrap(), 0);
+  }
+
+  #[test]
+  fn mem_file_size_and_exists() {
+    let fs = MemFileSystem::new();
+    let path = Path::new("/db/sized.bin");
+    assert!(!fs.file_exists(path));
+    assert!(matches!(fs.file_size(path), Err(Error::IoError(_))));
+
+    let mut w = fs.create_writable(path).unwrap();
+    w.write(&[0u8; 1234]).unwrap();
+    drop(w);
+
+    assert!(fs.file_exists(path));
+    assert_eq!(fs.file_size(path).unwrap(), 1234);
+  }
+
+  #[test]
+  fn mem_children_lists_directory() {
+    let fs = MemFileSystem::new();
+    fs.create_dir_all(Path::new("/db")).unwrap();
+    fs.create_writable(Path::new("/db/a.txt")).unwrap();
+    fs.create_writable(Path::new("/db/b.txt")).unwrap();
+    fs.create_dir_all(Path::new("/db/sub")).unwrap();
+
+    let mut names = fs.children(Path::new("/db")).unwrap();
+    names.sort();
+    assert_eq!(names, vec!["a.txt", "b.txt", "sub"]);
+  }
+
+  #[test]
+  fn mem_create_writable_truncates() {
+    let fs = MemFileSystem::new();
+    let path = Path::new("/db/f");
+    let mut w = fs.create_writable(path).unwrap();
+    w.write(b"old contents").unwrap();
+    drop(w);
+
+    let mut w = fs.create_writable(path).unwrap();
+    w.write(b"new").unwrap();
+    drop(w);
+
+    assert_eq!(fs.file_size(path).unwrap(), 3);
+  }
+
+  #[test]
+  fn mem_appendable_extends() {
+    let fs = MemFileSystem::new();
+    let path = Path::new("/db/append.txt");
+
+    let mut w = fs.create_writable(path).unwrap();
+    w.write(b"hello").unwrap();
+    drop(w);
+
+    let mut w = fs.open_appendable(path).unwrap();
+    w.write(b" world").unwrap();
+    drop(w);
+
+    assert_eq!(fs.read_string_from_file(path).unwrap(), "hello world");
+  }
+
+  #[test]
+  fn mem_rename_and_remove() {
+    let fs = MemFileSystem::new();
+    let src = Path::new("/db/src.txt");
+    let dst = Path::new("/db/dst.txt");
+
+    fs.create_writable(src).unwrap();
+    assert!(fs.file_exists(src));
+    fs.rename(src, dst).unwrap();
+    assert!(!fs.file_exists(src));
+    assert!(fs.file_exists(dst));
+    fs.remove_file(dst).unwrap();
+    assert!(!fs.file_exists(dst));
+    assert!(matches!(fs.remove_file(dst), Err(Error::IoError(_))));
+  }
+
+  #[test]
+  fn mem_remove_dir_rejects_non_empty() {
+    let fs = MemFileSystem::new();
+    fs.create_dir_all(Path::new("/db")).unwrap();
+    fs.create_writable(Path::new("/db/f")).unwrap();
+    assert!(fs.remove_dir(Path::new("/db")).is_err());
+    fs.remove_file(Path::new("/db/f")).unwrap();
+    fs.remove_dir(Path::new("/db")).unwrap();
+    assert!(!fs.file_exists(Path::new("/db")));
+  }
+
+  #[test]
+  fn mem_lock_is_exclusive_and_released_on_drop() {
+    let fs = MemFileSystem::new();
+    let path = Path::new("/db/LOCK");
+
+    let lock = fs.lock_file(path).unwrap();
+    // A second lock on the same path fails immediately.
+    assert!(fs.lock_file(path).is_err());
+    drop(lock);
+    // After drop, locking succeeds again.
+    let _lock2 = fs.lock_file(path).unwrap();
   }
 }
