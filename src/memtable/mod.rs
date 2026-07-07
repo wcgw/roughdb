@@ -155,7 +155,14 @@ impl<'a> MemTableIterator<'a> {
     if self.inner.valid() {
       let e = Entry::from_slice(self.inner.payload());
       let vtype: u8 = if e.value().is_some() { 1 } else { 0 };
-      self.cached_key = crate::table::format::make_internal_key(e.key(), e.sequence_id(), vtype);
+      // Encode in place so `cached_key`'s allocation is reused across steps
+      // instead of allocating a fresh `Vec` per entry.
+      crate::table::format::encode_internal_key_into(
+        &mut self.cached_key,
+        e.key(),
+        e.sequence_id(),
+        vtype,
+      );
     } else {
       self.cached_key.clear();
     }
@@ -479,6 +486,41 @@ mod tests {
     assert_eq!(keys[1], (b"a".to_vec(), 2));
     assert_eq!(keys[2], (b"b".to_vec(), 1));
     assert_eq!(keys[3], (b"c".to_vec(), 4));
+  }
+
+  #[test]
+  fn iter_ordering_follows_custom_comparator() {
+    // Guards the intent that memtable ordering is driven by the pluggable
+    // comparator, not by a byte-wise ordering of the encoded entry.  Under a
+    // reverse comparator, user keys must iterate DESCending — a naive
+    // `Entry: Ord` on raw bytes would (wrongly) still yield ascending order.
+    struct ReverseComparator;
+    impl Comparator for ReverseComparator {
+      fn compare(&self, a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+        b.cmp(a)
+      }
+      fn name(&self) -> &str {
+        "test.ReverseComparator"
+      }
+      fn find_shortest_separator(&self, _start: &mut Vec<u8>, _limit: &[u8]) {}
+      fn find_short_successor(&self, _key: &mut Vec<u8>) {}
+    }
+
+    let mem = Memtable::new(Arc::new(ReverseComparator));
+    mem.add(1, b"a", b"A");
+    mem.add(2, b"b", b"B");
+    mem.add(3, b"c", b"C");
+
+    let mut it = mem.iter();
+    it.seek_to_first();
+    let mut keys: Vec<Vec<u8>> = Vec::new();
+    while it.valid() {
+      let ikey = it.ikey();
+      let (uk, _, _) = parse_internal_key(&ikey).unwrap();
+      keys.push(uk.to_vec());
+      it.advance();
+    }
+    assert_eq!(keys, vec![b"c".to_vec(), b"b".to_vec(), b"a".to_vec()]);
   }
 
   #[test]

@@ -11,11 +11,6 @@
 //    limitations under the License.
 
 use crate::coding::{read_varu64, write_varu64};
-use std::cmp::Eq;
-use std::cmp::Ord;
-use std::cmp::Ordering;
-use std::cmp::PartialEq;
-use std::cmp::PartialOrd;
 use std::fmt::Debug;
 use std::fmt::Formatter;
 
@@ -198,29 +193,11 @@ impl<'a> Entry<'a> {
   }
 }
 
-impl Ord for Entry<'_> {
-  fn cmp(&self, other: &Self) -> Ordering {
-    let ordering = self.key().cmp(other.key());
-    match ordering {
-      Ordering::Equal => other.sequence_id().cmp(&self.sequence_id()),
-      _ => ordering,
-    }
-  }
-}
-
-impl PartialOrd for Entry<'_> {
-  fn partial_cmp(&self, other: &Entry) -> Option<Ordering> {
-    Some(self.cmp(other))
-  }
-}
-
-impl Eq for Entry<'_> {}
-
-impl PartialEq for Entry<'_> {
-  fn eq(&self, other: &Entry) -> bool {
-    self.key() == other.key()
-  }
-}
+// NOTE: `Entry` deliberately has no `Ord`/`PartialOrd`/`Eq`/`PartialEq` impls.
+// Memtable ordering is defined by the skip list, which compares user keys with
+// the pluggable `Options::comparator` (see `SkipList::key_after_node_cmp`), then
+// sequence numbers descending.  A byte-wise `Ord` on `Entry` would silently
+// disagree with a custom comparator, so ordering lives solely in the skip list.
 
 impl Debug for Entry<'_> {
   fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {

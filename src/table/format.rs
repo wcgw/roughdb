@@ -58,16 +58,41 @@ pub(crate) const FOOTER_ENCODED_LENGTH: usize = 2 * MAX_ENCODED_HANDLE_LENGTH + 
 
 // ── Internal key helpers ─────────────────────────────────────────────────────
 
+/// Encode an SSTable internal key (`user_key || tag`) into `buf`, replacing any
+/// previous contents.  Reusing a caller-owned buffer avoids a per-key
+/// allocation on hot paths (e.g. iterating a memtable).
+///
+/// `tag = (seq << 8 | vtype as u64) as u64 LE`.
+pub(crate) fn encode_internal_key_into(buf: &mut Vec<u8>, user_key: &[u8], seq: u64, vtype: u8) {
+  buf.clear();
+  buf.reserve(user_key.len() + 8);
+  buf.extend_from_slice(user_key);
+  let tag = (seq << 8) | vtype as u64;
+  buf.extend_from_slice(&tag.to_le_bytes());
+}
+
 /// Construct an SSTable internal key: `user_key || tag` where
 /// `tag = (seq << 8 | vtype as u64) as u64 LE`.
 ///
 /// `vtype`: `1` = Value, `0` = Deletion — matches `memtable/entry.rs: ValueType`.
 pub(crate) fn make_internal_key(user_key: &[u8], seq: u64, vtype: u8) -> Vec<u8> {
-  let mut out = Vec::with_capacity(user_key.len() + 8);
-  out.extend_from_slice(user_key);
-  let tag = (seq << 8) | vtype as u64;
-  out.extend_from_slice(&tag.to_le_bytes());
+  let mut out = Vec::new();
+  encode_internal_key_into(&mut out, user_key, seq, vtype);
   out
+}
+
+/// Extract the user-key prefix from an SSTable internal key by stripping the
+/// 8-byte trailing tag.  Returns the whole slice unchanged if it is shorter
+/// than a tag (defensive — well-formed internal keys are always ≥ 8 bytes).
+///
+/// This is the single canonical user-key accessor; prefer it over open-coding
+/// `&ikey[..ikey.len() - 8]`.
+pub(crate) fn user_key(ikey: &[u8]) -> &[u8] {
+  if ikey.len() >= 8 {
+    &ikey[..ikey.len() - 8]
+  } else {
+    ikey
+  }
 }
 
 /// Extract `(user_key, seq, vtype)` from an SSTable internal key.
@@ -328,6 +353,28 @@ mod tests {
     assert_eq!(uk, key);
     assert_eq!(s, seq);
     assert_eq!(vt, vtype);
+  }
+
+  #[test]
+  fn encode_internal_key_into_reuses_buffer_and_matches_make() {
+    let mut buf = Vec::new();
+    encode_internal_key_into(&mut buf, b"hello", 42, 1);
+    assert_eq!(buf, make_internal_key(b"hello", 42, 1));
+
+    // Re-encoding a shorter key into the same buffer replaces the contents and
+    // keeps the (already-grown) capacity — no fresh allocation.
+    let cap_before = buf.capacity();
+    encode_internal_key_into(&mut buf, b"hi", 7, 0);
+    assert_eq!(buf, make_internal_key(b"hi", 7, 0));
+    assert!(buf.capacity() >= cap_before);
+  }
+
+  #[test]
+  fn user_key_strips_tag() {
+    let ikey = make_internal_key(b"apple", 5, 1);
+    assert_eq!(user_key(&ikey), b"apple");
+    // Defensive: a too-short slice is returned unchanged.
+    assert_eq!(user_key(b"abc"), b"abc");
   }
 
   #[test]
