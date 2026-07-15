@@ -158,14 +158,15 @@ pub struct Snapshot<'db> {
 
 impl Drop for Snapshot<'_> {
   fn drop(&mut self) {
-    self
-      .db
-      .inner
-      .state
-      .lock()
-      .unwrap()
-      .snapshots
-      .remove(&self.seq);
+    let mut state = self.db.inner.state.lock().unwrap();
+    // Refcounted: several snapshots may share one sequence number (taken with
+    // no writes in between).  Only the last release un-pins the sequence.
+    if let Some(count) = state.snapshots.get_mut(&self.seq) {
+      *count -= 1;
+      if *count == 0 {
+        state.snapshots.remove(&self.seq);
+      }
+    }
   }
 }
 
@@ -272,10 +273,12 @@ struct DbState {
   /// Tracks the set of live SSTable files and the MANIFEST.
   /// `None` for in-memory databases (`Db::default()`).
   version_set: Option<VersionSet>,
-  /// Sequence numbers pinned by live snapshots (acquired via `get_snapshot`).
-  /// Compaction uses the minimum value here as the visibility cutoff so it
-  /// does not drop entries still observable through an active snapshot.
-  snapshots: std::collections::BTreeSet<u64>,
+  /// Sequence numbers pinned by live snapshots (acquired via `get_snapshot`),
+  /// with a refcount per sequence — several snapshots taken with no writes in
+  /// between share one sequence number, and releasing one must not un-pin the
+  /// others.  Compaction uses the minimum key here as the visibility cutoff so
+  /// it does not drop entries still observable through an active snapshot.
+  snapshots: std::collections::BTreeMap<u64, usize>,
   // ── Batch-write queue ──────────────────────────────────────────────────────
   /// Pending write requests in arrival order.  The front entry is the current
   /// leader; all others are followers waiting on `Db::write_condvar`.
@@ -527,7 +530,7 @@ impl Default for Db {
           mem: Arc::new(Memtable::default()),
           imm: None,
           version_set: None,
-          snapshots: std::collections::BTreeSet::new(),
+          snapshots: std::collections::BTreeMap::new(),
           writers: std::collections::VecDeque::new(),
           next_writer_id: 0,
           completed: std::collections::HashMap::new(),
@@ -709,7 +712,7 @@ impl Db {
         mem,
         imm: None,
         version_set,
-        snapshots: std::collections::BTreeSet::new(),
+        snapshots: std::collections::BTreeMap::new(),
         writers: std::collections::VecDeque::new(),
         next_writer_id: 0,
         completed: std::collections::HashMap::new(),
@@ -882,7 +885,7 @@ impl Db {
   pub fn get_snapshot(&self) -> Snapshot<'_> {
     let mut state = self.inner.state.lock().unwrap();
     let seq = state.last_sequence;
-    state.snapshots.insert(seq);
+    *state.snapshots.entry(seq).or_insert(0) += 1;
     Snapshot { db: self, seq }
   }
 
@@ -1805,16 +1808,18 @@ fn bg_worker(inner: Arc<DbInner>) {
           g.background_error = Some(e);
         }
       }
-      inner.write_condvar.notify_all();
       drop(g);
+      // Run GC before waking waiters: a `flush(wait: true)` caller must observe
+      // obsolete files already removed, not just imm/pending_flush cleared.
       delete_obsolete_files(&path, &inner.state, &*fs);
+      inner.write_condvar.notify_all();
       g = inner.state.lock().unwrap();
     } else if !shutting_down {
       // ── Compaction (skipped on shutdown path) ────────────────────────────
       drop(g);
       maybe_compact(&path, &inner.state, &inner.options, &tc);
-      inner.write_condvar.notify_all();
       delete_obsolete_files(&path, &inner.state, &*fs);
+      inner.write_condvar.notify_all();
       g = inner.state.lock().unwrap();
     }
 
@@ -2246,7 +2251,7 @@ fn compact_level_range(
     };
     let oldest = g
       .snapshots
-      .iter()
+      .keys()
       .next()
       .copied()
       .unwrap_or(g.last_sequence);
@@ -2363,7 +2368,7 @@ fn maybe_compact(
     };
     let oldest = g
       .snapshots
-      .iter()
+      .keys()
       .next()
       .copied()
       .unwrap_or(g.last_sequence);
@@ -3334,11 +3339,13 @@ mod tests {
     assert!(orphan.exists());
 
     // Reopen: delete_obsolete_files is NOT called on open (only on flush).
-    // We trigger a flush to force GC.
+    // We trigger a flush to force GC, then wait for the background thread to
+    // finish both the flush and the GC pass it runs before waking waiters.
     let db = Db::open(dir.path(), small_options()).unwrap();
     for i in 0u32..20 {
       db.put(format!("k{i:04}").as_bytes(), b"v2").unwrap();
     }
+    db.flush(&crate::FlushOptions { wait: true }).unwrap();
     // After a flush, the orphan must be gone.
     assert!(
       !orphan.exists(),
@@ -3804,6 +3811,50 @@ mod tests {
     assert_eq!(db.get_with_options(&opts1, b"k").unwrap(), b"v1");
     assert_eq!(db.get_with_options(&opts2, b"k").unwrap(), b"v2");
     assert_eq!(db.get(b"k").unwrap(), b"v3");
+  }
+
+  #[test]
+  fn snapshot_survives_sibling_release_at_same_sequence() {
+    // Two snapshots taken at the same sequence number must be tracked
+    // independently: releasing one must not un-pin the other.  A set-based
+    // snapshot registry gets this wrong — the second insert of the same seq is
+    // a no-op, so the first release removes protection for both, and the next
+    // compaction prunes versions the surviving snapshot can still see.
+    use crate::env::{FileSystem, MemFileSystem};
+    use crate::FlushOptions;
+    use std::sync::Arc;
+    let fs: Arc<dyn FileSystem> = Arc::new(MemFileSystem::new());
+    let opts = Options {
+      create_if_missing: true,
+      file_system: Arc::clone(&fs),
+      ..Options::default()
+    };
+    let db = Db::open(std::path::Path::new("/db"), opts).unwrap();
+
+    db.put(b"k", b"v1").unwrap();
+    db.flush(&FlushOptions { wait: true }).unwrap(); // k@1 = v1 into an SSTable
+
+    let snap_kept = db.get_snapshot();
+    let snap_released = db.get_snapshot();
+    assert_eq!(snap_kept.seq, snap_released.seq); // no writes in between — same seq
+    drop(snap_released);
+
+    db.put(b"k", b"v2").unwrap();
+    db.flush(&FlushOptions { wait: true }).unwrap(); // k@2 = v2 into a second SSTable
+
+    // Merge the SSTables.  Shadow-key pruning must keep k@1 because
+    // `snap_kept` still pins it.
+    db.compact_range(None, None).unwrap();
+
+    let read = ReadOptions {
+      snapshot: Some(&snap_kept),
+      ..ReadOptions::default()
+    };
+    assert_eq!(
+      db.get_with_options(&read, b"k").unwrap(),
+      b"v1",
+      "snapshot lost its pinned version after sibling release + compaction"
+    );
   }
 
   // ── Bloom filter tests ───────────────────────────────────────────────────────
@@ -4940,7 +4991,7 @@ mod tests {
           ))),
           imm: None,
           version_set: None,
-          snapshots: std::collections::BTreeSet::new(),
+          snapshots: std::collections::BTreeMap::new(),
           writers: std::collections::VecDeque::new(),
           next_writer_id: 0,
           completed: std::collections::HashMap::new(),
