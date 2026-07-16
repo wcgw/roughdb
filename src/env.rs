@@ -108,6 +108,13 @@ pub trait FileSystem: Send + Sync {
   /// Remove an empty directory.
   fn remove_dir(&self, path: &Path) -> Result<(), Error>;
 
+  /// Durably persist the directory entries of `path` (`fsync` on the directory).
+  ///
+  /// Required after creating or renaming a file for the new directory entry to
+  /// survive a crash — syncing the file itself only persists its contents.
+  /// Backends without directory metadata (e.g. in-memory) may no-op.
+  fn sync_dir(&self, path: &Path) -> Result<(), Error>;
+
   /// List the names of files and subdirectories in `path`.
   fn children(&self, path: &Path) -> Result<Vec<String>, Error>;
 
@@ -116,10 +123,13 @@ pub trait FileSystem: Send + Sync {
   /// Returns `Err` immediately if the lock is held by another process.
   fn lock_file(&self, path: &Path) -> Result<Box<dyn FileLock>, Error>;
 
-  /// Write `data` to `path` atomically (create or overwrite).
+  /// Write `data` to `path` durably (create or overwrite, then `fsync`).
   ///
-  /// Default implementation writes to the file directly.  Backends that
-  /// support atomic rename may write to a temporary file first.
+  /// Not atomic: a crash mid-write can leave a truncated file.  Callers that
+  /// need atomic replacement must write to a temporary file and [`rename`]
+  /// (see `write_current_file` in `db/version_set.rs`).
+  ///
+  /// [`rename`]: FileSystem::rename
   fn write_string_to_file(&self, path: &Path, data: &str) -> Result<(), Error> {
     let mut f = self.create_writable(path)?;
     f.write(data.as_bytes())?;
@@ -272,6 +282,12 @@ impl FileSystem for PosixFileSystem {
     std::fs::remove_dir(path).map_err(Error::IoError)
   }
 
+  fn sync_dir(&self, path: &Path) -> Result<(), Error> {
+    // Opening a directory read-only and fsync-ing it persists its entries.
+    let dir = std::fs::File::open(path).map_err(Error::IoError)?;
+    dir.sync_all().map_err(Error::IoError)
+  }
+
   fn children(&self, path: &Path) -> Result<Vec<String>, Error> {
     let entries = std::fs::read_dir(path).map_err(Error::IoError)?;
     let mut names = Vec::new();
@@ -300,10 +316,6 @@ impl FileSystem for PosixFileSystem {
       return Err(Error::IoError(std::io::Error::last_os_error()));
     }
     Ok(Box::new(PosixFileLock { _file: file }))
-  }
-
-  fn write_string_to_file(&self, path: &Path, data: &str) -> Result<(), Error> {
-    std::fs::write(path, data).map_err(Error::IoError)
   }
 
   fn read_string_from_file(&self, path: &Path) -> Result<String, Error> {
@@ -596,6 +608,11 @@ mod memfs {
       Ok(())
     }
 
+    fn sync_dir(&self, _path: &Path) -> Result<(), Error> {
+      // In-memory: directory entries are always "durable".
+      Ok(())
+    }
+
     fn children(&self, path: &Path) -> Result<Vec<String>, Error> {
       let st = self.state.lock().unwrap();
       if !st.dirs.contains(path) {
@@ -762,6 +779,16 @@ mod tests {
   }
 
   #[test]
+  fn posix_sync_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    let fs = PosixFileSystem;
+    fs.create_writable(&dir.path().join("f.txt")).unwrap();
+    fs.sync_dir(dir.path()).unwrap();
+    // Syncing a non-existent directory must error, not panic.
+    assert!(fs.sync_dir(&dir.path().join("no_such_dir")).is_err());
+  }
+
+  #[test]
   fn posix_appendable() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("append.txt");
@@ -893,6 +920,13 @@ mod tests {
     fs.remove_file(dst).unwrap();
     assert!(!fs.file_exists(dst));
     assert!(matches!(fs.remove_file(dst), Err(Error::IoError(_))));
+  }
+
+  #[test]
+  fn mem_sync_dir_is_noop() {
+    let fs = MemFileSystem::new();
+    fs.create_dir_all(Path::new("/db")).unwrap();
+    fs.sync_dir(Path::new("/db")).unwrap();
   }
 
   #[test]

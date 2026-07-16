@@ -31,8 +31,17 @@ pub(crate) fn write_current_file(
   manifest_number: u64,
   fs: &dyn crate::env::FileSystem,
 ) -> Result<(), Error> {
+  // Atomic replacement: write a temp file, fsync it, then rename over CURRENT
+  // and fsync the directory.  Rewriting CURRENT in place would brick the
+  // database if a crash left it truncated.  See LevelDB's SetCurrentFile.
   let content = format!("{}\n", manifest_filename(manifest_number));
-  fs.write_string_to_file(&path.join("CURRENT"), &content)
+  let tmp_path = path.join(format!("{manifest_number:06}.dbtmp"));
+  fs.write_string_to_file(&tmp_path, &content)?;
+  if let Err(e) = fs.rename(&tmp_path, &path.join("CURRENT")) {
+    let _ = fs.remove_file(&tmp_path);
+    return Err(e);
+  }
+  fs.sync_dir(path)
 }
 
 fn read_current_file(path: &Path, fs: &dyn crate::env::FileSystem) -> Result<String, Error> {
@@ -95,6 +104,8 @@ impl VersionSet {
     edit.last_sequence = Some(0);
     edit.log_number = Some(1);
     manifest_log.add_record(&edit.encode())?;
+    // The MANIFEST must be durable before CURRENT points at it.
+    manifest_log.sync()?;
 
     write_current_file(path, manifest_number, fs)?;
 
@@ -196,6 +207,10 @@ impl VersionSet {
     edit.log_number = Some(self.log_number);
 
     self.manifest_log.add_record(&edit.encode())?;
+    // Sync before installing the new version in memory: once this returns,
+    // callers may delete files (old WALs, compacted SSTables) that are only
+    // recoverable while the pre-edit MANIFEST state is intact on disk.
+    self.manifest_log.sync()?;
 
     // Build new Version by cloning current and applying additions/deletions.
     let mut new_files: [Vec<Arc<FileMetaData>>; 7] =

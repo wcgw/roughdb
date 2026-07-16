@@ -210,6 +210,11 @@ impl TableBuilder {
     self.offset += FOOTER_ENCODED_LENGTH as u64;
 
     self.dest.flush()?;
+    // Durability before reference: every finished table is fsync'd before the
+    // caller can install it in the MANIFEST.  A crash must never leave the
+    // MANIFEST pointing at a torn SSTable.  See LevelDB's BuildTable and
+    // FinishCompactionOutputFile, which Sync() before LogAndApply.
+    self.dest.sync()?;
     Ok(self.offset)
   }
 

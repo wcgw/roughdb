@@ -709,6 +709,13 @@ pub(crate) fn do_compaction(
     )?;
   }
 
+  // Each output file was fsync'd by TableBuilder::finish; one directory sync
+  // persists all their directory entries before install_compaction records
+  // them in the MANIFEST and the inputs become deletable.
+  if !outputs.is_empty() {
+    opts.file_system.sync_dir(path)?;
+  }
+
   log::info!(
     "compaction L{}→L{} complete: {} output files ({} bytes)",
     spec.level,

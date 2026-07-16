@@ -556,7 +556,13 @@ impl Drop for Db {
     if self.inner.persistence.is_some() {
       log::info!("shutting down database");
       self.inner.shutting_down.store(true, Ordering::Release);
+      // Notify while holding the state mutex: bg_worker checks shutting_down
+      // under this mutex before parking on bg_condvar, so an unlocked notify
+      // can land between its check and its park and be lost — leaving the
+      // join below waiting forever.
+      let g = self.inner.state.lock().unwrap();
       self.inner.bg_condvar.notify_one();
+      drop(g);
       if let Some(t) = self.bg_thread.take() {
         t.join().ok();
       }
@@ -1655,6 +1661,8 @@ impl Db {
     let manifest_file = fs.create_writable(&manifest_path)?;
     let mut manifest_writer = LogWriter::new(manifest_file, 0);
     manifest_writer.add_record(&edit.encode())?;
+    // Durable before CURRENT points at it (and before old manifests go away).
+    manifest_writer.sync()?;
 
     // Delete old manifests.
     for name in &manifests {
@@ -1953,6 +1961,8 @@ fn write_flush_from_mem(
     }
   }
   let file_size = builder.finish()?;
+  // Persist the new SSTable's directory entry before it enters the MANIFEST.
+  fs.sync_dir(path)?;
   let read_file = fs.open_random_access(&sst_path)?;
   let table = Arc::new(Table::open(
     read_file,
@@ -2058,6 +2068,12 @@ fn write_flush(prep: FlushPrep, opts: &Options) -> Result<FlushResult, Error> {
     }
   }
   let file_size = builder.finish()?;
+  // Persist the directory entries for the new SSTable and the new WAL
+  // (created in begin_flush) before finish_flush records them in the MANIFEST
+  // and deletes the old WAL.
+  if let Some(dir) = sst_path.parent() {
+    fs.sync_dir(dir)?;
+  }
   drop(old_mem);
   let read_file = fs.open_random_access(&sst_path)?;
   let table = Arc::new(Table::open(
@@ -2447,6 +2463,10 @@ enum FileKind {
   Table,
   Current,
   Lock,
+  /// Temporary file from an interrupted atomic-rename (e.g. `CURRENT` update).
+  /// Always safe to delete: a live temp file only exists inside
+  /// `write_current_file`, which never runs concurrently with GC.
+  Temp,
 }
 
 /// Parse a database filename into `(file_number, kind)`.
@@ -2473,6 +2493,10 @@ fn parse_db_filename(name: &str) -> Option<(u64, FileKind)> {
   if let Some(stem) = name.strip_suffix(".ldb") {
     let n = stem.parse().ok()?;
     return Some((n, FileKind::Table));
+  }
+  if let Some(stem) = name.strip_suffix(".dbtmp") {
+    let n = stem.parse().ok()?;
+    return Some((n, FileKind::Temp));
   }
   None
 }
@@ -2527,6 +2551,7 @@ fn delete_obsolete_files(
         FileKind::Manifest => number >= manifest_number,
         FileKind::Table => live_tables.contains(&number),
         FileKind::Current | FileKind::Lock => true,
+        FileKind::Temp => false,
       };
       if !keep {
         log::debug!("deleting obsolete file: {name}");
@@ -2557,6 +2582,8 @@ mod tests {
       ("LOCK", 0, FileKind::Lock),
       ("MANIFEST-2", 2, FileKind::Manifest),
       ("MANIFEST-7", 7, FileKind::Manifest),
+      ("000005.dbtmp", 5, FileKind::Temp),
+      ("100.dbtmp", 100, FileKind::Temp),
       // u64::MAX
       (
         "18446744073709551615.log",
@@ -2596,6 +2623,8 @@ mod tests {
       "100",
       "100.",
       "100.lop",
+      ".dbtmp",
+      "x.dbtmp",
       // u64 overflow
       "18446744073709551616.log",
       "184467440737095516150.log",
@@ -3351,6 +3380,40 @@ mod tests {
       !orphan.exists(),
       "orphan .ldb file should have been deleted"
     );
+  }
+
+  #[test]
+  fn stale_dbtmp_file_deleted_by_gc() {
+    // A leftover *.dbtmp (crash between temp-write and rename in
+    // write_current_file) must be cleaned up by delete_obsolete_files.
+    let dir = tempfile::tempdir().unwrap();
+    {
+      let db = Db::open(dir.path(), small_options()).unwrap();
+      db.put(b"k", b"v").unwrap();
+    }
+    let stale = dir.path().join("000123.dbtmp");
+    std::fs::write(&stale, b"MANIFEST-000123\n").unwrap();
+
+    let db = Db::open(dir.path(), small_options()).unwrap();
+    for i in 0u32..20 {
+      db.put(format!("k{i:04}").as_bytes(), b"v2").unwrap();
+    }
+    db.flush(&crate::FlushOptions { wait: true }).unwrap();
+    assert!(!stale.exists(), "stale .dbtmp should have been deleted");
+  }
+
+  #[test]
+  fn current_written_via_rename_leaves_no_tmp() {
+    // write_current_file goes through a temp file + atomic rename; after any
+    // open no *.dbtmp may remain and CURRENT must point at a real MANIFEST.
+    let dir = tempfile::tempdir().unwrap();
+    {
+      let db = Db::open(dir.path(), small_options()).unwrap();
+      db.put(b"k", b"v").unwrap();
+    }
+    assert_eq!(count_files(dir.path(), ".dbtmp"), 0);
+    let current = std::fs::read_to_string(dir.path().join("CURRENT")).unwrap();
+    assert!(dir.path().join(current.trim()).exists());
   }
 
   #[test]
