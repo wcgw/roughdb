@@ -126,6 +126,22 @@ fn read_benchmarks(c: &mut Criterion) {
     });
   });
 
+  // scan: one full forward iteration over all N entries.
+  group.bench_function("scan", |b| {
+    use roughdb::ReadOptions;
+    b.iter(|| {
+      let mut it = db.new_iterator(&ReadOptions::default()).unwrap();
+      it.seek_to_first();
+      let mut n = 0u64;
+      while it.valid() {
+        black_box((it.key(), it.value()));
+        it.next();
+        n += 1;
+      }
+      assert_eq!(n, N);
+    });
+  });
+
   // readmissing: N gets of keys that were never inserted.
   group.bench_function("missing", |b| {
     b.iter(|| {
