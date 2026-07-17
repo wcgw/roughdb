@@ -3892,6 +3892,59 @@ mod tests {
   }
 
   #[test]
+  fn get_reads_all_keys_across_many_l1_files() {
+    // With a tiny max_file_size, compact_range spreads the data over many
+    // disjoint L1 files.  Every key must still be found (exercises the
+    // per-level binary search in Version::get, including file-boundary keys),
+    // and keys outside every file's range must miss without error.
+    use crate::env::{FileSystem, MemFileSystem};
+    use crate::FlushOptions;
+    use std::sync::Arc;
+    let fs: Arc<dyn FileSystem> = Arc::new(MemFileSystem::new());
+    let opts = Options {
+      create_if_missing: true,
+      max_file_size: 4 << 10,
+      file_system: Arc::clone(&fs),
+      ..Options::default()
+    };
+    let db = Db::open(std::path::Path::new("/db"), opts).unwrap();
+    let value = [b'x'; 50];
+    for i in 0u32..2000 {
+      db.put(format!("k{i:05}").as_bytes(), value).unwrap();
+    }
+    db.flush(&FlushOptions { wait: true }).unwrap();
+    db.compact_range(None, None).unwrap();
+
+    // Sanity: the data really is spread over multiple files at one L1+ level
+    // (the flush may place its output at L1 or L2, and compact_range pushes
+    // one level deeper from wherever it landed).
+    let files_below_l0: usize = (1..7)
+      .map(|l| {
+        db.get_property(&format!("leveldb.num-files-at-level{l}"))
+          .unwrap()
+          .parse::<usize>()
+          .unwrap()
+      })
+      .sum();
+    assert!(
+      files_below_l0 > 1,
+      "expected multiple L1+ files, got {files_below_l0}"
+    );
+
+    for i in 0u32..2000 {
+      assert_eq!(
+        db.get(format!("k{i:05}").as_bytes()).unwrap(),
+        value,
+        "k{i:05} must be readable after multi-file compaction"
+      );
+    }
+    // Before the first file, between-file gaps don't exist for contiguous
+    // keys, and after the last file: all must miss cleanly.
+    assert!(db.get(b"a").unwrap_err().is_not_found());
+    assert!(db.get(b"k99999").unwrap_err().is_not_found());
+  }
+
+  #[test]
   fn snapshot_survives_sibling_release_at_same_sequence() {
     // Two snapshots taken at the same sequence number must be tracked
     // independently: releasing one must not un-pin the other.  A set-based

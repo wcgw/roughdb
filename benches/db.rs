@@ -268,11 +268,61 @@ fn compaction_benchmarks(c: &mut Criterion) {
   group.finish();
 }
 
+// ---------------------------------------------------------------------------
+// Disk read benchmarks
+// All data lives in SSTables (memtable drained by flush + compact_range), and
+// a small max_file_size spreads it across many files per level — the case
+// where per-lookup file selection matters.
+// ---------------------------------------------------------------------------
+
+fn disk_read_benchmarks(c: &mut Criterion) {
+  use roughdb::{FlushOptions, Options};
+
+  let order = shuffled(N);
+  let mut group = c.benchmark_group("disk_read");
+  group.throughput(Throughput::Elements(N));
+
+  let dir = tempfile::tempdir().unwrap();
+  let opts = Options {
+    create_if_missing: true,
+    max_file_size: 64 << 10,
+    ..Options::default()
+  };
+  let db = Db::open(dir.path(), opts).unwrap();
+  for i in 0..N {
+    db.put(make_key(i), VALUE).unwrap();
+  }
+  db.flush(&FlushOptions { wait: true }).unwrap();
+  db.compact_range(None, None).unwrap();
+
+  // random gets against a leveled, on-disk database.
+  group.bench_function("random", |b| {
+    b.iter(|| {
+      for &i in &order {
+        black_box(db.get(make_key(i))).unwrap();
+      }
+    });
+  });
+
+  // gets for keys that don't exist (no bloom filters by default, so every
+  // candidate file pays an index search).
+  group.bench_function("missing", |b| {
+    b.iter(|| {
+      for i in N..2 * N {
+        black_box(db.get(make_key(i))).unwrap_err().is_not_found();
+      }
+    });
+  });
+
+  group.finish();
+}
+
 criterion_group!(
   benches,
   write_benchmarks,
   read_benchmarks,
   delete_benchmarks,
-  compaction_benchmarks
+  compaction_benchmarks,
+  disk_read_benchmarks
 );
 criterion_main!(benches);

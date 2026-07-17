@@ -101,14 +101,17 @@ impl Version {
   /// Look up `user_key` across all levels, returning the first match and seek
   /// statistics for compaction accounting.
   ///
-  /// L0 is scanned newest-first.  L1–L6 are scanned linearly (binary search
-  /// deferred to a later phase).
+  /// Only files whose key range can contain `user_key` are probed: L0 is
+  /// scanned newest-first with a containment check per file; L1–L6 use a
+  /// binary search for the single candidate file per level (ranges are
+  /// disjoint and sorted).  Matching LevelDB's `Version::ForEachOverlapping`.
   ///
   /// Tables are opened on demand via `tc`; `verify_checksums` is forwarded to
   /// every `Table::get` call.
   ///
   /// The returned [`GetStats`] blames the first file consulted when the lookup
   /// required probing more than one file (matching LevelDB `Version::Get`).
+  /// Files skipped by the range checks are never charged.
   pub(crate) fn get(
     &self,
     user_key: &[u8],
@@ -139,8 +142,16 @@ impl Version {
       };
     }
 
-    // L0: newest-first scan.
+    // L0: newest-first scan of the files whose key range contains `user_key`.
+    // Ranges may overlap, so every containing file is a candidate.
     for meta in &self.files[0] {
+      let lo = crate::table::format::user_key(&meta.smallest);
+      let hi = crate::table::format::user_key(&meta.largest);
+      if self.comparator.compare(user_key, lo).is_lt()
+        || self.comparator.compare(user_key, hi).is_gt()
+      {
+        continue; // file cannot contain the key — don't open or charge it
+      }
       charge_prev!(meta, 0);
       let table = tc.get_or_open(meta.number, meta.file_size)?;
       match table.get(&lookup_key, verify_checksums, fill_cache)? {
@@ -150,16 +161,28 @@ impl Version {
       }
     }
 
-    // L1–L6: linear scan (binary search deferred to a later phase).
+    // L1–L6: file ranges are disjoint and sorted by smallest key, so at most
+    // one file per level can contain the key — binary-search for it.
+    // See LevelDB's `Version::ForEachOverlapping` / `FindFile`.
     for level in 1..NUM_LEVELS {
-      for meta in &self.files[level] {
-        charge_prev!(meta, level);
-        let table = tc.get_or_open(meta.number, meta.file_size)?;
-        match table.get(&lookup_key, verify_checksums, fill_cache)? {
-          LookupResult::Value(v) => return Ok((LookupResult::Value(v), stats)),
-          LookupResult::Deleted => return Ok((LookupResult::Deleted, stats)),
-          LookupResult::NotInTable => {}
-        }
+      let files = &self.files[level];
+      let index = find_file(files, &lookup_key, &*self.comparator);
+      let Some(meta) = files.get(index) else {
+        continue; // every file's range ends before the key
+      };
+      if self
+        .comparator
+        .compare(user_key, crate::table::format::user_key(&meta.smallest))
+        .is_lt()
+      {
+        continue; // the candidate file starts after the key
+      }
+      charge_prev!(meta, level);
+      let table = tc.get_or_open(meta.number, meta.file_size)?;
+      match table.get(&lookup_key, verify_checksums, fill_cache)? {
+        LookupResult::Value(v) => return Ok((LookupResult::Value(v), stats)),
+        LookupResult::Deleted => return Ok((LookupResult::Deleted, stats)),
+        LookupResult::NotInTable => {}
       }
     }
 
@@ -311,6 +334,27 @@ impl Version {
 ///
 /// L1 = 10 MiB, L2 = 100 MiB, L3 = 1 GiB, …  (×10 per level).
 /// L0 uses a file-count threshold, not byte size.
+/// Binary-search `files` (sorted by smallest key, disjoint ranges — L1+) for
+/// the index of the first file whose `largest` internal key is >= `ikey`.
+/// Returns `files.len()` when every file ends before `ikey`.
+///
+/// Port of LevelDB's `FindFile` (`db/version_set.cc`).
+fn find_file(files: &[Arc<FileMetaData>], ikey: &[u8], comparator: &dyn Comparator) -> usize {
+  use crate::table::format::cmp_internal_keys;
+  let mut left = 0usize;
+  let mut right = files.len();
+  while left < right {
+    let mid = left + (right - left) / 2;
+    if cmp_internal_keys(&files[mid].largest, ikey, comparator) == std::cmp::Ordering::Less {
+      // File at mid ends before ikey — everything at or before mid is out.
+      left = mid + 1;
+    } else {
+      right = mid;
+    }
+  }
+  left
+}
+
 pub(crate) fn max_bytes_for_level(level: usize) -> f64 {
   let mut result = 10.0 * 1_048_576.0_f64; // 10 MiB
   let mut l = level;
@@ -386,6 +430,55 @@ mod tests {
       v.push_file_for_test(1, meta(n, lo, hi));
     }
     v
+  }
+
+  // ── find_file tests (port of LevelDB version_set_test.cc: FindFile) ───────
+
+  /// Lookup internal key for `uk` (seq = MAX sorts before any stored entry of
+  /// the same user key, matching how `Version::get` builds it).
+  fn lookup(uk: &[u8]) -> Vec<u8> {
+    make_internal_key(uk, u64::MAX, 1)
+  }
+
+  #[test]
+  fn find_file_empty() {
+    let files: Vec<Arc<FileMetaData>> = Vec::new();
+    assert_eq!(find_file(&files, &lookup(b"foo"), &BytewiseComparator), 0);
+  }
+
+  #[test]
+  fn find_file_single() {
+    let files = vec![meta(1, b"p", b"q")];
+    let cmp = BytewiseComparator;
+    assert_eq!(find_file(&files, &lookup(b"a"), &cmp), 0);
+    assert_eq!(find_file(&files, &lookup(b"p"), &cmp), 0);
+    assert_eq!(find_file(&files, &lookup(b"p1"), &cmp), 0);
+    assert_eq!(find_file(&files, &lookup(b"q"), &cmp), 0);
+    assert_eq!(find_file(&files, &lookup(b"q1"), &cmp), 1);
+    assert_eq!(find_file(&files, &lookup(b"z"), &cmp), 1);
+  }
+
+  #[test]
+  fn find_file_multiple() {
+    let files = vec![
+      meta(1, b"150", b"200"),
+      meta(2, b"200", b"250"),
+      meta(3, b"300", b"350"),
+      meta(4, b"400", b"450"),
+    ];
+    let cmp = BytewiseComparator;
+    assert_eq!(find_file(&files, &lookup(b"100"), &cmp), 0);
+    assert_eq!(find_file(&files, &lookup(b"150"), &cmp), 0);
+    assert_eq!(find_file(&files, &lookup(b"199"), &cmp), 0);
+    assert_eq!(find_file(&files, &lookup(b"200"), &cmp), 0);
+    assert_eq!(find_file(&files, &lookup(b"201"), &cmp), 1);
+    assert_eq!(find_file(&files, &lookup(b"250"), &cmp), 1);
+    assert_eq!(find_file(&files, &lookup(b"251"), &cmp), 2);
+    assert_eq!(find_file(&files, &lookup(b"299"), &cmp), 2);
+    assert_eq!(find_file(&files, &lookup(b"350"), &cmp), 2);
+    assert_eq!(find_file(&files, &lookup(b"351"), &cmp), 3);
+    assert_eq!(find_file(&files, &lookup(b"450"), &cmp), 3);
+    assert_eq!(find_file(&files, &lookup(b"451"), &cmp), 4);
   }
 
   #[test]
