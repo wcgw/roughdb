@@ -141,27 +141,31 @@ impl Table {
     Ok(block)
   }
 
-  /// Look up `user_key` in the table, returning a [`LookupResult`].
+  /// Look up `lookup_key` (an internal key: `user_key || tag(sequence, vtype=1)`,
+  /// built via [`make_internal_key`](crate::table::format::make_internal_key)),
+  /// returning a [`LookupResult`].
+  ///
+  /// Callers probing several tables for one lookup (see `Version::get`) build
+  /// the key once and pass it to each probe — not once per table.
   ///
   /// `verify_checksums`: when `true`, CRC32c is verified on every block read.
   /// `fill_cache`: when `false`, a cache miss is not inserted into the block cache.
   pub(crate) fn get(
     &self,
-    user_key: &[u8],
-    sequence: u64,
+    lookup_key: &[u8],
     verify_checksums: bool,
     fill_cache: bool,
   ) -> Result<LookupResult, Error> {
-    use crate::table::format::{make_internal_key, parse_internal_key};
+    use crate::table::format::parse_internal_key;
 
-    // Construct a lookup internal key: user_key + tag(sequence, vtype=kValueTypeForSeek).
-    // In internal-key order (seq DESC), this sorts before all entries for `user_key`
-    // with seq <= `sequence`, so `seek(lookup_key)` lands at the newest visible version.
-    let lookup_key = make_internal_key(user_key, sequence, 1);
+    // In internal-key order (seq DESC), the lookup key sorts before all entries
+    // for `user_key` with seq <= `sequence`, so `seek(lookup_key)` lands at the
+    // newest visible version.
+    let user_key = crate::table::format::user_key(lookup_key);
 
     // Search the index block for the first data block whose largest key >= lookup_key.
     let mut idx = self.index_block.iter();
-    idx.seek(&lookup_key);
+    idx.seek(lookup_key);
     if !idx.valid() {
       return Ok(LookupResult::NotInTable);
     }
@@ -180,7 +184,7 @@ impl Table {
     // Read (or fetch from cache) the data block.
     let data_block = self.read_data_block(&handle, verify_checksums, fill_cache)?;
     let mut it = data_block.iter();
-    it.seek(&lookup_key);
+    it.seek(lookup_key);
 
     if it.valid() {
       let ikey = it.key();
@@ -381,7 +385,7 @@ mod tests {
     )
     .unwrap();
     assert!(
-      matches!(table.get(b"hello", u64::MAX, false, true).unwrap(), LookupResult::Value(v) if v == b"world")
+      matches!(table.get(&make_internal_key(b"hello", u64::MAX, 1), false, true).unwrap(), LookupResult::Value(v) if v == b"world")
     );
   }
 
@@ -397,7 +401,9 @@ mod tests {
     )
     .unwrap();
     assert!(matches!(
-      table.get(b"z", u64::MAX, false, true).unwrap(),
+      table
+        .get(&make_internal_key(b"z", u64::MAX, 1), false, true)
+        .unwrap(),
       LookupResult::NotInTable
     ));
   }
@@ -415,7 +421,9 @@ mod tests {
     )
     .unwrap();
     assert!(matches!(
-      table.get(b"gone", u64::MAX, false, true).unwrap(),
+      table
+        .get(&make_internal_key(b"gone", u64::MAX, 1), false, true)
+        .unwrap(),
       LookupResult::Deleted
     ));
   }
@@ -432,7 +440,7 @@ mod tests {
     )
     .unwrap();
     assert!(
-      matches!(table.get(b"key", u64::MAX, false, true).unwrap(), LookupResult::Value(v) if v == b"new")
+      matches!(table.get(&make_internal_key(b"key", u64::MAX, 1), false, true).unwrap(), LookupResult::Value(v) if v == b"new")
     );
   }
 
@@ -450,15 +458,17 @@ mod tests {
     .unwrap();
     // With sequence=u64::MAX, we see the newest (seq=10).
     assert!(
-      matches!(table.get(b"key", u64::MAX, false, true).unwrap(), LookupResult::Value(v) if v == b"new")
+      matches!(table.get(&make_internal_key(b"key", u64::MAX, 1), false, true).unwrap(), LookupResult::Value(v) if v == b"new")
     );
     // With sequence=7, seq=10 is invisible — we see seq=5.
     assert!(
-      matches!(table.get(b"key", 7, false, true).unwrap(), LookupResult::Value(v) if v == b"old")
+      matches!(table.get(&make_internal_key(b"key", 7, 1), false, true).unwrap(), LookupResult::Value(v) if v == b"old")
     );
     // With sequence=3, both versions are invisible.
     assert!(matches!(
-      table.get(b"key", 3, false, true).unwrap(),
+      table
+        .get(&make_internal_key(b"key", 3, 1), false, true)
+        .unwrap(),
       LookupResult::NotInTable
     ));
   }
@@ -475,7 +485,9 @@ mod tests {
     )
     .unwrap();
     assert!(matches!(
-      table.get(b"k", u64::MAX, true, true).unwrap(),
+      table
+        .get(&make_internal_key(b"k", u64::MAX, 1), true, true)
+        .unwrap(),
       LookupResult::Value(_)
     ));
   }

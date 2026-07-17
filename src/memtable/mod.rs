@@ -79,11 +79,21 @@ impl Memtable {
     // Seek to (key, sequence): in skip-list order (user_key ASC, seq DESC),
     // this positions at the first entry with the same user key and seq ≤ sequence.
     let ssize = Entry::seek_key_size(key, sequence);
-    let mut sbuf = vec![0u8; ssize];
-    Entry::write_seek_key_to(&mut sbuf, key, sequence);
+    // Short keys (the common case) build the seek key on the stack — no
+    // allocation per lookup.  Mirrors LevelDB's LookupKey inline buffer.
+    const INLINE_SEEK_KEY: usize = 128;
+    let mut stack_buf = [0u8; INLINE_SEEK_KEY];
+    let mut heap_buf: Vec<u8>;
+    let sbuf: &mut [u8] = if ssize <= INLINE_SEEK_KEY {
+      &mut stack_buf[..ssize]
+    } else {
+      heap_buf = vec![0u8; ssize];
+      &mut heap_buf
+    };
+    Entry::write_seek_key_to(sbuf, key, sequence);
     // SAFETY: SkipList reads are lock-free via acquire/release atomics.
     let table = unsafe { &*self.table.get() };
-    match table.find_first_at_or_after(&sbuf) {
+    match table.find_first_at_or_after(sbuf) {
       Some(payload) => {
         let e = Entry::from_slice(payload);
         if self.comparator.compare(e.key(), key) == std::cmp::Ordering::Equal {

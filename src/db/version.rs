@@ -124,6 +124,9 @@ impl Version {
     let mut last_file_read: Option<Arc<FileMetaData>> = None;
     let mut last_file_read_level: usize = 0;
 
+    // Build the lookup internal key once; every table probe reuses it.
+    let lookup_key = crate::table::format::make_internal_key(user_key, sequence, 1);
+
     // Helper: record blame on the previous file before moving to a new one.
     macro_rules! charge_prev {
       ($meta:expr, $level:expr) => {
@@ -140,7 +143,7 @@ impl Version {
     for meta in &self.files[0] {
       charge_prev!(meta, 0);
       let table = tc.get_or_open(meta.number, meta.file_size)?;
-      match table.get(user_key, sequence, verify_checksums, fill_cache)? {
+      match table.get(&lookup_key, verify_checksums, fill_cache)? {
         LookupResult::Value(v) => return Ok((LookupResult::Value(v), stats)),
         LookupResult::Deleted => return Ok((LookupResult::Deleted, stats)),
         LookupResult::NotInTable => {}
@@ -152,7 +155,7 @@ impl Version {
       for meta in &self.files[level] {
         charge_prev!(meta, level);
         let table = tc.get_or_open(meta.number, meta.file_size)?;
-        match table.get(user_key, sequence, verify_checksums, fill_cache)? {
+        match table.get(&lookup_key, verify_checksums, fill_cache)? {
           LookupResult::Value(v) => return Ok((LookupResult::Value(v), stats)),
           LookupResult::Deleted => return Ok((LookupResult::Deleted, stats)),
           LookupResult::NotInTable => {}
