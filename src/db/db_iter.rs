@@ -263,8 +263,6 @@ impl DbIterator {
   pub(crate) fn next(&mut self) {
     debug_assert!(self.valid);
 
-    let mut skip: Vec<u8>;
-
     if self.direction == Direction::Reverse {
       // Switching from Reverse to Forward.
       // `iter` is positioned at an entry with user_key < saved_key (the
@@ -281,15 +279,16 @@ impl DbIterator {
         self.saved_key.clear();
         return;
       }
-      // Use saved_key as the key to skip (advance past the entry we were
-      // presenting before the direction switch).
-      skip = std::mem::take(&mut self.saved_key);
+      // saved_key already holds the key to skip (the entry we were presenting
+      // before the direction switch).
     } else {
-      // Forward → Forward: copy current key and advance.
-      let ikey = self.iter.key().to_vec();
-      skip = parse_internal_key(&ikey)
-        .map(|(uk, _, _)| uk.to_vec())
-        .unwrap_or_default();
+      // Forward → Forward: stash the current user key as the skip target,
+      // then advance.  Borrowed parse + amortised buffer — no allocation
+      // (matching LevelDB, where saved_key_ doubles as the skip scratch).
+      self.saved_key.clear();
+      if let Some((uk, _, _)) = parse_internal_key(self.iter.key()) {
+        self.saved_key.extend_from_slice(uk);
+      }
       self.iter.next();
       if !self.iter.valid() {
         self.valid = false;
@@ -297,7 +296,11 @@ impl DbIterator {
       }
     }
 
+    // Lend saved_key to find_next_user_entry as the skip buffer, then put it
+    // back so its capacity is reused across calls.
+    let mut skip = std::mem::take(&mut self.saved_key);
     self.find_next_user_entry(true, &mut skip);
+    self.saved_key = skip;
   }
 
   /// Move to the previous user-visible entry.
@@ -312,9 +315,8 @@ impl DbIterator {
       // `iter` is positioned AT the current entry.  Save the current user
       // key, then scan backward until we see a different (smaller) user key.
       debug_assert!(self.iter.valid());
-      let ikey = self.iter.key().to_vec();
       self.saved_key.clear();
-      if let Some((uk, _, _)) = parse_internal_key(&ikey) {
+      if let Some((uk, _, _)) = parse_internal_key(self.iter.key()) {
         self.saved_key.extend_from_slice(uk);
       }
       loop {

@@ -195,7 +195,10 @@ impl BlockIter {
 
   /// Return the key stored at restart point `index`, or `None` if the entry
   /// there is malformed.  Does not modify `self`.
-  fn key_at_restart(&self, index: usize) -> Option<Vec<u8>> {
+  ///
+  /// At a restart point the key is stored contiguously (shared prefix length
+  /// is always 0), so it can be borrowed from block memory — no allocation.
+  fn key_at_restart(&self, index: usize) -> Option<&[u8]> {
     let data = &*self.data;
     let limit = self.restarts_offset;
     // At a restart point shared_len is always 0, so the unshared suffix is the
@@ -207,7 +210,7 @@ impl BlockIter {
     if key_end > limit {
       return None;
     }
-    Some(data[pos..key_end].to_vec())
+    Some(&data[pos..key_end])
   }
 }
 
@@ -259,7 +262,7 @@ impl InternalIterator for BlockIter {
           return;
         }
       };
-      match cmp_internal_keys(restart_key.as_slice(), target, &*self.comparator) {
+      match cmp_internal_keys(restart_key, target, &*self.comparator) {
         std::cmp::Ordering::Less | std::cmp::Ordering::Equal => lo = mid,
         std::cmp::Ordering::Greater => hi = mid,
       }

@@ -1354,28 +1354,43 @@ impl Db {
       group_len += 1;
     }
 
-    // ── Phase 4: Build combined batch, write WAL, insert into memtable ────────
+    // ── Phase 4: Write WAL, insert into memtable ──────────────────────────────
     let need_sync = state.writers.iter().take(group_len).any(|w| w.sync);
     let start_seq = state.last_sequence + 1;
 
-    let mut combined = WriteBatch::new();
-    combined.set_sequence(start_seq);
-    for slot in state.writers.iter().take(group_len) {
-      combined.append(&slot.batch);
-    }
+    // A group of one — the uncontended common case — stamps and writes the
+    // leader's batch in place: no scratch batch, no copy.  Only real groups
+    // (two or more writers) are merged into a freshly built batch.  Matches
+    // LevelDB's `BuildBatchGroup`, which returns `first->batch` unless a
+    // second writer joins.
+    let st = &mut *state;
+    let scratch: WriteBatch;
+    let batch: &WriteBatch = if group_len == 1 {
+      let slot = st.writers.front_mut().unwrap();
+      slot.batch.set_sequence(start_seq);
+      &slot.batch
+    } else {
+      let mut combined = WriteBatch::new();
+      combined.set_sequence(start_seq);
+      for slot in st.writers.iter().take(group_len) {
+        combined.append(&slot.batch);
+      }
+      scratch = combined;
+      &scratch
+    };
 
     let status: Result<(), Error> = (|| {
-      if let Some(log) = state.log.as_mut() {
-        log.add_record(combined.contents())?;
+      if let Some(log) = st.log.as_mut() {
+        log.add_record(batch.contents())?;
         if need_sync {
           log.sync()?;
         }
       }
-      combined.iterate(&mut Inserter {
-        mem: &state.mem,
+      batch.iterate(&mut Inserter {
+        mem: &st.mem,
         seq: start_seq,
       })?;
-      state.last_sequence += combined.count() as u64;
+      st.last_sequence += batch.count() as u64;
       Ok(())
     })();
 
@@ -1948,15 +1963,15 @@ fn write_flush_from_mem(
   {
     let mut it = mem.iter();
     it.seek_to_first();
-    let mut first = true;
     while it.valid() {
-      let ikey = it.key().to_vec();
-      if first {
-        smallest = ikey.clone();
-        first = false;
+      // Borrowed key/value; only the range bounds are copied (internal keys
+      // are never empty — the 8-byte tag — so empty `smallest` means "first").
+      if smallest.is_empty() {
+        smallest.extend_from_slice(it.key());
       }
-      largest = ikey;
       builder.add(it.key(), it.value())?;
+      largest.clear();
+      largest.extend_from_slice(it.key());
       it.advance();
     }
   }
@@ -2055,15 +2070,15 @@ fn write_flush(prep: FlushPrep, opts: &Options) -> Result<FlushResult, Error> {
   {
     let mut it = old_mem.iter();
     it.seek_to_first();
-    let mut first = true;
     while it.valid() {
-      let ikey = it.key().to_vec(); // SSTable internal key (user_key || tag)
-      if first {
-        smallest = ikey.clone();
-        first = false;
+      // `it.key()` is the SSTable internal key (user_key || tag), borrowed
+      // from the iterator's scratch buffer — only the range bounds are copied.
+      if smallest.is_empty() {
+        smallest.extend_from_slice(it.key());
       }
-      largest = ikey;
       builder.add(it.key(), it.value())?;
+      largest.clear();
+      largest.extend_from_slice(it.key());
       it.advance();
     }
   }
@@ -3874,6 +3889,59 @@ mod tests {
     assert_eq!(db.get_with_options(&opts1, b"k").unwrap(), b"v1");
     assert_eq!(db.get_with_options(&opts2, b"k").unwrap(), b"v2");
     assert_eq!(db.get(b"k").unwrap(), b"v3");
+  }
+
+  #[test]
+  fn get_reads_all_keys_across_many_l1_files() {
+    // With a tiny max_file_size, compact_range spreads the data over many
+    // disjoint L1 files.  Every key must still be found (exercises the
+    // per-level binary search in Version::get, including file-boundary keys),
+    // and keys outside every file's range must miss without error.
+    use crate::env::{FileSystem, MemFileSystem};
+    use crate::FlushOptions;
+    use std::sync::Arc;
+    let fs: Arc<dyn FileSystem> = Arc::new(MemFileSystem::new());
+    let opts = Options {
+      create_if_missing: true,
+      max_file_size: 4 << 10,
+      file_system: Arc::clone(&fs),
+      ..Options::default()
+    };
+    let db = Db::open(std::path::Path::new("/db"), opts).unwrap();
+    let value = [b'x'; 50];
+    for i in 0u32..2000 {
+      db.put(format!("k{i:05}").as_bytes(), value).unwrap();
+    }
+    db.flush(&FlushOptions { wait: true }).unwrap();
+    db.compact_range(None, None).unwrap();
+
+    // Sanity: the data really is spread over multiple files at one L1+ level
+    // (the flush may place its output at L1 or L2, and compact_range pushes
+    // one level deeper from wherever it landed).
+    let files_below_l0: usize = (1..7)
+      .map(|l| {
+        db.get_property(&format!("leveldb.num-files-at-level{l}"))
+          .unwrap()
+          .parse::<usize>()
+          .unwrap()
+      })
+      .sum();
+    assert!(
+      files_below_l0 > 1,
+      "expected multiple L1+ files, got {files_below_l0}"
+    );
+
+    for i in 0u32..2000 {
+      assert_eq!(
+        db.get(format!("k{i:05}").as_bytes()).unwrap(),
+        value,
+        "k{i:05} must be readable after multi-file compaction"
+      );
+    }
+    // Before the first file, between-file gaps don't exist for contiguous
+    // keys, and after the last file: all must miss cleanly.
+    assert!(db.get(b"a").unwrap_err().is_not_found());
+    assert!(db.get(b"k99999").unwrap_err().is_not_found());
   }
 
   #[test]

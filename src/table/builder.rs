@@ -313,10 +313,12 @@ mod tests {
     )
     .unwrap();
     assert!(
-      matches!(table.get(b"hello", u64::MAX, false, true).unwrap(), L::Value(v) if v == b"world")
+      matches!(table.get(&make_internal_key(b"hello", u64::MAX, 1), false, true).unwrap(), L::Value(v) if v == b"world")
     );
     assert!(matches!(
-      table.get(b"missing", u64::MAX, false, true).unwrap(),
+      table
+        .get(&make_internal_key(b"missing", u64::MAX, 1), false, true)
+        .unwrap(),
       L::NotInTable
     ));
   }
@@ -335,7 +337,7 @@ mod tests {
     .unwrap();
     for (k, v) in &pairs {
       assert!(
-        matches!(table.get(k, u64::MAX, false, true).unwrap(), L::Value(ref val) if val == v)
+        matches!(table.get(&make_internal_key(k, u64::MAX, 1), false, true).unwrap(), L::Value(ref val) if val == v)
       );
     }
   }
@@ -376,7 +378,7 @@ mod tests {
     .unwrap();
     for (k, v) in &pairs {
       assert!(
-        matches!(table.get(k, u64::MAX, false, true).unwrap(), L::Value(ref val) if val == v)
+        matches!(table.get(&make_internal_key(k, u64::MAX, 1), false, true).unwrap(), L::Value(ref val) if val == v)
       );
     }
   }
@@ -417,7 +419,7 @@ mod tests {
     .unwrap();
     for (k, v) in &pairs {
       assert!(
-        matches!(table.get(k, u64::MAX, false, true).unwrap(), L::Value(ref val) if val == v)
+        matches!(table.get(&make_internal_key(k, u64::MAX, 1), false, true).unwrap(), L::Value(ref val) if val == v)
       );
     }
   }
@@ -436,7 +438,7 @@ mod tests {
     .unwrap();
     for (k, v) in &pairs {
       assert!(
-        matches!(table.get(k, u64::MAX, false, true).unwrap(), L::Value(ref val) if val == v)
+        matches!(table.get(&make_internal_key(k, u64::MAX, 1), false, true).unwrap(), L::Value(ref val) if val == v)
       );
     }
   }
