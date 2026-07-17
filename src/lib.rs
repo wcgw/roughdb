@@ -1963,15 +1963,15 @@ fn write_flush_from_mem(
   {
     let mut it = mem.iter();
     it.seek_to_first();
-    let mut first = true;
     while it.valid() {
-      let ikey = it.key().to_vec();
-      if first {
-        smallest = ikey.clone();
-        first = false;
+      // Borrowed key/value; only the range bounds are copied (internal keys
+      // are never empty — the 8-byte tag — so empty `smallest` means "first").
+      if smallest.is_empty() {
+        smallest.extend_from_slice(it.key());
       }
-      largest = ikey;
       builder.add(it.key(), it.value())?;
+      largest.clear();
+      largest.extend_from_slice(it.key());
       it.advance();
     }
   }
@@ -2070,15 +2070,15 @@ fn write_flush(prep: FlushPrep, opts: &Options) -> Result<FlushResult, Error> {
   {
     let mut it = old_mem.iter();
     it.seek_to_first();
-    let mut first = true;
     while it.valid() {
-      let ikey = it.key().to_vec(); // SSTable internal key (user_key || tag)
-      if first {
-        smallest = ikey.clone();
-        first = false;
+      // `it.key()` is the SSTable internal key (user_key || tag), borrowed
+      // from the iterator's scratch buffer — only the range bounds are copied.
+      if smallest.is_empty() {
+        smallest.extend_from_slice(it.key());
       }
-      largest = ikey;
       builder.add(it.key(), it.value())?;
+      largest.clear();
+      largest.extend_from_slice(it.key());
       it.advance();
     }
   }

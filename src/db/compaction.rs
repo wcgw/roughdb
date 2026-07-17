@@ -585,54 +585,66 @@ pub(crate) fn do_compaction(
   let mut last_sequence_for_key: u64 = u64::MAX;
 
   while merger.valid() {
-    let ikey = merger.key().to_vec();
-    let mut value = merger.value().to_vec();
-    merger.next();
+    // Zero-copy per entry: `ikey`/`value` borrow from the merging iterator
+    // (values point into block memory) and stay valid until `merger.next()`
+    // at the bottom of the loop.  The labeled block replaces `continue` so
+    // skipped entries still advance the iterator.  Only cross-iteration
+    // state (`current_user_key`, `current_largest`) is copied, into reused
+    // scratch buffers.
+    'entry: {
+      let ikey = merger.key();
 
-    let (uk, seq, vtype) = match crate::table::format::parse_internal_key(&ikey) {
-      Some(parts) => parts,
-      None => continue, // corrupt key — skip silently
-    };
+      let (uk, seq, vtype) = match crate::table::format::parse_internal_key(ikey) {
+        Some(parts) => parts,
+        None => break 'entry, // corrupt key — skip silently
+      };
 
-    // Track first occurrence of this user key.
-    let first_occurrence = !has_current_user_key
-      || opts
-        .comparator
-        .compare(uk, current_user_key.as_slice())
-        .is_ne();
-    if first_occurrence {
-      current_user_key = uk.to_vec();
-      has_current_user_key = true;
-      last_sequence_for_key = u64::MAX;
-    }
+      // Track first occurrence of this user key.
+      let first_occurrence = !has_current_user_key
+        || opts
+          .comparator
+          .compare(uk, current_user_key.as_slice())
+          .is_ne();
+      if first_occurrence {
+        current_user_key.clear();
+        current_user_key.extend_from_slice(uk);
+        has_current_user_key = true;
+        last_sequence_for_key = u64::MAX;
+      }
 
-    // Determine whether to drop this entry.
-    let drop = if last_sequence_for_key <= oldest_snapshot {
-      // A newer version for this user key was already emitted and is visible
-      // to even the oldest active snapshot — this older version is invisible.
-      true
-    } else if vtype == 0
-      && seq <= oldest_snapshot
-      && is_base_level_for_key(spec, uk, &*opts.comparator)
-    {
-      // Tombstone that no snapshot can see below this level — safe to elide.
-      true
-    } else {
-      false
-    };
+      // Determine whether to drop this entry.
+      let drop = if last_sequence_for_key <= oldest_snapshot {
+        // A newer version for this user key was already emitted and is visible
+        // to even the oldest active snapshot — this older version is invisible.
+        true
+      } else if vtype == 0
+        && seq <= oldest_snapshot
+        && is_base_level_for_key(spec, uk, &*opts.comparator)
+      {
+        // Tombstone that no snapshot can see below this level — safe to elide.
+        true
+      } else {
+        false
+      };
 
-    last_sequence_for_key = seq;
+      last_sequence_for_key = seq;
 
-    if !drop {
+      if drop {
+        break 'entry;
+      }
+
+      // Borrowed until the filter decides to rewrite it (the uncommon case).
+      let mut value: std::borrow::Cow<[u8]> = std::borrow::Cow::Borrowed(merger.value());
+
       // Apply the compaction filter to the newest visible version of each key.
       // Entries still visible to a live snapshot are never filtered (seq > oldest_snapshot).
       if let Some(ref mut filter) = compaction_filter {
         if first_occurrence && seq <= oldest_snapshot {
           match filter.filter(output_level, uk, &value, vtype) {
             crate::compaction_filter::CompactionDecision::Keep => {}
-            crate::compaction_filter::CompactionDecision::Remove => continue,
+            crate::compaction_filter::CompactionDecision::Remove => break 'entry,
             crate::compaction_filter::CompactionDecision::ChangeValue(new_val) => {
-              value = new_val;
+              value = std::borrow::Cow::Owned(new_val);
             }
           }
         }
@@ -640,7 +652,7 @@ pub(crate) fn do_compaction(
 
       // Close the current output file early if grandparent overlap is too high.
       // This limits future compaction amplification (Gap 4).
-      if current.is_some() && should_stop_before(spec, &ikey, opts) {
+      if current.is_some() && should_stop_before(spec, ikey, opts) {
         let finished = current.take().unwrap();
         finish_compaction_output(
           finished,
@@ -686,14 +698,16 @@ pub(crate) fn do_compaction(
           file_number,
           path: sst_path,
           builder,
-          smallest: ikey.clone(),
+          smallest: ikey.to_vec(),
         });
       }
 
       let cur = current.as_mut().unwrap();
-      cur.builder.add(&ikey, &value)?;
-      current_largest = ikey;
+      cur.builder.add(ikey, &value)?;
+      current_largest.clear();
+      current_largest.extend_from_slice(ikey);
     }
+    merger.next();
   }
 
   // Finalise the last output file (if any).

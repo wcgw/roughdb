@@ -180,10 +180,83 @@ fn delete_benchmarks(c: &mut Criterion) {
   group.finish();
 }
 
+// ---------------------------------------------------------------------------
+// Flush / compaction benchmarks
+// These need a persistent DB (tempdir; /tmp is tmpfs on most Linux setups, so
+// I/O noise stays low).  The default 4 MiB write buffer holds all N entries,
+// so flushes and compactions happen only where the benchmark invokes them —
+// two L0 files stay below L0_COMPACTION_TRIGGER, keeping the background
+// thread out of the measurement.
+// ---------------------------------------------------------------------------
+
+fn compaction_benchmarks(c: &mut Criterion) {
+  use criterion::BatchSize;
+  use roughdb::{FlushOptions, Options};
+
+  let mut group = c.benchmark_group("compaction");
+  group.sample_size(20);
+  group.throughput(Throughput::Elements(N));
+
+  // flush: N entries memtable → one L0 SSTable.
+  group.bench_function("flush", |b| {
+    b.iter_batched(
+      || {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = Options {
+          create_if_missing: true,
+          ..Options::default()
+        };
+        let db = Db::open(dir.path(), opts).unwrap();
+        for i in 0..N {
+          db.put(make_key(i), VALUE).unwrap();
+        }
+        (dir, db)
+      },
+      |(dir, db)| {
+        db.flush(&FlushOptions { wait: true }).unwrap();
+        black_box((dir, db));
+      },
+      BatchSize::PerIteration,
+    );
+  });
+
+  // compact_range: merge two fully-overlapping L0 files (2N entries in,
+  // N entries out after shadow-key pruning).
+  group.bench_function("compact_range", |b| {
+    b.iter_batched(
+      || {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = Options {
+          create_if_missing: true,
+          ..Options::default()
+        };
+        let db = Db::open(dir.path(), opts).unwrap();
+        for i in 0..N {
+          db.put(make_key(i), VALUE).unwrap();
+        }
+        db.flush(&FlushOptions { wait: true }).unwrap();
+        for i in 0..N {
+          db.put(make_key(i), VALUE).unwrap();
+        }
+        db.flush(&FlushOptions { wait: true }).unwrap();
+        (dir, db)
+      },
+      |(dir, db)| {
+        db.compact_range(None, None).unwrap();
+        black_box((dir, db));
+      },
+      BatchSize::PerIteration,
+    );
+  });
+
+  group.finish();
+}
+
 criterion_group!(
   benches,
   write_benchmarks,
   read_benchmarks,
-  delete_benchmarks
+  delete_benchmarks,
+  compaction_benchmarks
 );
 criterion_main!(benches);
