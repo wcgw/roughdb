@@ -1354,28 +1354,43 @@ impl Db {
       group_len += 1;
     }
 
-    // ── Phase 4: Build combined batch, write WAL, insert into memtable ────────
+    // ── Phase 4: Write WAL, insert into memtable ──────────────────────────────
     let need_sync = state.writers.iter().take(group_len).any(|w| w.sync);
     let start_seq = state.last_sequence + 1;
 
-    let mut combined = WriteBatch::new();
-    combined.set_sequence(start_seq);
-    for slot in state.writers.iter().take(group_len) {
-      combined.append(&slot.batch);
-    }
+    // A group of one — the uncontended common case — stamps and writes the
+    // leader's batch in place: no scratch batch, no copy.  Only real groups
+    // (two or more writers) are merged into a freshly built batch.  Matches
+    // LevelDB's `BuildBatchGroup`, which returns `first->batch` unless a
+    // second writer joins.
+    let st = &mut *state;
+    let scratch: WriteBatch;
+    let batch: &WriteBatch = if group_len == 1 {
+      let slot = st.writers.front_mut().unwrap();
+      slot.batch.set_sequence(start_seq);
+      &slot.batch
+    } else {
+      let mut combined = WriteBatch::new();
+      combined.set_sequence(start_seq);
+      for slot in st.writers.iter().take(group_len) {
+        combined.append(&slot.batch);
+      }
+      scratch = combined;
+      &scratch
+    };
 
     let status: Result<(), Error> = (|| {
-      if let Some(log) = state.log.as_mut() {
-        log.add_record(combined.contents())?;
+      if let Some(log) = st.log.as_mut() {
+        log.add_record(batch.contents())?;
         if need_sync {
           log.sync()?;
         }
       }
-      combined.iterate(&mut Inserter {
-        mem: &state.mem,
+      batch.iterate(&mut Inserter {
+        mem: &st.mem,
         seq: start_seq,
       })?;
-      state.last_sequence += combined.count() as u64;
+      st.last_sequence += batch.count() as u64;
       Ok(())
     })();
 
