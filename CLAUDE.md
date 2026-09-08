@@ -42,7 +42,16 @@ The read path checks `mem` → `imm` → each level of SSTables (newest to oldes
 - **`src/lib.rs`** — public `Db` API and orchestration only: open/recovery, the write path (write groups,
   backpressure), the three-phase lock protocol (snapshot under lock → I/O without lock → install under lock), flush,
   compaction *installation* (`install_compaction`, `install_trivial_move`, `maybe_compact`, `compact_level_range`),
-  and file GC.
+  and file GC.  The write leader follows the same protocol: it forms its group and reserves sequence numbers under
+  the `DbState` mutex, releases it for the WAL append / fsync / memtable insert (LevelDB's `mutex_.Unlock()` around
+  `AddRecord`), then re-locks to publish `last_sequence` and retire the group.  `DbState::write_in_progress` marks
+  that window; `Db::flush` waits for it before rotating the memtable or WAL.  A WAL write/sync error becomes the
+  sticky `background_error`.
+- **Recovery watermark**: `VersionSet::last_sequence` (persisted in every MANIFEST edit) is the highest sequence
+  whose data is in an SSTable, not the live write counter; `Db::open` skips WAL records at or below it.  Only a
+  flush advances it (`last_sequence_at_rotation`); compactions and `reuse_logs` recovery must leave it alone, or a
+  close after a compaction loses the writes still in the memtable
+  (`compaction_does_not_advance_recovery_watermark_past_unflushed_writes`).
 - **`src/db/compaction.rs`** — compaction planning + execution behind a pick → do → install seam.
   `pick_compaction`/`pick_range_compaction` produce a `Compaction` plan from a `Version` snapshot; `do_compaction`
   executes it with **no lock and no `DbState` dependency** (output file numbers come from an injected
@@ -390,9 +399,11 @@ what remains is compaction, the full Iterator/Snapshot API, and operational hygi
   `writers: VecDeque<WriterSlot>`, `next_writer_id: u64`, and `completed: HashMap<u64, Result<(), Error>>`;
   `Db` holds `write_condvar: Condvar` (paired with `Mutex<DbState>`). Group bounds match LevelDB's
   `BuildBatchGroup`: max 1 MiB; tightened to `first_size + 128 KiB` when the first batch is ≤ 128 KiB; a
-  `sync=true` writer won't join a non-sync group. Leader pops followers, stores results in `completed`, calls
-  `notify_all`; followers retrieve their result by `id` and return. Leader handles flush/compaction after.
-  See `db/db_impl.cc: DBImpl::Write`.
+  `sync=true` writer won't join a non-sync group. The leader takes the group's batches out of their `WriterSlot`s
+  and the `LogWriter` out of `DbState`, releases the mutex for the WAL append, fsync and memtable insert, re-locks,
+  pops followers, stores results in `completed`, calls `notify_all`; followers retrieve their result by `id` and
+  return. Leader handles flush/compaction after.  `benches/db.rs` `concurrent/reads_during_sync_writes` measures
+  readers against a writer doing fsyncs.  See `db/db_impl.cc: DBImpl::Write`.
 - ✅ **Custom comparator**: `Comparator` trait (`src/comparator.rs`) with `compare`, `name`,
   `find_shortest_separator`, `find_short_successor`. `BytewiseComparator` is the default. `Options::comparator:
   Arc<dyn Comparator>` threaded through all ~40 comparison sites: skip list entry ordering, `cmp_internal_keys`,
@@ -461,7 +472,9 @@ what remains is compaction, the full Iterator/Snapshot API, and operational hygi
   Bound every allocation whose size comes from disk (`MAX_BLOCK_SIZE`). `VersionEdit::decode`, the WAL reader, and
   `BlockIter` are the reference implementations.
 - **Comparator discipline**: all user-key ordering goes through `Options::comparator` — never raw byte `cmp` on keys
-  or key-containing structs. `Entry` deliberately has no `Ord`/`PartialEq`; skip-list ordering lives in
+  or key-containing structs.  The comparator's `find_shortest_separator` / `find_short_successor` operate on *user*
+  keys only: for internal keys use `find_shortest_internal_separator` / `find_short_internal_successor` in
+  `table/format.rs` (LevelDB's `InternalKeyComparator`), which never cut into the 8-byte tag. `Entry` deliberately has no `Ord`/`PartialEq`; skip-list ordering lives in
   `SkipList::key_after_node_cmp`. When adding a sort or comparison, write a test with a non-bytewise comparator.
 - Run `cargo fmt` on changesets
 - Have text and other files hardwrap at 120 character lines

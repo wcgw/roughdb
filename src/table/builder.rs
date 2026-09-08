@@ -97,10 +97,12 @@ impl TableBuilder {
 
     // If the previous data block was flushed, emit its index entry now.
     // Shorten last_key to the shortest separator in [last_key, key) so the index
-    // block is more compressible.  Port of LevelDB's FindShortestSeparator call.
+    // block is more compressible.  Keys are internal keys, so this goes through
+    // the internal-key variant (LevelDB's `InternalKeyComparator`), which only
+    // ever shortens the user-key part.
     if let Some(handle) = self.pending_handle.take() {
       let mut sep = std::mem::take(&mut self.last_key);
-      self.comparator.find_shortest_separator(&mut sep, key);
+      crate::table::format::find_shortest_internal_separator(&*self.comparator, &mut sep, key);
       let mut handle_enc = [0u8; 20];
       let n = handle.encode_to(&mut handle_enc);
       self.index_block.add(&sep, &handle_enc[..n]);
@@ -141,7 +143,7 @@ impl TableBuilder {
     // Emit the index entry for the last data block.  Use FindShortSuccessor
     // to shorten the key — there is no next data block to bound against.
     if let Some(handle) = self.pending_handle.take() {
-      self.comparator.find_short_successor(&mut self.last_key);
+      crate::table::format::find_short_internal_successor(&*self.comparator, &mut self.last_key);
       let mut handle_enc = [0u8; 20];
       let n = handle.encode_to(&mut handle_enc);
       self.index_block.add(&self.last_key, &handle_enc[..n]);

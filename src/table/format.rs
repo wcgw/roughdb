@@ -81,6 +81,60 @@ pub(crate) fn make_internal_key(user_key: &[u8], seq: u64, vtype: u8) -> Vec<u8>
   out
 }
 
+/// Largest sequence number an internal key can carry (56 bits; the low byte
+/// of the tag is the value type).  Matches LevelDB's `kMaxSequenceNumber`.
+pub(crate) const MAX_SEQUENCE_NUMBER: u64 = (1 << 56) - 1;
+
+/// Value type used in synthetic seek keys: with sequence descending inside a
+/// user key, `(MAX_SEQUENCE_NUMBER, 1)` sorts before every real entry for
+/// that key.  Matches LevelDB's `kValueTypeForSeek`.
+pub(crate) const VALUE_TYPE_FOR_SEEK: u8 = 1;
+
+/// Shorten the internal key `start` to a short internal key in `[start, limit)`,
+/// for index-block separators.
+///
+/// Port of `InternalKeyComparator::FindShortestSeparator`: only the user-key
+/// part may be shortened, and only when the user comparator makes it
+/// physically shorter yet logically larger; the result then gets the
+/// earliest possible tag appended so it still sorts before every entry of
+/// the next block.  Running the user comparator over the raw internal key
+/// instead can cut the key inside its 8-byte tag whenever two versions of
+/// one user key straddle a block boundary, which yields an index key that
+/// decodes to the wrong user key and breaks the index binary search.
+pub(crate) fn find_shortest_internal_separator(
+  cmp: &dyn crate::comparator::Comparator,
+  start: &mut Vec<u8>,
+  limit: &[u8],
+) {
+  let user_start = user_key(start);
+  let user_limit = user_key(limit);
+  let mut tmp = user_start.to_vec();
+  cmp.find_shortest_separator(&mut tmp, user_limit);
+  if tmp.len() < user_start.len() && cmp.compare(user_start, &tmp) == std::cmp::Ordering::Less {
+    encode_internal_key_into(
+      start,
+      &tmp.clone(),
+      MAX_SEQUENCE_NUMBER,
+      VALUE_TYPE_FOR_SEEK,
+    );
+    debug_assert!(cmp_internal_keys(start, limit, cmp) == std::cmp::Ordering::Less);
+  }
+}
+
+/// Change the internal key `key` to a short internal key `>= key`, for the
+/// last index-block entry.  Port of `InternalKeyComparator::FindShortSuccessor`.
+pub(crate) fn find_short_internal_successor(
+  cmp: &dyn crate::comparator::Comparator,
+  key: &mut Vec<u8>,
+) {
+  let user = user_key(key);
+  let mut tmp = user.to_vec();
+  cmp.find_short_successor(&mut tmp);
+  if tmp.len() < user.len() && cmp.compare(user, &tmp) == std::cmp::Ordering::Less {
+    encode_internal_key_into(key, &tmp.clone(), MAX_SEQUENCE_NUMBER, VALUE_TYPE_FOR_SEEK);
+  }
+}
+
 /// Extract the user-key prefix from an SSTable internal key by stripping the
 /// 8-byte trailing tag.  Returns the whole slice unchanged if it is shorter
 /// than a tag (defensive — well-formed internal keys are always ≥ 8 bytes).
@@ -508,5 +562,40 @@ mod tests {
       read_block(ra.as_ref(), &handle, false),
       Err(Error::Corruption(_))
     ));
+  }
+
+  #[test]
+  fn internal_separator_never_cuts_into_the_tag() {
+    use crate::comparator::BytewiseComparator;
+    let cmp = BytewiseComparator;
+    // Two versions of the same user key on either side of a block boundary:
+    // the user key cannot be shortened, so the separator stays the full key.
+    let mut sep = make_internal_key(b"k", 9, 1);
+    find_shortest_internal_separator(&cmp, &mut sep, &make_internal_key(b"k", 7, 1));
+    assert_eq!(sep, make_internal_key(b"k", 9, 1));
+    // Distinct user keys: shortened user key plus the maximal tag, sorting
+    // strictly between the two.
+    let start = make_internal_key(b"abc1", 5, 1);
+    let limit = make_internal_key(b"abz", 3, 1);
+    let mut sep = start.clone();
+    find_shortest_internal_separator(&cmp, &mut sep, &limit);
+    assert_eq!(user_key(&sep), b"abd");
+    assert_eq!(
+      cmp_internal_keys(&start, &sep, &cmp),
+      std::cmp::Ordering::Less
+    );
+    assert_eq!(
+      cmp_internal_keys(&sep, &limit, &cmp),
+      std::cmp::Ordering::Less
+    );
+    // Successor of the last key: shortened and tagged, still >= the key.
+    let last = make_internal_key(b"abc", 2, 1);
+    let mut succ = last.clone();
+    find_short_internal_successor(&cmp, &mut succ);
+    assert_eq!(user_key(&succ), b"b");
+    assert_eq!(
+      cmp_internal_keys(&last, &succ, &cmp),
+      std::cmp::Ordering::Less
+    );
   }
 }

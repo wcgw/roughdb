@@ -227,9 +227,11 @@ impl Default for ReadOptions<'_> {
 /// Applies a `WriteBatch` to a memtable, one sequence number per record.
 ///
 /// Contract: an `Inserter` is only constructed where the caller has exclusive
-/// write access to `mem` — the write leader holding the `DbState` mutex, or
-/// WAL recovery / repair filling a memtable no other thread can write to yet.
-/// That exclusivity is what makes the `unsafe` calls below sound.
+/// write access to `mem` — the write leader while its group is in flight (no
+/// other leader can start until it retires the group, and `write_in_progress`
+/// keeps `Db::flush` from rotating the memtable), or WAL recovery / repair
+/// filling a memtable no other thread can write to yet.  That exclusivity is
+/// what makes the `unsafe` calls below sound.
 struct Inserter<'a> {
   mem: &'a Memtable,
   seq: u64,
@@ -251,6 +253,42 @@ impl Handler for Inserter<'_> {
   }
 }
 
+/// The batch of a queued writer.  Only the leader of the group a slot belongs
+/// to takes the batch, and it pops the slot before any other writer runs, so a
+/// slot observed in the queue always still holds its batch.
+fn slot_batch(slot: &WriterSlot) -> &WriteBatch {
+  slot
+    .batch
+    .as_ref()
+    .expect("write slot batch taken by a leader that has not retired it")
+}
+
+/// Take the batches of the `group_len` writers at the front of the queue and
+/// return the batch the leader will write, stamped with `start_seq`.  A group
+/// of one — the uncontended common case — is moved out as is: no scratch
+/// batch, no copy.  Larger groups are merged into a fresh batch.  Matches
+/// LevelDB's `BuildBatchGroup`, which returns `first->batch` unless a second
+/// writer joins.
+fn take_group_batch(
+  writers: &mut std::collections::VecDeque<WriterSlot>,
+  group_len: usize,
+  start_seq: u64,
+) -> WriteBatch {
+  let take = |slot: &mut WriterSlot| slot.batch.take().expect("write slot batch taken twice");
+  if group_len == 1 {
+    let mut batch = take(writers.front_mut().unwrap());
+    batch.set_sequence(start_seq);
+    batch
+  } else {
+    let mut combined = WriteBatch::new();
+    combined.set_sequence(start_seq);
+    for slot in writers.iter_mut().take(group_len) {
+      combined.append(&take(slot));
+    }
+    combined
+  }
+}
+
 // ── DbState: lives inside a Mutex ────────────────────────────────────────────
 //
 // Matching LevelDB's single `mutex_`: the lock is taken briefly to snapshot
@@ -269,7 +307,9 @@ impl Handler for Inserter<'_> {
 /// mutex is held.
 struct WriterSlot {
   id: u64,
-  batch: WriteBatch,
+  /// `None` once the group leader has taken the batch for writing; the slot
+  /// stays in the queue until the leader retires the group.
+  batch: Option<WriteBatch>,
   sync: bool,
 }
 
@@ -304,6 +344,13 @@ struct DbState {
   /// A follower checks this map on wake-up and removes its own entry.
   /// `Ok(())` is the common case; `Err` propagates a WAL/memtable failure.
   completed: std::collections::HashMap<u64, Result<(), Error>>,
+  /// `true` while a group leader has released the lock to append to the WAL
+  /// and insert into the memtable.  During that window the leader owns `log`
+  /// (taken out of `DbState`) and is the memtable's sole writer, so nothing
+  /// else may rotate `mem` or `log`: `Db::flush` waits for the flag to clear
+  /// (the same exclusion RocksDB's `WriteThread::EnterUnbatched` gives its
+  /// flush path).  Leaders themselves rotate only while holding the lock.
+  write_in_progress: bool,
   // ── Seek-based compaction (Gap 5) ──────────────────────────────────────────
   /// File + level nominated for seek-based compaction (its `allowed_seeks` hit
   /// zero).  `None` when no file is pending.  Cleared by `install_compaction`
@@ -553,6 +600,7 @@ impl Default for Db {
           compaction_needed: false,
           background_scheduled: false,
           background_error: None,
+          write_in_progress: false,
           pending_flush: None,
         }),
         write_condvar: std::sync::Condvar::new(),
@@ -681,10 +729,10 @@ impl Db {
         manifest_last_seq
       };
 
-      if actual_last_seq > manifest_last_seq {
-        vs.set_last_sequence(actual_last_seq);
-      }
-      let last_seq = vs.last_sequence();
+      // The write counter resumes after everything replayed; the VersionSet's
+      // watermark (what recovery may skip) only advances once that data is in
+      // an SSTable — see `VersionSet::set_last_sequence`.
+      let last_seq = actual_last_seq.max(manifest_last_seq);
 
       // When reuse_logs is false and the WAL had data, flush the replayed
       // memtable to an SSTable so the next open doesn't need to replay it.
@@ -695,6 +743,7 @@ impl Db {
         && mem.approximate_memory_usage() > 0
       {
         log::info!("flushing replayed WAL data to SSTable (reuse_logs=false)");
+        vs.set_last_sequence(actual_last_seq);
         let flush_result = write_flush_from_mem(&mem, &mut vs, &options, &*fs, path)?;
         finish_flush_at_open(&mut vs, flush_result, &options, &table_cache)?;
         let fresh_mem = Arc::new(Memtable::new(Arc::clone(&options.comparator)));
@@ -741,6 +790,7 @@ impl Db {
         compaction_needed: false,
         background_scheduled: false,
         background_error: None,
+        write_in_progress: false,
         pending_flush: None,
       }),
       write_condvar: std::sync::Condvar::new(),
@@ -1242,8 +1292,13 @@ impl Db {
       return Ok(());
     }
 
-    // Wait for any in-progress flush to drain before rotating mem → imm.
-    while (g.imm.is_some() || g.pending_flush.is_some()) && g.background_error.is_none() {
+    // Wait for any in-progress flush to drain, and for any write leader that
+    // has released the lock for WAL/memtable I/O to finish, before rotating
+    // mem → imm: the leader is the memtable's sole writer during that window
+    // and holds the WAL writer.
+    while (g.imm.is_some() || g.pending_flush.is_some() || g.write_in_progress)
+      && g.background_error.is_none()
+    {
       g = self.inner.write_condvar.wait(g).unwrap();
     }
     if let Some(ref e) = g.background_error {
@@ -1297,6 +1352,15 @@ impl Db {
   ///
   /// If `opts.sync` is `true`, the WAL record is `fsync`'d before this call returns.  Otherwise
   /// the OS page cache provides durability — data survives crashes of the process but not the OS.
+  /// A WAL write or sync failure is returned to the whole group and then becomes sticky
+  /// (`background_error`): the WAL may hold a torn record, and appending past it could cost
+  /// good records on recovery.
+  ///
+  /// ## Locking
+  ///
+  /// The leader holds the `DbState` mutex only to form the group and to publish the result.  The
+  /// WAL append, the optional `fsync` and the memtable insert run with the mutex released, so
+  /// readers and the background thread are never blocked on a disk write.  See `write_in_progress`.
   ///
   /// See `db/db_impl.cc: DBImpl::Write`.
   pub fn write(&self, opts: &WriteOptions, batch: WriteBatch) -> Result<(), Error> {
@@ -1311,7 +1375,7 @@ impl Db {
       state.next_writer_id += 1;
       state.writers.push_back(WriterSlot {
         id,
-        batch,
+        batch: Some(batch),
         sync: opts.sync,
       });
       id
@@ -1345,7 +1409,7 @@ impl Db {
     // Sync boundary: a sync=true writer is not included in a non-sync group
     // (it would silently drop the sync guarantee).  Non-sync writers *may*
     // join a sync group — they receive sync for free, which is harmless.
-    let first_size = state.writers.front().unwrap().batch.approximate_size();
+    let first_size = slot_batch(state.writers.front().unwrap()).approximate_size();
     let max_size = if first_size <= 128 << 10 {
       first_size + (128 << 10)
     } else {
@@ -1361,7 +1425,7 @@ impl Db {
       if next.sync && !first_sync {
         break;
       }
-      let next_size = next.batch.approximate_size();
+      let next_size = slot_batch(next).approximate_size();
       if group_size + next_size > max_size {
         break;
       }
@@ -1369,45 +1433,63 @@ impl Db {
       group_len += 1;
     }
 
-    // ── Phase 4: Write WAL, insert into memtable ──────────────────────────────
+    // ── Phase 4: Write WAL and memtable — without the lock ───────────────────
+    //
+    // Only the leader touches the WAL and the memtable while its group is in
+    // flight: no other leader can start until this group is retired (the
+    // leader's slot stays at the front of the queue), and `write_in_progress`
+    // keeps `Db::flush` from rotating either underneath us.  So the lock is not
+    // needed for the I/O — and holding it would make every `get`, iterator and
+    // the background thread wait for a disk write, or for an `fsync` when
+    // `sync = true`.  Matches LevelDB, which unlocks around `AddRecord`.
+    //
+    // Readers that run meanwhile still see the old `last_sequence`, so the
+    // group's entries — stamped `start_seq..` — stay invisible until the
+    // sequence is published under the lock below.
     let need_sync = state.writers.iter().take(group_len).any(|w| w.sync);
     let start_seq = state.last_sequence + 1;
+    let batch = take_group_batch(&mut state.writers, group_len, start_seq);
+    let mut log = state.log.take();
+    let mem = Arc::clone(&state.mem);
+    state.write_in_progress = true;
+    drop(state);
 
-    // A group of one — the uncontended common case — stamps and writes the
-    // leader's batch in place: no scratch batch, no copy.  Only real groups
-    // (two or more writers) are merged into a freshly built batch.  Matches
-    // LevelDB's `BuildBatchGroup`, which returns `first->batch` unless a
-    // second writer joins.
-    let st = &mut *state;
-    let scratch: WriteBatch;
-    let batch: &WriteBatch = if group_len == 1 {
-      let slot = st.writers.front_mut().unwrap();
-      slot.batch.set_sequence(start_seq);
-      &slot.batch
-    } else {
-      let mut combined = WriteBatch::new();
-      combined.set_sequence(start_seq);
-      for slot in st.writers.iter().take(group_len) {
-        combined.append(&slot.batch);
+    let wal_status: Result<(), Error> = match log.as_mut() {
+      Some(log) => {
+        log
+          .add_record(batch.contents())
+          .and_then(|()| if need_sync { log.sync() } else { Ok(()) })
       }
-      scratch = combined;
-      &scratch
+      None => Ok(()),
     };
+    if wal_status.is_ok() {
+      batch
+        .iterate(&mut Inserter {
+          mem: &mem,
+          seq: start_seq,
+        })
+        .expect("memtable insert cannot fail");
+    }
 
-    let status: Result<(), Error> = (|| {
-      if let Some(log) = st.log.as_mut() {
-        log.add_record(batch.contents())?;
-        if need_sync {
-          log.sync()?;
-        }
+    let mut state = self.inner.state.lock().unwrap();
+    state.log = log;
+    state.write_in_progress = false;
+    let status = match wal_status {
+      Ok(()) => {
+        state.last_sequence += batch.count() as u64;
+        Ok(())
       }
-      batch.iterate(&mut Inserter {
-        mem: &st.mem,
-        seq: start_seq,
-      })?;
-      st.last_sequence += batch.count() as u64;
-      Ok(())
-    })();
+      Err(e) => {
+        // The WAL may now hold a torn record; nothing must be appended after
+        // it, or recovery could drop good records that share its block.
+        // LevelDB (`RecordBackgroundError` on sync failure) and RocksDB make
+        // the error sticky for the same reason.
+        if state.background_error.is_none() {
+          state.background_error = Some(e.clone());
+        }
+        Err(e)
+      }
+    };
 
     // ── Phase 5: Retire the group ─────────────────────────────────────────────
     //
@@ -2260,7 +2342,10 @@ fn install_compaction(
   for (lvl, key) in &spec.edit.compact_pointers {
     edit.compact_pointers.push((*lvl, key.clone()));
   }
-  vs.set_last_sequence(state.last_sequence);
+  // A compaction changes nothing about which writes are in SSTables, so the
+  // recovery watermark (`vs.last_sequence`) stays as the last flush left it.
+  // Recording `state.last_sequence` here would make recovery skip the WAL
+  // records of writes that are still only in the memtable.
   vs.log_and_apply(&mut edit, tc)?;
 
   // Clear seek_compact_file if the nominated file was removed by this compaction.
@@ -2372,7 +2457,7 @@ fn install_trivial_move(
   // access finds it in the cache instead of re-opening from disk.
   let table_arc = tc.get_or_open(file.number, file.file_size).ok();
 
-  vs.set_last_sequence(state.last_sequence);
+  // As in `install_compaction`: the recovery watermark is untouched.
   vs.log_and_apply(&mut edit, tc)?;
 
   // Re-insert so the file stays warm even though log_and_apply evicted it.
@@ -4750,6 +4835,7 @@ mod tests {
       compaction_needed: false,
       background_scheduled: false,
       background_error: None,
+      write_in_progress: false,
       pending_flush: None,
     };
     super::update_stats(&mut ds, &stats);
@@ -4814,6 +4900,7 @@ mod tests {
       compaction_needed: false,
       background_scheduled: false,
       background_error: None,
+      write_in_progress: false,
       pending_flush: None,
     };
     super::update_stats(&mut ds, &stats);
@@ -5143,6 +5230,7 @@ mod tests {
           compaction_needed: false,
           background_scheduled: false,
           background_error: None,
+          write_in_progress: false,
           pending_flush: None,
         }),
         write_condvar: std::sync::Condvar::new(),
@@ -5423,5 +5511,385 @@ mod tests {
         "key{i:03}: expected uppercased value"
       );
     }
+  }
+
+  // ── Write path releases the DB mutex around WAL I/O ─────────────────────────
+
+  /// `MemFileSystem` whose WAL files can be made to stall or fail on append,
+  /// so a test can observe what the rest of the database does meanwhile.
+  mod gated_fs {
+    use crate::env::{
+      FileLock, FileSystem, MemFileSystem, RandomAccessFile, SequentialFile, WritableFile,
+    };
+    use crate::error::Error;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+    use std::sync::{Arc, Condvar, Mutex};
+
+    #[derive(Default)]
+    pub struct Gate {
+      /// The next WAL append blocks until `release()`.
+      arm_block: AtomicBool,
+      /// Every WAL append fails with an I/O error.
+      fail: AtomicBool,
+      /// `(an append is blocked, released)`.
+      blocked: Mutex<(bool, bool)>,
+      cv: Condvar,
+    }
+
+    impl Gate {
+      pub fn block_next_append(&self) {
+        self.arm_block.store(true, SeqCst);
+      }
+      pub fn wait_until_blocked(&self) {
+        let mut g = self.blocked.lock().unwrap();
+        while !g.0 {
+          g = self.cv.wait(g).unwrap();
+        }
+      }
+      pub fn release(&self) {
+        let mut g = self.blocked.lock().unwrap();
+        g.1 = true;
+        self.cv.notify_all();
+      }
+      pub fn fail_appends(&self, fail: bool) {
+        self.fail.store(fail, SeqCst);
+      }
+    }
+
+    struct GatedWal {
+      inner: Box<dyn WritableFile>,
+      gate: Arc<Gate>,
+    }
+
+    impl WritableFile for GatedWal {
+      fn write(&mut self, data: &[u8]) -> Result<(), Error> {
+        if self.gate.fail.load(SeqCst) {
+          return Err(Error::IoError(std::io::Error::other(
+            "injected WAL failure",
+          )));
+        }
+        if self.gate.arm_block.swap(false, SeqCst) {
+          let mut g = self.gate.blocked.lock().unwrap();
+          g.0 = true;
+          self.gate.cv.notify_all();
+          while !g.1 {
+            g = self.gate.cv.wait(g).unwrap();
+          }
+        }
+        self.inner.write(data)
+      }
+      fn flush(&mut self) -> Result<(), Error> {
+        self.inner.flush()
+      }
+      fn sync(&mut self) -> Result<(), Error> {
+        self.inner.sync()
+      }
+    }
+
+    pub struct GatedFs {
+      pub inner: MemFileSystem,
+      pub gate: Arc<Gate>,
+    }
+
+    impl GatedFs {
+      pub fn gated() -> (Arc<dyn FileSystem>, Arc<Gate>) {
+        let gate = Arc::new(Gate::default());
+        let fs = GatedFs {
+          inner: MemFileSystem::new(),
+          gate: Arc::clone(&gate),
+        };
+        (Arc::new(fs), gate)
+      }
+
+      fn wrap(&self, path: &Path, file: Box<dyn WritableFile>) -> Box<dyn WritableFile> {
+        if path.extension().is_some_and(|e| e == "log") {
+          Box::new(GatedWal {
+            inner: file,
+            gate: Arc::clone(&self.gate),
+          })
+        } else {
+          file
+        }
+      }
+    }
+
+    impl FileSystem for GatedFs {
+      fn open_sequential(&self, p: &Path) -> Result<Box<dyn SequentialFile>, Error> {
+        self.inner.open_sequential(p)
+      }
+      fn open_random_access(&self, p: &Path) -> Result<Arc<dyn RandomAccessFile>, Error> {
+        self.inner.open_random_access(p)
+      }
+      fn open_appendable(&self, p: &Path) -> Result<Box<dyn WritableFile>, Error> {
+        Ok(self.wrap(p, self.inner.open_appendable(p)?))
+      }
+      fn create_writable(&self, p: &Path) -> Result<Box<dyn WritableFile>, Error> {
+        Ok(self.wrap(p, self.inner.create_writable(p)?))
+      }
+      fn file_size(&self, p: &Path) -> Result<u64, Error> {
+        self.inner.file_size(p)
+      }
+      fn file_exists(&self, p: &Path) -> bool {
+        self.inner.file_exists(p)
+      }
+      fn rename(&self, a: &Path, b: &Path) -> Result<(), Error> {
+        self.inner.rename(a, b)
+      }
+      fn remove_file(&self, p: &Path) -> Result<(), Error> {
+        self.inner.remove_file(p)
+      }
+      fn create_dir_all(&self, p: &Path) -> Result<(), Error> {
+        self.inner.create_dir_all(p)
+      }
+      fn remove_dir(&self, p: &Path) -> Result<(), Error> {
+        self.inner.remove_dir(p)
+      }
+      fn lock_file(&self, p: &Path) -> Result<Box<dyn FileLock>, Error> {
+        self.inner.lock_file(p)
+      }
+      fn sync_dir(&self, p: &Path) -> Result<(), Error> {
+        self.inner.sync_dir(p)
+      }
+      fn children(&self, p: &Path) -> Result<Vec<String>, Error> {
+        self.inner.children(p)
+      }
+      fn read_string_from_file(&self, p: &Path) -> Result<String, Error> {
+        self.inner.read_string_from_file(p)
+      }
+    }
+  }
+
+  /// A write leader stuck inside the WAL append must not hold the DB mutex:
+  /// reads and snapshots go through, and the in-flight write stays invisible
+  /// until it completes.
+  #[test]
+  fn reads_are_served_while_a_wal_append_is_stalled() {
+    use std::sync::Arc;
+    use std::time::Duration;
+    let (fs, gate) = gated_fs::GatedFs::gated();
+    let db = Arc::new(
+      Db::open(
+        "/db",
+        Options {
+          create_if_missing: true,
+          file_system: fs,
+          ..Options::default()
+        },
+      )
+      .unwrap(),
+    );
+    db.put(b"a", b"1").unwrap();
+
+    gate.block_next_append();
+    let writer = {
+      let db = Arc::clone(&db);
+      std::thread::spawn(move || db.put(b"b", b"2"))
+    };
+    gate.wait_until_blocked();
+
+    // The leader is now inside the WAL append with the lock released.
+    let (tx, rx) = std::sync::mpsc::channel();
+    {
+      let db = Arc::clone(&db);
+      std::thread::spawn(move || tx.send(db.get(b"a")).unwrap());
+    }
+    let got = rx
+      .recv_timeout(Duration::from_secs(10))
+      .expect("get blocked behind an in-flight WAL append");
+    assert_eq!(got.unwrap(), b"1");
+    // The sequence number of the in-flight write is reserved but not yet
+    // published: it is invisible now, and stays invisible to a snapshot
+    // taken now even after it completes.
+    assert!(db.get(b"b").unwrap_err().is_not_found());
+    let snap = db.get_snapshot();
+
+    gate.release();
+    writer.join().unwrap().unwrap();
+    assert_eq!(db.get(b"b").unwrap(), b"2");
+    let at_snap = ReadOptions {
+      snapshot: Some(&snap),
+      ..ReadOptions::default()
+    };
+    assert!(db
+      .get_with_options(&at_snap, b"b")
+      .unwrap_err()
+      .is_not_found());
+  }
+
+  /// `Db::flush` rotates the memtable and WAL; it must wait for a leader whose
+  /// group is in flight, otherwise that group's entries could land in the
+  /// wrong memtable or a WAL that is about to be deleted.
+  #[test]
+  fn flush_racing_with_concurrent_writers_loses_nothing() {
+    use crate::env::{FileSystem, MemFileSystem};
+    use std::sync::Arc;
+    const WRITERS: usize = 4;
+    const PER_WRITER: usize = 400;
+
+    let fs: Arc<dyn FileSystem> = Arc::new(MemFileSystem::new());
+    let path = std::path::Path::new("/db");
+    let opts = |fs: &Arc<dyn FileSystem>| Options {
+      create_if_missing: true,
+      write_buffer_size: 4096,
+      file_system: Arc::clone(fs),
+      ..Options::default()
+    };
+    let check = |db: &Db, phase: &str| {
+      for w in 0..WRITERS {
+        for i in 0..PER_WRITER {
+          let key = format!("w{w}-{i:04}");
+          let got = db
+            .get(key.as_bytes())
+            .unwrap_or_else(|e| panic!("{phase}: {key} → {e:?}"));
+          assert_eq!(got, format!("{w}:{i}").as_bytes(), "{phase}: {key}");
+        }
+      }
+    };
+
+    let db = Db::open(path, opts(&fs)).unwrap();
+    std::thread::scope(|s| {
+      for w in 0..WRITERS {
+        let db = &db;
+        s.spawn(move || {
+          for i in 0..PER_WRITER {
+            db.put(
+              format!("w{w}-{i:04}").as_bytes(),
+              format!("{w}:{i}").as_bytes(),
+            )
+            .unwrap();
+          }
+        });
+      }
+      for _ in 0..25 {
+        db.flush(&crate::FlushOptions { wait: true }).unwrap();
+      }
+    });
+    check(&db, "before reopen");
+
+    drop(db);
+    let db = Db::open(path, opts(&fs)).unwrap();
+    check(&db, "after reopen");
+  }
+
+  /// A WAL append failure fails the write and then sticks: the WAL may hold a
+  /// torn record, so nothing may be appended after it.  Reads keep working.
+  #[test]
+  fn wal_append_failure_is_sticky() {
+    let (fs, gate) = gated_fs::GatedFs::gated();
+    let db = Db::open(
+      "/db",
+      Options {
+        create_if_missing: true,
+        file_system: fs,
+        ..Options::default()
+      },
+    )
+    .unwrap();
+    db.put(b"a", b"1").unwrap();
+
+    gate.fail_appends(true);
+    assert!(db.put(b"b", b"2").is_err());
+    gate.fail_appends(false);
+    // Even though the file system works again, the database refuses writes.
+    assert!(db.put(b"c", b"3").is_err());
+    assert!(db.flush(&crate::FlushOptions { wait: true }).is_err());
+
+    assert_eq!(db.get(b"a").unwrap(), b"1");
+    assert!(db.get(b"b").unwrap_err().is_not_found());
+    assert!(db.get(b"c").unwrap_err().is_not_found());
+  }
+
+  /// The MANIFEST's `last_sequence` is the recovery watermark: WAL records at
+  /// or below it are skipped on open.  Compactions must not advance it past
+  /// writes that are still only in the memtable and WAL, or a close (or crash)
+  /// after a compaction loses them.
+  #[test]
+  fn compaction_does_not_advance_recovery_watermark_past_unflushed_writes() {
+    use crate::env::{FileSystem, MemFileSystem};
+    use std::sync::Arc;
+    let fs: Arc<dyn FileSystem> = Arc::new(MemFileSystem::new());
+    let path = std::path::Path::new("/db");
+    let opts = |fs: &Arc<dyn FileSystem>| Options {
+      create_if_missing: true,
+      file_system: Arc::clone(fs),
+      ..Options::default()
+    };
+    let flush = |db: &Db| db.flush(&crate::FlushOptions { wait: true }).unwrap();
+
+    let db = Db::open(path, opts(&fs)).unwrap();
+    // Two L0 files, then an unflushed write, then a real (merging) compaction.
+    db.put(b"a", b"1").unwrap();
+    flush(&db);
+    db.put(b"b", b"2").unwrap();
+    flush(&db);
+    db.put(b"c", b"3").unwrap();
+    db.compact_range(None, None).unwrap();
+    // One non-overlapping L0 file, an unflushed write, then a trivial move.
+    db.put(b"z", b"4").unwrap();
+    flush(&db);
+    db.put(b"q", b"5").unwrap();
+    db.compact_range(None, None).unwrap();
+    let watermark = {
+      let g = db.inner.state.lock().unwrap();
+      g.version_set.as_ref().unwrap().last_sequence()
+    };
+    assert!(
+      watermark < 5,
+      "watermark {watermark} covers unflushed writes"
+    );
+    drop(db);
+
+    let db = Db::open(path, opts(&fs)).unwrap();
+    for (k, v) in [
+      (b"a", b"1"),
+      (b"b", b"2"),
+      (b"c", b"3"),
+      (b"z", b"4"),
+      (b"q", b"5"),
+    ] {
+      assert_eq!(db.get(k).unwrap(), v, "{}", String::from_utf8_lossy(k));
+    }
+  }
+
+  /// Index-block separators must never be cut inside the internal-key tag.
+  /// With several versions of a user key straddling a data-block boundary,
+  /// the old user-comparator-on-internal-key shortening produced a malformed
+  /// separator that broke point lookups for every earlier block.
+  #[test]
+  fn point_lookups_in_a_multi_version_sstable() {
+    use crate::env::{FileSystem, MemFileSystem};
+    use std::sync::Arc;
+    let fs: Arc<dyn FileSystem> = Arc::new(MemFileSystem::new());
+    let db = Db::open(
+      "/db",
+      Options {
+        create_if_missing: true,
+        file_system: fs,
+        ..Options::default()
+      },
+    )
+    .unwrap();
+    let n = 10_000u64;
+    let value = [b'v'; 100];
+    let key = |i: u64| format!("{i:016}");
+    for i in 0..n {
+      db.put(key(i).as_bytes(), value).unwrap();
+    }
+    for _round in 0..4 {
+      for i in 2 * n..2 * n + 4729 {
+        db.put(key(i).as_bytes(), value).unwrap();
+      }
+    }
+    db.flush(&crate::FlushOptions { wait: true }).unwrap();
+    let missing = (0..n)
+      .filter(|&i| db.get(key(i).as_bytes()).is_err())
+      .count();
+    let missing_w = (2 * n..2 * n + 4729)
+      .filter(|&i| db.get(key(i).as_bytes()).is_err())
+      .count();
+    eprintln!("{}", db.get_property("leveldb.sstables").unwrap());
+    eprintln!("setup keys missing: {missing}; writer keys missing: {missing_w}");
+    assert_eq!(missing + missing_w, 0);
   }
 }
