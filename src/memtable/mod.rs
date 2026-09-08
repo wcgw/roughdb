@@ -17,7 +17,6 @@ mod skiplist;
 use arena::Arena;
 use entry::Entry;
 use skiplist::SkipList;
-use std::cell::UnsafeCell;
 use std::sync::Arc;
 
 use crate::comparator::{BytewiseComparator, Comparator};
@@ -44,28 +43,42 @@ impl<T> MemtableResult<T> {
   }
 }
 
+/// In-memory write buffer: a skip list of entry-encoded key/value versions.
+///
+/// # Thread safety
+///
+/// `Memtable` is `Sync` (the skip list's reads are lock-free), but writes are
+/// *not* internally synchronised: [`Memtable::add`] and [`Memtable::delete`]
+/// are `unsafe fn` and require the caller to serialise writers.  `Db` does so
+/// by inserting only while holding the `DbState` mutex, matching LevelDB.
 pub struct Memtable {
-  table: UnsafeCell<SkipList>,
+  table: SkipList,
   comparator: Arc<dyn Comparator>,
 }
-
-// SAFETY: all mutations are serialised by the DB-level write mutex in `Db`;
-// reads are lock-free via the skip-list's acquire/release atomics.
-unsafe impl Sync for Memtable {}
 
 impl Memtable {
   pub fn new(comparator: Arc<dyn Comparator>) -> Self {
     Self {
-      table: UnsafeCell::new(SkipList::new(Arena::default(), Arc::clone(&comparator))),
+      table: SkipList::new(Arena::default(), Arc::clone(&comparator)),
       comparator,
     }
   }
 
-  pub fn add(&self, seq: u64, key: &[u8], value: &[u8]) {
+  /// Insert a value for `key` at sequence number `seq`.
+  ///
+  /// # Safety
+  /// No other `add` or `delete` may run concurrently on this memtable; the
+  /// caller must serialise writers (in `Db`, the write leader holds the
+  /// `DbState` mutex).  Concurrent `get` and iterators are fine.
+  pub unsafe fn add(&self, seq: u64, key: &[u8], value: &[u8]) {
     let size = Entry::encoded_value_size(seq, key, value);
-    // SAFETY: caller holds the DB write mutex, serialising all mutations.
-    let table = unsafe { &mut *self.table.get() };
-    table.alloc_and_insert(size, |buf| Entry::write_value_to(buf, seq, key, value));
+    // SAFETY: writer serialisation is forwarded from this function's
+    // contract; `write_value_to` fills exactly `size` bytes.
+    unsafe {
+      self
+        .table
+        .alloc_and_insert(size, |buf| Entry::write_value_to(buf, seq, key, value))
+    };
   }
 
   /// Look up `key` at the given `sequence` number.
@@ -76,66 +89,51 @@ impl Memtable {
   /// absolute latest version.
   pub fn get<K: AsRef<[u8]>>(&self, key: K, sequence: u64) -> MemtableResult<Vec<u8>> {
     let key = key.as_ref();
-    // Seek to (key, sequence): in skip-list order (user_key ASC, seq DESC),
-    // this positions at the first entry with the same user key and seq ≤ sequence.
-    let ssize = Entry::seek_key_size(key, sequence);
-    // Short keys (the common case) build the seek key on the stack — no
-    // allocation per lookup.  Mirrors LevelDB's LookupKey inline buffer.
-    const INLINE_SEEK_KEY: usize = 128;
-    let mut stack_buf = [0u8; INLINE_SEEK_KEY];
-    let mut heap_buf: Vec<u8>;
-    let sbuf: &mut [u8] = if ssize <= INLINE_SEEK_KEY {
-      &mut stack_buf[..ssize]
-    } else {
-      heap_buf = vec![0u8; ssize];
-      &mut heap_buf
-    };
-    Entry::write_seek_key_to(sbuf, key, sequence);
-    // SAFETY: SkipList reads are lock-free via acquire/release atomics.
-    let table = unsafe { &*self.table.get() };
-    match table.find_first_at_or_after(sbuf) {
-      Some(payload) => {
-        let e = Entry::from_slice(payload);
-        if self.comparator.compare(e.key(), key) == std::cmp::Ordering::Equal {
-          match e.value().map(Vec::from) {
-            None => MemtableResult::Deleted,
-            Some(val) => MemtableResult::Hit(val),
-          }
-        } else {
-          MemtableResult::Miss
+    // In skip-list order (user_key ASC, seq DESC) this lands on the newest
+    // version of `key` with seq ≤ `sequence`, or on a later key.
+    match self.table.find_first_at_or_after(key, sequence) {
+      Some(e) if self.comparator.compare(e.key, key) == std::cmp::Ordering::Equal => {
+        match e.value {
+          None => MemtableResult::Deleted,
+          Some(val) => MemtableResult::Hit(val.to_vec()),
         }
       }
-      None => MemtableResult::Miss,
+      _ => MemtableResult::Miss,
     }
   }
 
-  pub fn delete(&self, seq: u64, key: &[u8]) {
+  /// Insert a deletion tombstone for `key` at sequence number `seq`.
+  ///
+  /// # Safety
+  /// Same contract as [`Memtable::add`]: no concurrent `add`/`delete`.
+  pub unsafe fn delete(&self, seq: u64, key: &[u8]) {
     let size = Entry::encoded_deletion_size(seq, key);
-    // SAFETY: caller holds the DB write mutex, serialising all mutations.
-    let table = unsafe { &mut *self.table.get() };
-    table.alloc_and_insert(size, |buf| Entry::write_deletion_to(buf, seq, key));
+    // SAFETY: writer serialisation is forwarded from this function's
+    // contract; `write_deletion_to` fills exactly `size` bytes.
+    unsafe {
+      self
+        .table
+        .alloc_and_insert(size, |buf| Entry::write_deletion_to(buf, seq, key))
+    };
   }
 
   /// Return a forward iterator over all entries in internal-key order.
   ///
   /// The returned iterator starts in an invalid (unpositioned) state; the
   /// caller must invoke `seek_to_first()` or `seek()` before reading entries.
-  pub(crate) fn iter(&self) -> MemTableIterator<'_> {
-    // SAFETY: SkipList reads are lock-free via acquire/release atomics.
-    let table = unsafe { &*self.table.get() };
+  pub fn iter(&self) -> MemTableIterator<'_> {
     MemTableIterator {
-      inner: table.iter(),
+      inner: self.table.iter(),
       cached_key: Vec::new(),
+      cached_value: &[],
     }
   }
 
   /// Approximate number of bytes used by this memtable (arena allocations).
   ///
   /// Used to decide when to flush to L0.
-  pub(crate) fn approximate_memory_usage(&self) -> usize {
-    // SAFETY: accessing Arena (which is Send+Sync) from a shared ref is fine.
-    let table = unsafe { &*self.table.get() };
-    table.arena_memory_usage()
+  pub fn approximate_memory_usage(&self) -> usize {
+    self.table.arena_memory_usage()
   }
 }
 
@@ -151,58 +149,59 @@ impl Default for Memtable {
 /// order (user key ASC, sequence DESC).
 ///
 /// Starts unpositioned; call `seek_to_first()` or `seek()` before reading.
-/// Implements [`InternalIterator`] for use with `MergingIterator`.
-pub(crate) struct MemTableIterator<'a> {
+/// Implements `InternalIterator` for use with `MergingIterator`.
+pub struct MemTableIterator<'a> {
   inner: skiplist::SkipListIter<'a>,
   /// Cached SSTable internal key for the current position.  Cleared when
   /// the iterator becomes invalid.
   cached_key: Vec<u8>,
+  /// Value of the current entry (empty for tombstones), borrowed from the
+  /// arena.  Decoded once per position, alongside `cached_key`.
+  cached_value: &'a [u8],
 }
 
 impl<'a> MemTableIterator<'a> {
-  /// Recompute `cached_key` from the current skip-list position.
-  fn update_cached_key(&mut self) {
+  /// Recompute `cached_key` and `cached_value` from the current position.
+  fn update_cached(&mut self) {
     if self.inner.valid() {
-      let e = Entry::from_slice(self.inner.payload());
-      let vtype: u8 = if e.value().is_some() { 1 } else { 0 };
+      let e = self.inner.entry();
+      let vtype: u8 = if e.value.is_some() { 1 } else { 0 };
       // Encode in place so `cached_key`'s allocation is reused across steps
       // instead of allocating a fresh `Vec` per entry.
-      crate::table::format::encode_internal_key_into(
-        &mut self.cached_key,
-        e.key(),
-        e.sequence_id(),
-        vtype,
-      );
+      crate::table::format::encode_internal_key_into(&mut self.cached_key, e.key, e.seq, vtype);
+      self.cached_value = e.value.unwrap_or(&[]);
     } else {
       self.cached_key.clear();
+      self.cached_value = &[];
     }
   }
 
-  pub(crate) fn valid(&self) -> bool {
+  pub fn valid(&self) -> bool {
     self.inner.valid()
   }
 
   /// Position at the first entry.
-  pub(crate) fn seek_to_first(&mut self) {
+  pub fn seek_to_first(&mut self) {
     self.inner.seek_to_first();
-    self.update_cached_key();
+    self.update_cached();
   }
 
   /// Position at the last entry.
-  pub(crate) fn seek_to_last(&mut self) {
+  pub fn seek_to_last(&mut self) {
     self.inner.seek_to_last();
-    self.update_cached_key();
+    self.update_cached();
   }
 
   /// Position at the first entry whose SSTable internal key is ≥ `target`.
-  pub(crate) fn seek(&mut self, target: &[u8]) {
-    if let Some((user_key, seq, _)) = crate::table::format::parse_internal_key(target) {
-      let size = Entry::seek_key_size(user_key, seq);
-      let mut buf = vec![0u8; size];
-      Entry::write_seek_key_to(&mut buf, user_key, seq);
-      self.inner.seek(&buf);
+  ///
+  /// A malformed `target` (shorter than the 8-byte tag) leaves the iterator
+  /// invalid.
+  pub fn seek(&mut self, target: &[u8]) {
+    match crate::table::format::parse_internal_key(target) {
+      Some((user_key, seq, _)) => self.inner.seek(user_key, seq),
+      None => self.inner.seek(&[], 0),
     }
-    self.update_cached_key();
+    self.update_cached();
   }
 
   /// SSTable internal key for the current entry (owned).
@@ -212,31 +211,29 @@ impl<'a> MemTableIterator<'a> {
   }
 
   /// Current SSTable internal key as a slice.
-  pub(crate) fn key(&self) -> &[u8] {
+  pub fn key(&self) -> &[u8] {
     debug_assert!(self.valid());
     &self.cached_key
   }
 
   /// Value bytes for the current entry; empty slice for tombstones.
-  pub(crate) fn value(&self) -> &[u8] {
+  pub fn value(&self) -> &[u8] {
     debug_assert!(self.valid());
-    Entry::from_slice(self.inner.payload())
-      .value()
-      .unwrap_or(&[])
+    self.cached_value
   }
 
   /// Advance to the next entry.
-  pub(crate) fn advance(&mut self) {
+  pub fn advance(&mut self) {
     debug_assert!(self.valid());
     self.inner.advance();
-    self.update_cached_key();
+    self.update_cached();
   }
 
   /// Move to the previous entry.
-  pub(crate) fn prev(&mut self) {
+  pub fn prev(&mut self) {
     debug_assert!(self.valid());
     self.inner.prev();
-    self.update_cached_key();
+    self.update_cached();
   }
 }
 
@@ -288,29 +285,25 @@ impl crate::iter::InternalIterator for MemTableIterator<'_> {
 /// the iterator so the iterator is `'static` and can be boxed as
 /// `Box<dyn InternalIterator>`.
 ///
-/// # Safety
-///
-/// The transmute from `MemTableIterator<'_>` to `MemTableIterator<'static>` is
-/// sound because `_owner` keeps the `Memtable` (and its arena) alive for the
-/// entire lifetime of this struct.  All slices returned from `key()` and
-/// `value()` through the `InternalIterator` trait are bounded by `&self`'s
-/// lifetime, so they cannot escape beyond the iterator.
+/// The `'static` lifetime is a lie the borrow checker cannot see through:
+/// `iter` really borrows the memtable owned by `_owner`.  It is sound because
+/// `_owner` lives as long as this struct (and is declared after `iter`, so it
+/// is dropped after it), and every slice handed out via `key()`/`value()` is
+/// bounded by `&self`, so nothing can outlive the `Arc`.
 pub(crate) struct ArcMemTableIter {
-  _owner: Arc<Memtable>,
   iter: MemTableIterator<'static>,
+  _owner: Arc<Memtable>,
 }
 
 impl ArcMemTableIter {
   pub(crate) fn new(mem: Arc<Memtable>) -> Self {
-    // SAFETY: `raw` points to the Memtable kept alive by `mem` (stored in
-    // `_owner` below).  `iter()` returns a `MemTableIterator` whose raw
-    // pointers reference the arena inside that Memtable.  We transmute the
-    // `'_` lifetime to `'static`; this is safe because `_owner` guarantees
-    // the arena outlives `self`.
+    // SAFETY: `raw` points to the `Memtable` kept alive by `mem`, which is
+    // stored in `_owner` below and therefore outlives the iterator.
+    // Dereferencing the raw pointer yields a borrow of unbounded lifetime; we
+    // pin it to `'static`, which is sound for the reasons given on the struct.
     let raw: *const Memtable = Arc::as_ptr(&mem);
-    let iter: MemTableIterator<'_> = unsafe { (*raw).iter() };
-    let iter: MemTableIterator<'static> = unsafe { std::mem::transmute(iter) };
-    ArcMemTableIter { _owner: mem, iter }
+    let iter: MemTableIterator<'static> = unsafe { (*raw).iter() };
+    ArcMemTableIter { iter, _owner: mem }
   }
 }
 
@@ -357,16 +350,26 @@ mod tests {
   use super::*;
   use std::str::from_utf8;
 
+  fn add(mem: &Memtable, seq: u64, key: &[u8], value: &[u8]) {
+    // SAFETY: tests write from a single thread, so no concurrent writer exists.
+    unsafe { Memtable::add(mem, seq, key, value) }
+  }
+
+  fn delete(mem: &Memtable, seq: u64, key: &[u8]) {
+    // SAFETY: as in `add`.
+    unsafe { Memtable::delete(mem, seq, key) }
+  }
+
   #[test]
   fn creates_memtable() {
     let table = Memtable::default();
-    assert_eq!(0, unsafe { &*table.table.get() }.len());
+    assert_eq!(0, table.table.len());
   }
 
   #[test]
   fn insert_get() {
     let table = Memtable::default();
-    table.add(0, b"foo", b"bar");
+    add(&table, 0, b"foo", b"bar");
     assert_eq!(
       b"bar",
       table.get(b"foo", u64::MAX).unwrap_value().as_slice()
@@ -376,12 +379,12 @@ mod tests {
   #[test]
   fn replace_get() {
     let table = Memtable::default();
-    table.add(0, b"foo", b"foo");
+    add(&table, 0, b"foo", b"foo");
     assert_eq!(
       b"foo",
       table.get(b"foo", u64::MAX).unwrap_value().as_slice()
     );
-    table.add(1, b"foo", b"bar");
+    add(&table, 1, b"foo", b"bar");
     assert_eq!(
       b"bar",
       table.get(b"foo", u64::MAX).unwrap_value().as_slice()
@@ -391,7 +394,7 @@ mod tests {
   #[test]
   fn miss_get() {
     let table = Memtable::default();
-    table.add(0, b"foo", b"bar");
+    add(&table, 0, b"foo", b"bar");
     assert_eq!(table.get(b"bar", u64::MAX), MemtableResult::Miss);
   }
 
@@ -404,8 +407,8 @@ mod tests {
   #[test]
   fn hit_deleted() {
     let table = Memtable::default();
-    table.add(0, b"foo", b"bar");
-    table.delete(1, b"foo");
+    add(&table, 0, b"foo", b"bar");
+    delete(&table, 1, b"foo");
     assert_eq!(table.get(b"foo", u64::MAX), MemtableResult::Deleted);
   }
 
@@ -414,18 +417,18 @@ mod tests {
     let table = Memtable::default();
     {
       let foo = String::from("foo");
-      table.add(0, foo.as_bytes(), foo.as_bytes());
+      add(&table, 0, foo.as_bytes(), foo.as_bytes());
       let value = table.get(b"foo", u64::MAX).unwrap_value();
       assert_eq!("foo", from_utf8(value.as_ref()).unwrap());
     }
     {
       let sparkle_heart = String::from("💖");
-      table.add(1, b"foo", sparkle_heart.as_bytes());
+      add(&table, 1, b"foo", sparkle_heart.as_bytes());
     }
     let value = table.get(b"foo", u64::MAX).unwrap_value();
     assert_eq!("💖", from_utf8(value.as_ref()).unwrap());
-    table.delete(2, b"foo");
-    assert_eq!(3, unsafe { &*table.table.get() }.len());
+    delete(&table, 2, b"foo");
+    assert_eq!(3, table.table.len());
   }
 
   // ── MemTableIterator tests ────────────────────────────────────────────────
@@ -442,7 +445,7 @@ mod tests {
   #[test]
   fn iter_single_value() {
     let mem = Memtable::default();
-    mem.add(7, b"key", b"val");
+    add(&mem, 7, b"key", b"val");
     let mut it = mem.iter();
     it.seek_to_first();
     assert!(it.valid());
@@ -459,7 +462,7 @@ mod tests {
   #[test]
   fn iter_tombstone() {
     let mem = Memtable::default();
-    mem.delete(3, b"gone");
+    delete(&mem, 3, b"gone");
     let mut it = mem.iter();
     it.seek_to_first();
     assert!(it.valid());
@@ -477,10 +480,10 @@ mod tests {
   fn iter_ordering_user_key_asc_seq_desc() {
     let mem = Memtable::default();
     // Insert in non-sequential order; iterator must yield in sorted order.
-    mem.add(1, b"b", b"B1");
-    mem.add(2, b"a", b"A2");
-    mem.add(3, b"a", b"A3");
-    mem.add(4, b"c", b"C4");
+    add(&mem, 1, b"b", b"B1");
+    add(&mem, 2, b"a", b"A2");
+    add(&mem, 3, b"a", b"A3");
+    add(&mem, 4, b"c", b"C4");
 
     let mut it = mem.iter();
     it.seek_to_first();
@@ -517,9 +520,9 @@ mod tests {
     }
 
     let mem = Memtable::new(Arc::new(ReverseComparator));
-    mem.add(1, b"a", b"A");
-    mem.add(2, b"b", b"B");
-    mem.add(3, b"c", b"C");
+    add(&mem, 1, b"a", b"A");
+    add(&mem, 2, b"b", b"B");
+    add(&mem, 3, b"c", b"C");
 
     let mut it = mem.iter();
     it.seek_to_first();
@@ -537,7 +540,7 @@ mod tests {
   fn approximate_memory_usage_grows() {
     let mem = Memtable::default();
     let before = mem.approximate_memory_usage();
-    mem.add(0, b"k", b"v");
+    add(&mem, 0, b"k", b"v");
     let after = mem.approximate_memory_usage();
     assert!(after > before);
   }

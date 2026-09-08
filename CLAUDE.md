@@ -15,6 +15,7 @@ cargo test                        # run all tests
 cargo test memtable               # run tests matching a path/name
 cargo test -- --nocapture         # show println! output
 cargo bench                       # run Criterion benchmarks (benches/db.rs)
+cargo bench --features bench --bench skiplist   # skip-list / memtable micro-benchmarks (benches/skiplist.rs)
 cargo clippy                      # lint
 cargo fmt                         # format (2-space indent, see rustfmt.toml)
 ```
@@ -60,17 +61,29 @@ The read path checks `mem` → `imm` → each level of SSTables (newest to oldes
 
 **Memtable** (`src/memtable/`)
 - Skip list with RocksDB's `InlineSkipList` memory layout: every node is a single arena allocation containing the
-  level-0 link, higher-level links prefixed before it (negative indexing), a `u32` payload length, and the
-  varint-encoded entry inline. This keeps the hot level-0 link and payload in the same cache line.
+  higher-level links (prefixed before the level-0 link, negative indexing), the level-0 link, and the varint-encoded
+  entry inline — nothing else. There is no height word (the *level invariant* in the module docs replaces it) and
+  no length word (the entry encoding is self-delimiting). This keeps the hot level-0 link and payload in the same
+  cache line; per-entry overhead is `8 × height` (E ≈ 10.7 bytes) plus up to 7 bytes of 8-byte alignment padding.
+- Searches decode the target `(user_key, seq)` once and compare it against nodes with the raw single-pass decoders
+  in `entry.rs` (`Entry::key_raw`, then `seq_raw` only on a user-key tie); they skip re-comparing the node that
+  caused a level descent (`last_bigger`, from RocksDB) and prefetch the following node. `prev()` is O(log N) via
+  `find_less_than` (LevelDB's approach — no back-pointers).
 - `Splice` caches `prev`/`next` from the last insert for O(1) amortised sequential inserts.
-- Lock-free reads (Acquire/Release atomics); writes serialised by the DB-level write mutex in `Db` (no lock inside
-  `Memtable` itself — `UnsafeCell<SkipList>` + `unsafe impl Sync`).
+- Lock-free reads (Acquire/Release atomics). Writes must be serialised externally: `SkipList::alloc_and_insert`
+  and `Memtable::add`/`delete` are `unsafe fn` whose contract is "no concurrent writer"; `Db` satisfies it by
+  inserting only while holding the `DbState` mutex (see `Inserter` in `lib.rs`). Writer-only state (`Splice`,
+  RNG) lives in an `UnsafeCell<WriterState>` so inserts go through `&SkipList` like reads and never create a
+  `&mut SkipList` that would alias readers' shared borrows.
+- The `bench` Cargo feature exposes `roughdb::bench::{Memtable, MemTableIterator}` (doc-hidden) for
+  `benches/skiplist.rs`; it is not a public API.
 
 **Entry encoding** (`src/memtable/entry.rs`)
 - Internal key format: `[klen: varint][key][seq: varint][vtype: u8][vlen: varint][value]`
 - `vtype`: `0` = Deletion, `1` = Value.
 - Ordering: key ASC, seq DESC — so a lookup key with `seq = u64::MAX` always seeks to the newest version of a user key.
-- Allocation-free helpers (`write_value_to`, `write_lookup_to`, etc.) encode directly into arena memory.
+- Allocation-free helpers (`write_value_to`, `write_deletion_to`) encode directly into arena memory; the raw decoders
+  (`decode_raw`, `key_raw`/`seq_raw`) read entries back from a pointer without a stored length, trusting the encoding.
 
 **Arena** (`src/memtable/arena/bump.rs`)
 - Thin wrapper around `bumpalo::Bump`; `allocate_aligned(size, align)` panics on OOM (matching LevelDB: memtable OOM
@@ -78,10 +91,11 @@ The read path checks `mem` → `imm` → each level of SSTables (newest to oldes
 - Unlike LevelDB/RocksDB, which manage explicit 4 KB slabs and bypass them for large allocations (> slab/4), we
   delegate slab management entirely to bumpalo. The large-allocation bypass is bumpalo's internal policy rather than
   ours, but the outcome is equivalent.
-- **`memory_usage()`**: `Arena` tracks exact bytes used via an explicit `AtomicUsize` counter (bumpalo's
-  `allocated_bytes()` returns chunk *capacity* not bytes used). `Memtable::approximate_memory_usage()` delegates to
-  this; `Db::write` compares against `options.write_buffer_size` to trigger L0 flush.  The arena grows unboundedly
-  (matching LevelDB — no capacity limit); the flush threshold is the sole governing constraint.
+- **`memory_usage()`**: `Arena` tracks bytes consumed via an explicit `AtomicUsize` counter (bumpalo's
+  `allocated_bytes()` returns chunk *capacity* not bytes used), counting each request rounded up to its alignment
+  so the padding between nodes is included. `Memtable::approximate_memory_usage()` delegates to this; `Db::write`
+  compares against `options.write_buffer_size` to trigger L0 flush.  The arena grows unboundedly (matching LevelDB —
+  no capacity limit); the flush threshold is the sole governing constraint.
 
 ---
 
@@ -273,7 +287,7 @@ what remains is compaction, the full Iterator/Snapshot API, and operational hygi
 
 **Iterator and snapshot API** *(all required by `include/leveldb/db.h`)*
 
-- [x] **Backward iteration**: `SkipListIter::seek_to_last()` / `prev()` (scan level-0 from head; no back-pointers),
+- [x] **Backward iteration**: `SkipListIter::seek_to_last()` / `prev()` (`find_last` / `find_less_than`; no back-pointers),
   `BlockIter::seek_to_last()` (last restart + scan forward) / `prev()` (binary-search restart points, scan to
   predecessor), `TwoLevelIterator::prev()` + `skip_empty_data_blocks_backward()`, `MergingIterator::prev()` /
   `find_largest()` (symmetric to `find_smallest`), `DbIterator::prev()` / `seek_to_last()` / `find_prev_user_entry()`
@@ -281,7 +295,7 @@ what remains is compaction, the full Iterator/Snapshot API, and operational hygi
   `next()` handled). `InternalIterator` trait extended with `seek_to_last` + `prev`. Public `DbIter` exposes both.
   26 new unit tests across all layers; 161 tests total. See `table/iterator.h` and `db/db_iter.cc`.
 - [x] **`Db::new_iterator(read_opts)`**: Returns `Result<DbIter, Error>`. Pins `Arc<Memtable>` for `mem` and `imm`
-  via `ArcMemTableIter` (owned wrapper using `unsafe` transmute of `'a` lifetime, backed by the Arc). Creates
+  via `ArcMemTableIter` (owned wrapper that borrows the memtable for `'static` through the Arc's raw pointer). Creates
   `TwoLevelIterator` per SSTable from the current `Version`. Builds `MergingIterator` → `DbIterator`. Exposes:
   `valid`, `seek_to_first`, `seek_to_last`, `seek`, `next`, `prev`, `key`, `value`, `status`. `DbState.mem` and
   `.imm` changed to `Arc<Memtable>` to enable Arc cloning for the iterator. See `db/db_impl.cc`.
@@ -432,10 +446,13 @@ what remains is compaction, the full Iterator/Snapshot API, and operational hygi
 ## Key conventions
 
 - `rustfmt.toml` sets `tab_spaces = 2`.
-- `unsafe` blocks must carry a `// SAFETY:` comment; `unsafe fn` must carry a `# Safety` doc section.
-- `find_splice_for_level` and `recompute_splice_levels` are free functions (not `SkipList` methods) to avoid a
-  simultaneous `&self` / `&mut self.splice` borrow conflict — a pattern to follow whenever a method needs both `&self`
-  and `&mut self.field`.
+- `unsafe` blocks must carry a `// SAFETY:` comment; `unsafe fn` must carry a `# Safety` doc section. A safe function
+  must have no soundness preconditions: if correctness depends on something only the caller can guarantee (writer
+  serialisation, a pointer's provenance, a level being below a node's height), make it an `unsafe fn` and state the
+  requirement in `# Safety` — see `Memtable::add`, `Node::load_next`, and the `Inserter` contract in `lib.rs`.
+- `find_splice_for_level` and `recompute_splice_levels` are free functions (not `SkipList` methods) that take the
+  comparator explicitly; this keeps the insert hot path free of `&self` entanglement and is the pattern to follow
+  whenever a method would otherwise need both `&self` and `&mut self.field`.
 - Methods or functions only used in tests are gated with `#[cfg(test)]`.
 - Prefer encoding directly into arena/pre-allocated memory (see `Entry` helpers) over intermediate `Vec` allocations on
   hot paths.

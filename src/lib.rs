@@ -144,6 +144,13 @@ pub(crate) mod table;
 pub mod write_batch;
 pub use write_batch::{Handler, WriteBatch};
 
+/// Internal hooks for `benches/skiplist.rs`.  Only built with `--features bench`; not a public API.
+#[cfg(feature = "bench")]
+#[doc(hidden)]
+pub mod bench {
+  pub use crate::memtable::{MemTableIterator, Memtable, MemtableResult};
+}
+
 /// An immutable snapshot of the database state at a particular sequence number.
 ///
 /// Obtained via [`Db::get_snapshot`] and passed via [`ReadOptions::snapshot`] to pin reads to a
@@ -215,8 +222,14 @@ impl Default for ReadOptions<'_> {
   }
 }
 
-// ── Shared inserter used by both Db::write and Db::recover_wal ───────────────
+// ── Shared inserter used by Db::write, Db::recover_wal and Db::repair ─────────
 
+/// Applies a `WriteBatch` to a memtable, one sequence number per record.
+///
+/// Contract: an `Inserter` is only constructed where the caller has exclusive
+/// write access to `mem` — the write leader holding the `DbState` mutex, or
+/// WAL recovery / repair filling a memtable no other thread can write to yet.
+/// That exclusivity is what makes the `unsafe` calls below sound.
 struct Inserter<'a> {
   mem: &'a Memtable,
   seq: u64,
@@ -224,13 +237,15 @@ struct Inserter<'a> {
 
 impl Handler for Inserter<'_> {
   fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), Error> {
-    self.mem.add(self.seq, key, value);
+    // SAFETY: see the `Inserter` contract — no concurrent writer exists.
+    unsafe { self.mem.add(self.seq, key, value) };
     self.seq += 1;
     Ok(())
   }
 
   fn delete(&mut self, key: &[u8]) -> Result<(), Error> {
-    self.mem.delete(self.seq, key);
+    // SAFETY: see the `Inserter` contract — no concurrent writer exists.
+    unsafe { self.mem.delete(self.seq, key) };
     self.seq += 1;
     Ok(())
   }
@@ -2997,8 +3012,8 @@ mod tests {
     let dir = tempfile::tempdir().unwrap();
     {
       let db = Db::open(dir.path(), small_options()).unwrap();
-      // Trigger at least one flush.
-      for i in 0u32..20 {
+      // Trigger at least one flush (each entry costs ~18 bytes of arena).
+      for i in 0u32..40 {
         db.put(format!("k{i:04}").as_bytes(), b"v").unwrap();
       }
     }
@@ -4353,12 +4368,10 @@ mod tests {
 
     let mut v =
       crate::db::version::Version::new(std::sync::Arc::new(crate::comparator::BytewiseComparator));
-    let mut file_number = 10u64;
-    for &(level, size) in level_sizes {
+    for (file_number, &(level, size)) in (10u64..).zip(level_sizes.iter()) {
       let ikey = make_internal_key(format!("a{file_number}").as_bytes(), file_number, 1);
       let meta = FileMetaData::new(file_number, size, ikey.clone(), ikey);
       v.push_file_for_test(level, meta);
-      file_number += 1;
     }
     v
   }

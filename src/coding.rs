@@ -22,6 +22,13 @@ pub(crate) fn write_varu64(data: &mut [u8], mut n: u64) -> usize {
 }
 
 pub(crate) fn read_varu64(data: &[u8]) -> (u64, usize) {
+  // Fast path: single-byte values (key lengths, small sizes) are the common
+  // case.
+  if let Some(&b) = data.first() {
+    if b < 0b1000_0000 {
+      return (b as u64, 1);
+    }
+  }
   let mut n: u64 = 0;
   let mut shift: u32 = 0;
   for (i, &b) in data.iter().enumerate() {
@@ -100,8 +107,8 @@ mod tests {
       write_u32_le(&mut tmp, v);
       buf.extend_from_slice(&tmp);
     }
-    for (i, chunk) in buf.chunks_exact(4).enumerate() {
-      let actual = read_u32_le(chunk.try_into().unwrap());
+    for (i, chunk) in buf.as_chunks::<4>().0.iter().enumerate() {
+      let actual = read_u32_le(chunk);
       assert_eq!(actual, i as u32);
     }
   }
@@ -123,8 +130,8 @@ mod tests {
       write_u64_le(&mut tmp, v);
       buf.extend_from_slice(&tmp);
     }
-    for (i, chunk) in buf.chunks_exact(8).enumerate() {
-      let actual = read_u64_le(chunk.try_into().unwrap());
+    for (i, chunk) in buf.as_chunks::<8>().0.iter().enumerate() {
+      let actual = read_u64_le(chunk);
       assert_eq!(actual, values[i]);
     }
   }

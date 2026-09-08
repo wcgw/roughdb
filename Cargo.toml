@@ -26,3 +26,12 @@ serial_test = "3.4"
 [[bench]]
 name = "db"
 harness = false
+
+[features]
+# Internal: exposes `roughdb::bench` (memtable/skip-list hooks) for `benches/skiplist.rs`.  Not a public API.
+bench = []
+
+[[bench]]
+name = "skiplist"
+harness = false
+required-features = ["bench"]
