@@ -63,7 +63,11 @@ pub(crate) struct VersionSet {
   current: Arc<Version>,
   /// Next file number to allocate.  Incremented by `next_file_number()`.
   next_file_number: u64,
-  /// Sequence number of the last write reflected in the current `Version`.
+  /// Recovery watermark: the highest sequence number whose write is durable in
+  /// an SSTable of the current `Version`.  Persisted in every MANIFEST edit;
+  /// on open, WAL records at or below it are skipped.  It therefore lags the
+  /// live write counter (`DbState::last_sequence`) by everything still in the
+  /// memtable, and only a flush may advance it — see `set_last_sequence`.
   last_sequence: u64,
   /// File number of the current WAL.
   log_number: u64,
@@ -267,6 +271,12 @@ impl VersionSet {
     self.last_sequence
   }
 
+  /// Advance the recovery watermark to `seq`.
+  ///
+  /// Only call this when every write with sequence ≤ `seq` is in an SSTable
+  /// (after a flush, with the sequence captured when the memtable was
+  /// rotated).  Setting it to the live write counter would make the next open
+  /// skip the WAL records of writes that were only in the memtable.
   pub(crate) fn set_last_sequence(&mut self, seq: u64) {
     self.last_sequence = seq;
   }

@@ -43,6 +43,11 @@ The read path checks `mem` → `imm` → each level of SSTables (newest to oldes
   backpressure), the three-phase lock protocol (snapshot under lock → I/O without lock → install under lock), flush,
   compaction *installation* (`install_compaction`, `install_trivial_move`, `maybe_compact`, `compact_level_range`),
   and file GC.
+- **Recovery watermark**: `VersionSet::last_sequence` (persisted in every MANIFEST edit) is the highest sequence
+  whose data is in an SSTable, not the live write counter; `Db::open` skips WAL records at or below it.  Only a
+  flush advances it (`last_sequence_at_rotation`); compactions and `reuse_logs` recovery must leave it alone, or a
+  close after a compaction loses the writes still in the memtable
+  (`compaction_does_not_advance_recovery_watermark_past_unflushed_writes`).
 - **`src/db/compaction.rs`** — compaction planning + execution behind a pick → do → install seam.
   `pick_compaction`/`pick_range_compaction` produce a `Compaction` plan from a `Version` snapshot; `do_compaction`
   executes it with **no lock and no `DbState` dependency** (output file numbers come from an injected

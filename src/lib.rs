@@ -681,10 +681,10 @@ impl Db {
         manifest_last_seq
       };
 
-      if actual_last_seq > manifest_last_seq {
-        vs.set_last_sequence(actual_last_seq);
-      }
-      let last_seq = vs.last_sequence();
+      // The write counter resumes after everything replayed; the VersionSet's
+      // watermark (what recovery may skip) only advances once that data is in
+      // an SSTable — see `VersionSet::set_last_sequence`.
+      let last_seq = actual_last_seq.max(manifest_last_seq);
 
       // When reuse_logs is false and the WAL had data, flush the replayed
       // memtable to an SSTable so the next open doesn't need to replay it.
@@ -695,6 +695,7 @@ impl Db {
         && mem.approximate_memory_usage() > 0
       {
         log::info!("flushing replayed WAL data to SSTable (reuse_logs=false)");
+        vs.set_last_sequence(actual_last_seq);
         let flush_result = write_flush_from_mem(&mem, &mut vs, &options, &*fs, path)?;
         finish_flush_at_open(&mut vs, flush_result, &options, &table_cache)?;
         let fresh_mem = Arc::new(Memtable::new(Arc::clone(&options.comparator)));
@@ -2260,7 +2261,10 @@ fn install_compaction(
   for (lvl, key) in &spec.edit.compact_pointers {
     edit.compact_pointers.push((*lvl, key.clone()));
   }
-  vs.set_last_sequence(state.last_sequence);
+  // A compaction changes nothing about which writes are in SSTables, so the
+  // recovery watermark (`vs.last_sequence`) stays as the last flush left it.
+  // Recording `state.last_sequence` here would make recovery skip the WAL
+  // records of writes that are still only in the memtable.
   vs.log_and_apply(&mut edit, tc)?;
 
   // Clear seek_compact_file if the nominated file was removed by this compaction.
@@ -2372,7 +2376,7 @@ fn install_trivial_move(
   // access finds it in the cache instead of re-opening from disk.
   let table_arc = tc.get_or_open(file.number, file.file_size).ok();
 
-  vs.set_last_sequence(state.last_sequence);
+  // As in `install_compaction`: the recovery watermark is untouched.
   vs.log_and_apply(&mut edit, tc)?;
 
   // Re-insert so the file stays warm even though log_and_apply evicted it.
@@ -5422,6 +5426,58 @@ mod tests {
         expected.as_bytes(),
         "key{i:03}: expected uppercased value"
       );
+    }
+  }
+
+  /// The MANIFEST's `last_sequence` is the recovery watermark: WAL records at
+  /// or below it are skipped on open.  Compactions must not advance it past
+  /// writes that are still only in the memtable and WAL, or a close (or crash)
+  /// after a compaction loses them.
+  #[test]
+  fn compaction_does_not_advance_recovery_watermark_past_unflushed_writes() {
+    use crate::env::{FileSystem, MemFileSystem};
+    use std::sync::Arc;
+    let fs: Arc<dyn FileSystem> = Arc::new(MemFileSystem::new());
+    let path = std::path::Path::new("/db");
+    let opts = |fs: &Arc<dyn FileSystem>| Options {
+      create_if_missing: true,
+      file_system: Arc::clone(fs),
+      ..Options::default()
+    };
+    let flush = |db: &Db| db.flush(&crate::FlushOptions { wait: true }).unwrap();
+
+    let db = Db::open(path, opts(&fs)).unwrap();
+    // Two L0 files, then an unflushed write, then a real (merging) compaction.
+    db.put(b"a", b"1").unwrap();
+    flush(&db);
+    db.put(b"b", b"2").unwrap();
+    flush(&db);
+    db.put(b"c", b"3").unwrap();
+    db.compact_range(None, None).unwrap();
+    // One non-overlapping L0 file, an unflushed write, then a trivial move.
+    db.put(b"z", b"4").unwrap();
+    flush(&db);
+    db.put(b"q", b"5").unwrap();
+    db.compact_range(None, None).unwrap();
+    let watermark = {
+      let g = db.inner.state.lock().unwrap();
+      g.version_set.as_ref().unwrap().last_sequence()
+    };
+    assert!(
+      watermark < 5,
+      "watermark {watermark} covers unflushed writes"
+    );
+    drop(db);
+
+    let db = Db::open(path, opts(&fs)).unwrap();
+    for (k, v) in [
+      (b"a", b"1"),
+      (b"b", b"2"),
+      (b"c", b"3"),
+      (b"z", b"4"),
+      (b"q", b"5"),
+    ] {
+      assert_eq!(db.get(k).unwrap(), v, "{}", String::from_utf8_lossy(k));
     }
   }
 }
