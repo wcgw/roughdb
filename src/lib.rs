@@ -5480,4 +5480,45 @@ mod tests {
       assert_eq!(db.get(k).unwrap(), v, "{}", String::from_utf8_lossy(k));
     }
   }
+
+  /// Index-block separators must never be cut inside the internal-key tag.
+  /// With several versions of a user key straddling a data-block boundary,
+  /// the old user-comparator-on-internal-key shortening produced a malformed
+  /// separator that broke point lookups for every earlier block.
+  #[test]
+  fn point_lookups_in_a_multi_version_sstable() {
+    use crate::env::{FileSystem, MemFileSystem};
+    use std::sync::Arc;
+    let fs: Arc<dyn FileSystem> = Arc::new(MemFileSystem::new());
+    let db = Db::open(
+      "/db",
+      Options {
+        create_if_missing: true,
+        file_system: fs,
+        ..Options::default()
+      },
+    )
+    .unwrap();
+    let n = 10_000u64;
+    let value = [b'v'; 100];
+    let key = |i: u64| format!("{i:016}");
+    for i in 0..n {
+      db.put(key(i).as_bytes(), value).unwrap();
+    }
+    for _round in 0..4 {
+      for i in 2 * n..2 * n + 4729 {
+        db.put(key(i).as_bytes(), value).unwrap();
+      }
+    }
+    db.flush(&crate::FlushOptions { wait: true }).unwrap();
+    let missing = (0..n)
+      .filter(|&i| db.get(key(i).as_bytes()).is_err())
+      .count();
+    let missing_w = (2 * n..2 * n + 4729)
+      .filter(|&i| db.get(key(i).as_bytes()).is_err())
+      .count();
+    eprintln!("{}", db.get_property("leveldb.sstables").unwrap());
+    eprintln!("setup keys missing: {missing}; writer keys missing: {missing_w}");
+    assert_eq!(missing + missing_w, 0);
+  }
 }

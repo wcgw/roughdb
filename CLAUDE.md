@@ -466,7 +466,9 @@ what remains is compaction, the full Iterator/Snapshot API, and operational hygi
   Bound every allocation whose size comes from disk (`MAX_BLOCK_SIZE`). `VersionEdit::decode`, the WAL reader, and
   `BlockIter` are the reference implementations.
 - **Comparator discipline**: all user-key ordering goes through `Options::comparator` — never raw byte `cmp` on keys
-  or key-containing structs. `Entry` deliberately has no `Ord`/`PartialEq`; skip-list ordering lives in
+  or key-containing structs.  The comparator's `find_shortest_separator` / `find_short_successor` operate on *user*
+  keys only: for internal keys use `find_shortest_internal_separator` / `find_short_internal_successor` in
+  `table/format.rs` (LevelDB's `InternalKeyComparator`), which never cut into the 8-byte tag. `Entry` deliberately has no `Ord`/`PartialEq`; skip-list ordering lives in
   `SkipList::key_after_node_cmp`. When adding a sort or comparison, write a test with a non-bytewise comparator.
 - Run `cargo fmt` on changesets
 - Have text and other files hardwrap at 120 character lines
