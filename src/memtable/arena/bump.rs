@@ -16,7 +16,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub struct Arena {
   arena: Bump,
-  /// Running total of bytes requested via `allocate_aligned`.
+  /// Running total of arena space consumed via `allocate_aligned`: the
+  /// bytes requested plus the padding each allocation forces before the
+  /// next one (allocations are `align`-aligned, so a request is rounded up
+  /// to a multiple of `align`).
   ///
   /// Bumpalo's `allocated_bytes()` returns total chunk *capacity*, which
   /// doesn't grow for small allocations within a pre-allocated chunk.
@@ -32,7 +35,8 @@ impl Arena {
     }
   }
 
-  /// Bytes of memory allocated from the arena so far (exact, not an estimate).
+  /// Bytes of arena space consumed so far, alignment padding included
+  /// (exact for the allocations made; chunk slack is not counted).
   ///
   /// Used by `Db` to decide when to flush the memtable to L0.
   pub fn memory_usage(&self) -> usize {
@@ -44,11 +48,16 @@ impl Arena {
   /// The allocation is *not* zero-initialised; callers must initialise every
   /// byte before use.  Panics on OOM — matching LevelDB's behaviour, since a
   /// memtable allocation failure is unrecoverable.
+  #[inline]
   pub fn allocate_aligned(&self, size: usize, align: usize) -> *mut u8 {
     let layout = Layout::from_size_align(size, align).expect("invalid layout");
     match self.arena.try_alloc_layout(layout) {
       Ok(ptr) => {
-        self.bytes_used.fetch_add(size, Ordering::Relaxed);
+        // The next allocation starts at an `align`-aligned address, so the
+        // bytes between `size` and the next multiple of `align` are spent
+        // too.  `align` is a power of two (checked by `Layout`).
+        let consumed = (size + align - 1) & !(align - 1);
+        self.bytes_used.fetch_add(consumed, Ordering::Relaxed);
         ptr.as_ptr()
       }
       Err(_) => panic!("Arena OOM: failed to allocate {size} bytes (align {align})"),

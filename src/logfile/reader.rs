@@ -477,6 +477,7 @@ mod tests {
     let rec = r.read_record().unwrap();
     assert_eq!(rec.len(), b"data".len());
 
+    // SAFETY: log_ptr is valid for the duration of this test.
     let log = unsafe { &*log_ptr };
     assert!(log.0.is_empty(), "no report expected when checksum=false");
   }
