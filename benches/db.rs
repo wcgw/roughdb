@@ -317,12 +317,79 @@ fn disk_read_benchmarks(c: &mut Criterion) {
   group.finish();
 }
 
+// ---------------------------------------------------------------------------
+// Concurrency benchmarks
+// One writer thread issues `sync: true` puts (each an fsync on a real file)
+// for the whole measurement while the timed thread performs N random gets of
+// memtable-resident keys.  Measures how much a write in flight — in
+// particular its fsync — delays readers.  Compare with read/random for the
+// uncontended cost of the same gets.
+// ---------------------------------------------------------------------------
+
+fn concurrency_benchmarks(c: &mut Criterion) {
+  use roughdb::{Options, WriteOptions};
+  use std::sync::atomic::{AtomicBool, Ordering};
+  use std::sync::Arc;
+
+  let order = shuffled(N);
+  let mut group = c.benchmark_group("concurrent");
+  group.sample_size(20);
+  group.throughput(Throughput::Elements(N));
+
+  let dir = tempfile::tempdir().unwrap();
+  let opts = Options {
+    create_if_missing: true,
+    ..Options::default()
+  };
+  let db = Arc::new(Db::open(dir.path(), opts).unwrap());
+  for i in 0..N {
+    db.put(make_key(i), VALUE).unwrap();
+  }
+
+  group.bench_function("reads_during_sync_writes", |b| {
+    b.iter_custom(|iters| {
+      let stop = Arc::new(AtomicBool::new(false));
+      let writer = {
+        let (db, stop) = (Arc::clone(&db), Arc::clone(&stop));
+        std::thread::spawn(move || {
+          let sync = WriteOptions { sync: true };
+          let mut i = 2 * N;
+          let mut batches = 0u64;
+          while !stop.load(Ordering::Relaxed) {
+            let mut wb = roughdb::WriteBatch::new();
+            wb.put(make_key(i), VALUE);
+            db.write(&sync, wb).unwrap();
+            i += 1;
+            batches += 1;
+          }
+          batches
+        })
+      };
+      let start = std::time::Instant::now();
+      for _ in 0..iters {
+        for &i in &order {
+          if let Err(e) = black_box(db.get(make_key(i))) {
+            panic!("key {i} → {e:?} during concurrent sync writes");
+          }
+        }
+      }
+      let elapsed = start.elapsed();
+      stop.store(true, Ordering::Relaxed);
+      black_box(writer.join().unwrap());
+      elapsed
+    });
+  });
+
+  group.finish();
+}
+
 criterion_group!(
   benches,
   write_benchmarks,
   read_benchmarks,
   delete_benchmarks,
   compaction_benchmarks,
-  disk_read_benchmarks
+  disk_read_benchmarks,
+  concurrency_benchmarks
 );
 criterion_main!(benches);
