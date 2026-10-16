@@ -124,7 +124,9 @@ use std::sync::{Arc, Mutex};
 pub mod cache;
 pub use cache::BlockCache;
 pub mod compaction_filter;
-pub use compaction_filter::{CompactionDecision, CompactionFilter, CompactionFilterFactory};
+pub use compaction_filter::{
+  CompactionDecision, CompactionFilter, CompactionFilterFactory, CompactionValue,
+};
 pub mod comparator;
 pub use comparator::{BytewiseComparator, Comparator};
 pub mod env;
@@ -5380,8 +5382,7 @@ mod tests {
       &mut self,
       _level: usize,
       key: &[u8],
-      _value: &[u8],
-      _vtype: u8,
+      _value: crate::CompactionValue<'_>,
     ) -> crate::CompactionDecision {
       if key.starts_with(b"drop_") {
         crate::CompactionDecision::Remove
@@ -5413,9 +5414,11 @@ mod tests {
       &mut self,
       _level: usize,
       _key: &[u8],
-      value: &[u8],
-      _vtype: u8,
+      value: crate::CompactionValue<'_>,
     ) -> crate::CompactionDecision {
+      let crate::CompactionValue::Value(value) = value else {
+        return crate::CompactionDecision::Keep;
+      };
       let upper: Vec<u8> = value.iter().map(|b| b.to_ascii_uppercase()).collect();
       if upper != value {
         crate::CompactionDecision::ChangeValue(upper)

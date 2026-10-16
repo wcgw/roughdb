@@ -87,9 +87,13 @@ change no public API.  Items 6–10 do, and are acceptable as a 0.x minor bump.
   section.  Found on the way: a record length near `u64::MAX` overflowed the end offset and panicked (in release
   too, as a bad slice) while replaying a damaged WAL; such a length is now `Corruption`.
 
-- [ ] **11. `CompactionFilter::filter` takes a value-type enum.**  Its `value_type: u8` argument is documented as
+- [x] **11. `CompactionFilter::filter` takes a value-type enum.**  Its `value_type: u8` argument is documented as
   "`1` = Value, `0` = Deletion"; a public enum (the crate's `ValueType`, or one of its own) says that in the type.
   Found while doing item 2.
+  *Done:* `filter(level, key, value: CompactionValue)`, where `CompactionValue` is `Value(&[u8])` or `Deletion`, so a
+  tombstone can no longer come with a value.  `ChangeValue` on a deletion is documented as, and now is, a no-op (its
+  bytes used to be stored as the tombstone's unread value).  Not covered by a test: a tombstone only reaches the
+  filter when the key has data below the output level, which `compact_range` alone cannot set up.
 
 ## Small items
 

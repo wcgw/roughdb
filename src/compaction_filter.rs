@@ -23,6 +23,15 @@
 //!
 //! See `include/rocksdb/compaction_filter.h`.
 
+/// The newest visible version of a key, as a [`CompactionFilter`] sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactionValue<'a> {
+  /// The key holds this value.
+  Value(&'a [u8]),
+  /// The key was deleted: this version is a tombstone.
+  Deletion,
+}
+
 /// Decision returned by a [`CompactionFilter`] for each key.
 #[derive(Debug)]
 pub enum CompactionDecision {
@@ -31,6 +40,7 @@ pub enum CompactionDecision {
   /// Remove the key-value pair entirely.
   Remove,
   /// Replace the value with a new one (key and sequence number are preserved).
+  /// Has no effect on a [`CompactionValue::Deletion`]: a tombstone stays one.
   ChangeValue(Vec<u8>),
 }
 
@@ -40,8 +50,8 @@ pub enum CompactionDecision {
 /// versions are already pruned before the filter runs.  Entries still visible
 /// to a live snapshot are never filtered.
 ///
-/// Tombstones (`value_type == 0`) are presented so the filter can suppress
-/// elision (return [`Keep`](CompactionDecision::Keep)) if needed.
+/// Tombstones ([`CompactionValue::Deletion`]) are presented so the filter can
+/// suppress elision (return [`Keep`](CompactionDecision::Keep)) if needed.
 ///
 /// # Thread safety
 ///
@@ -55,15 +65,8 @@ pub trait CompactionFilter: Send {
   ///
   /// - `level`: the output level of this compaction.
   /// - `key`: the user key (no internal sequence/type suffix).
-  /// - `value`: the current value bytes (empty for tombstones).
-  /// - `value_type`: `1` = Value, `0` = Deletion tombstone.
-  fn filter(
-    &mut self,
-    level: usize,
-    key: &[u8],
-    value: &[u8],
-    value_type: u8,
-  ) -> CompactionDecision;
+  /// - `value`: the key's newest visible version.
+  fn filter(&mut self, level: usize, key: &[u8], value: CompactionValue<'_>) -> CompactionDecision;
 
   /// Human-readable name for logging.
   fn name(&self) -> &str;

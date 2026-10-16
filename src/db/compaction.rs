@@ -39,6 +39,7 @@ use crate::error::Error;
 use crate::options::Options;
 use crate::table::builder::TableBuilder;
 use crate::table::format::user_key as ikey_user_key;
+use crate::table::format::ValueType;
 use crate::table::reader::Table;
 use std::sync::Arc;
 
@@ -623,7 +624,7 @@ pub(crate) fn do_compaction(
         // A newer version for this user key was already emitted and is visible
         // to even the oldest active snapshot — this older version is invisible.
         true
-      } else if vtype == crate::table::format::ValueType::Deletion
+      } else if vtype == ValueType::Deletion
         && seq <= oldest_snapshot
         && is_base_level_for_key(spec, uk, &*opts.comparator)
       {
@@ -646,11 +647,19 @@ pub(crate) fn do_compaction(
       // Entries still visible to a live snapshot are never filtered (seq > oldest_snapshot).
       if let Some(ref mut filter) = compaction_filter {
         if first_occurrence && seq <= oldest_snapshot {
-          match filter.filter(output_level, uk, &value, vtype as u8) {
-            crate::compaction_filter::CompactionDecision::Keep => {}
-            crate::compaction_filter::CompactionDecision::Remove => break 'entry,
-            crate::compaction_filter::CompactionDecision::ChangeValue(new_val) => {
-              value = std::borrow::Cow::Owned(new_val);
+          use crate::compaction_filter::{CompactionDecision, CompactionValue};
+          let seen = match vtype {
+            ValueType::Value => CompactionValue::Value(&value),
+            ValueType::Deletion => CompactionValue::Deletion,
+          };
+          match filter.filter(output_level, uk, seen) {
+            CompactionDecision::Keep => {}
+            CompactionDecision::Remove => break 'entry,
+            // A tombstone stays a tombstone; only a value can be replaced.
+            CompactionDecision::ChangeValue(new_val) => {
+              if vtype == ValueType::Value {
+                value = std::borrow::Cow::Owned(new_val);
+              }
             }
           }
         }
