@@ -5706,6 +5706,8 @@ mod tests {
       arm_block: AtomicBool,
       /// The next SSTable create blocks until `release()`.
       arm_table_block: AtomicBool,
+      /// The next read from an SSTable blocks until `release()`.
+      arm_table_read_block: AtomicBool,
       /// Every WAL append fails with an I/O error.
       fail: AtomicBool,
       /// Every MANIFEST append fails with an I/O error.
@@ -5724,6 +5726,9 @@ mod tests {
     impl Gate {
       pub fn block_next_append(&self) {
         self.arm_block.store(true, SeqCst);
+      }
+      pub fn block_next_table_read(&self) {
+        self.arm_table_read_block.store(true, SeqCst);
       }
       pub fn block_next_table_create(&self) {
         self.arm_table_block.store(true, SeqCst);
@@ -5819,6 +5824,20 @@ mod tests {
       }
     }
 
+    struct GatedTable {
+      inner: Arc<dyn RandomAccessFile>,
+      gate: Arc<Gate>,
+    }
+
+    impl RandomAccessFile for GatedTable {
+      fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<usize, Error> {
+        if self.gate.arm_table_read_block.swap(false, SeqCst) {
+          self.gate.park();
+        }
+        self.inner.read_at(buf, offset)
+      }
+    }
+
     pub struct GatedFs {
       pub inner: Arc<MemFileSystem>,
       pub gate: Arc<Gate>,
@@ -5859,7 +5878,14 @@ mod tests {
         self.inner.open_sequential(p)
       }
       fn open_random_access(&self, p: &Path) -> Result<Arc<dyn RandomAccessFile>, Error> {
-        self.inner.open_random_access(p)
+        let file = self.inner.open_random_access(p)?;
+        if p.extension().is_some_and(|e| e == "ldb") {
+          return Ok(Arc::new(GatedTable {
+            inner: file,
+            gate: Arc::clone(&self.gate),
+          }));
+        }
+        Ok(file)
       }
       fn open_appendable(&self, p: &Path) -> Result<Box<dyn WritableFile>, Error> {
         Ok(self.wrap(p, self.inner.open_appendable(p)?))
@@ -6472,5 +6498,54 @@ mod tests {
 
     let db = Db::open("/db", opts()).unwrap();
     assert_eq!(db.get(b"a").unwrap().unwrap(), b"1");
+  }
+
+  /// A `get` reads through the `Version` that was current when it started.
+  /// A compaction installed meanwhile must not let file GC delete the files
+  /// that `Version` still names, or the `get` cannot open them.
+  #[test]
+  fn get_survives_a_compaction_that_removes_its_files() {
+    use crate::env::MemFileSystem;
+    use std::sync::Arc;
+    let disk = Arc::new(MemFileSystem::new());
+    let (fs, gate) = gated_fs::GatedFs::over(Arc::clone(&disk));
+    let db = Db::open(
+      "/db",
+      Options {
+        open_mode: crate::OpenMode::CreateIfMissing,
+        // Room for one open table, so the `get` must open older ones itself,
+        // and no block cache, so its first data-block read reaches the file.
+        max_open_files: crate::db::table_cache::NUM_NON_TABLE_CACHE_FILES + 1,
+        block_cache: None,
+        file_system: fs,
+        ..Options::default()
+      },
+    )
+    .unwrap();
+    db.put(b"r", b"1").unwrap();
+    let round = fill_l0_to_one_below_trigger(&db);
+
+    std::thread::scope(|s| {
+      // The `get` takes the current `Version`, then stalls on its first
+      // block read, in the newest L0 file, before it opens the older ones.
+      gate.block_next_table_read();
+      let reader = s.spawn(|| db.get(b"r"));
+      gate.wait_until_blocked();
+
+      // Meanwhile: a compaction of all of L0, then a flush, whose GC pass
+      // runs after the compaction is installed.
+      write_round(&db, round + 1);
+      db.flush(&crate::FlushOptions { wait: true }).unwrap();
+      let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+      while db.property("leveldb.num-files-at-level0").unwrap() != "0" {
+        assert!(std::time::Instant::now() < deadline, "L0 never compacted");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+      }
+      db.put(b"after", b"compaction").unwrap();
+      db.flush(&crate::FlushOptions { wait: true }).unwrap();
+
+      gate.release();
+      assert_eq!(reader.join().unwrap().unwrap(), Some(b"1".to_vec()));
+    });
   }
 }

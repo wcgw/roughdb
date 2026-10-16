@@ -18,7 +18,7 @@ use crate::logfile::reader::Reader as LogReader;
 use crate::logfile::writer::Writer as LogWriter;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 // ── MANIFEST file-name helpers ────────────────────────────────────────────────
 
@@ -61,6 +61,13 @@ fn read_current_file(path: &Path, fs: &dyn crate::env::FileSystem) -> Result<Str
 /// can be recovered without replaying the entire WAL.
 pub(crate) struct VersionSet {
   current: Arc<Version>,
+  /// Versions that were `current` once and may still be in use: by a `get`
+  /// that started before the next edit, or by a compaction (its input
+  /// version).  Their files must outlive them, so `add_live_files` counts
+  /// every one still referenced; LevelDB keeps its `Version`s in a list with
+  /// reference counts for the same reason.  Dead entries are pruned on each
+  /// `log_and_apply`.
+  superseded: Vec<Weak<Version>>,
   /// Next file number to allocate.  Incremented by `next_file_number()`.
   next_file_number: u64,
   /// Recovery watermark: the highest sequence number whose write is durable in
@@ -111,6 +118,7 @@ impl VersionSet {
       manifest_log: LogWriter::new(Box::new(NoManifest), 0),
       manifest_number: 0,
       compact_pointer: std::array::from_fn(|_| Vec::new()),
+      superseded: Vec::new(),
       comparator,
     }
   }
@@ -152,6 +160,7 @@ impl VersionSet {
       manifest_log,
       manifest_number,
       compact_pointer: std::array::from_fn(|_| Vec::new()),
+      superseded: Vec::new(),
       comparator,
     })
   }
@@ -223,6 +232,7 @@ impl VersionSet {
       manifest_log,
       manifest_number,
       compact_pointer,
+      superseded: Vec::new(),
       comparator,
     })
   }
@@ -283,7 +293,13 @@ impl VersionSet {
 
     let mut v = Version::from_files(new_files, Arc::clone(&self.comparator));
     crate::db::version::finalize(&mut v);
-    self.current = Arc::new(v);
+    let previous = std::mem::replace(&mut self.current, Arc::new(v));
+    self.superseded.retain(|v| v.strong_count() > 0);
+    // Every clone of `current` is taken under the `DbState` lock, as is this
+    // call, so a version nobody else holds now can never be revived.
+    if Arc::strong_count(&previous) > 1 {
+      self.superseded.push(Arc::downgrade(&previous));
+    }
     Ok(())
   }
 
@@ -340,14 +356,16 @@ impl VersionSet {
     self.manifest_number
   }
 
-  /// Add the file numbers of every live SSTable across all levels to `live`.
+  /// Add to `live` the file number of every SSTable in the current `Version`
+  /// and in every superseded one still in use.
   ///
   /// Called by `delete_obsolete_files` to compute the set of files that must
   /// not be deleted.  Matches LevelDB's `VersionSet::AddLiveFiles`.
   pub(crate) fn add_live_files(&self, live: &mut HashSet<u64>) {
-    for level in 0..crate::db::version::NUM_LEVELS {
-      for meta in self.current.files_at(level) {
-        live.insert(meta.number);
+    let superseded = self.superseded.iter().filter_map(Weak::upgrade);
+    for version in std::iter::once(Arc::clone(&self.current)).chain(superseded) {
+      for level in 0..crate::db::version::NUM_LEVELS {
+        live.extend(version.files_at(level).iter().map(|meta| meta.number));
       }
     }
   }
