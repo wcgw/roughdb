@@ -106,7 +106,9 @@ change no public API.  Items 6–10 do, and are acceptable as a 0.x minor bump.
   the doc comment it was missing.
 - [x] A test pins `Db: Send + Sync`.  *Done:* with `Snapshot`, `WriteBatch` and `Options` (`Error` has its own).
   `DbIter` is not `Send`: see item 12.
-- [ ] `Snapshot` is `#[must_use]` (`let _ = db.get_snapshot()` releases it immediately).
+- [x] `Snapshot` is `#[must_use]` (`let _ = db.get_snapshot()` releases it immediately).  *Done:* the attribute
+  warns on a discarded `db.snapshot();`; a `let _ =` binding is an explicit discard and stays silent, so the entry
+  above overstated what it catches.
 - [ ] `Drop for Db` reports a background-thread panic instead of discarding it (`t.join().ok()`).
 - [ ] Public functions document `# Errors` and `# Panics` (34 and 8 missing under clippy's pedantic lints); the 4
   wildcard matches on crate enums become exhaustive.

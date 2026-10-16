@@ -162,6 +162,7 @@ pub mod bench {
 /// is then free to discard entries that were only retained because of it.
 ///
 /// See `include/leveldb/db.h: DB::GetSnapshot`.
+#[must_use = "a snapshot is released as soon as it is dropped"]
 pub struct Snapshot<'db> {
   db: &'db Db,
   pub(crate) seq: u64,
