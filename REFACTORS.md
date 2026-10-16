@@ -60,9 +60,11 @@ change no public API.  Items 6–10 do, and are acceptable as a 0.x minor bump.
   `Error::is_not_found` are gone.  README, crate docs, `examples/cli.rs` and the benches match; the benches now
   assert hits are present instead of only that the call succeeded.
 
-- [ ] **7. Error type polish.**  `Display` as lowercase one-liners (today `"NotFound"`, `"Corruption: …"`);
+- [x] **7. Error type polish.**  `Display` as lowercase one-liners (today `"NotFound"`, `"Corruption: …"`);
   `#[non_exhaustive]` (used nowhere in the crate); `IoError(Arc<io::Error>)`, so that the `Clone` the sticky
   background error needs keeps the original error instead of rebuilding it from `kind()` and `to_string()`.
+  *Done:* `Display` reads `corruption: …`, `invalid argument: …`, `not supported: …`, `I/O error: …`; `Error` is
+  `#[non_exhaustive]`, derives `Clone`, and documents each variant; a test pins `Send + Sync + 'static`.
 
 - [ ] **8. Rust naming and ranges.**  No `get_` prefixes: `get_snapshot` → `snapshot`, `get_property` →
   `property`, `get_approximate_sizes` → `approximate_sizes`.  Ranges as Rust ranges: `db.compact_range(..)` rather

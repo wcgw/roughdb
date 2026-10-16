@@ -171,7 +171,7 @@ struct PosixSequentialFile {
 impl SequentialFile for PosixSequentialFile {
   fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
     use std::io::Read;
-    self.inner.read(buf).map_err(Error::IoError)
+    self.inner.read(buf).map_err(Error::from)
   }
 
   fn skip(&mut self, n: u64) -> Result<(), Error> {
@@ -179,7 +179,7 @@ impl SequentialFile for PosixSequentialFile {
     self
       .inner
       .seek(SeekFrom::Current(n as i64))
-      .map_err(Error::IoError)?;
+      .map_err(Error::from)?;
     Ok(())
   }
 }
@@ -191,7 +191,7 @@ struct PosixRandomAccessFile {
 impl RandomAccessFile for PosixRandomAccessFile {
   fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<usize, Error> {
     use std::os::unix::fs::FileExt;
-    self.inner.read_at(buf, offset).map_err(Error::IoError)
+    self.inner.read_at(buf, offset).map_err(Error::from)
   }
 }
 
@@ -202,19 +202,19 @@ struct PosixWritableFile {
 impl WritableFile for PosixWritableFile {
   fn write(&mut self, data: &[u8]) -> Result<(), Error> {
     use std::io::Write;
-    self.inner.write_all(data).map_err(Error::IoError)
+    self.inner.write_all(data).map_err(Error::from)
   }
 
   fn flush(&mut self) -> Result<(), Error> {
     use std::io::Write;
-    self.inner.flush().map_err(Error::IoError)
+    self.inner.flush().map_err(Error::from)
   }
 
   fn sync(&mut self) -> Result<(), Error> {
     // Flush the BufWriter first, then fsync the underlying file.
     use std::io::Write;
-    self.inner.flush().map_err(Error::IoError)?;
-    self.inner.get_ref().sync_all().map_err(Error::IoError)
+    self.inner.flush().map_err(Error::from)?;
+    self.inner.get_ref().sync_all().map_err(Error::from)
   }
 }
 
@@ -229,12 +229,12 @@ impl FileLock for PosixFileLock {}
 
 impl FileSystem for PosixFileSystem {
   fn open_sequential(&self, path: &Path) -> Result<Box<dyn SequentialFile>, Error> {
-    let file = std::fs::File::open(path).map_err(Error::IoError)?;
+    let file = std::fs::File::open(path).map_err(Error::from)?;
     Ok(Box::new(PosixSequentialFile { inner: file }))
   }
 
   fn open_random_access(&self, path: &Path) -> Result<Arc<dyn RandomAccessFile>, Error> {
-    let file = std::fs::File::open(path).map_err(Error::IoError)?;
+    let file = std::fs::File::open(path).map_err(Error::from)?;
     Ok(Arc::new(PosixRandomAccessFile { inner: file }))
   }
 
@@ -244,21 +244,21 @@ impl FileSystem for PosixFileSystem {
       .append(true)
       .create(true)
       .open(path)
-      .map_err(Error::IoError)?;
+      .map_err(Error::from)?;
     Ok(Box::new(PosixWritableFile {
       inner: std::io::BufWriter::new(file),
     }))
   }
 
   fn create_writable(&self, path: &Path) -> Result<Box<dyn WritableFile>, Error> {
-    let file = std::fs::File::create(path).map_err(Error::IoError)?;
+    let file = std::fs::File::create(path).map_err(Error::from)?;
     Ok(Box::new(PosixWritableFile {
       inner: std::io::BufWriter::new(file),
     }))
   }
 
   fn file_size(&self, path: &Path) -> Result<u64, Error> {
-    let meta = std::fs::metadata(path).map_err(Error::IoError)?;
+    let meta = std::fs::metadata(path).map_err(Error::from)?;
     Ok(meta.len())
   }
 
@@ -267,32 +267,32 @@ impl FileSystem for PosixFileSystem {
   }
 
   fn rename(&self, src: &Path, dst: &Path) -> Result<(), Error> {
-    std::fs::rename(src, dst).map_err(Error::IoError)
+    std::fs::rename(src, dst).map_err(Error::from)
   }
 
   fn remove_file(&self, path: &Path) -> Result<(), Error> {
-    std::fs::remove_file(path).map_err(Error::IoError)
+    std::fs::remove_file(path).map_err(Error::from)
   }
 
   fn create_dir_all(&self, path: &Path) -> Result<(), Error> {
-    std::fs::create_dir_all(path).map_err(Error::IoError)
+    std::fs::create_dir_all(path).map_err(Error::from)
   }
 
   fn remove_dir(&self, path: &Path) -> Result<(), Error> {
-    std::fs::remove_dir(path).map_err(Error::IoError)
+    std::fs::remove_dir(path).map_err(Error::from)
   }
 
   fn sync_dir(&self, path: &Path) -> Result<(), Error> {
     // Opening a directory read-only and fsync-ing it persists its entries.
-    let dir = std::fs::File::open(path).map_err(Error::IoError)?;
-    dir.sync_all().map_err(Error::IoError)
+    let dir = std::fs::File::open(path).map_err(Error::from)?;
+    dir.sync_all().map_err(Error::from)
   }
 
   fn children(&self, path: &Path) -> Result<Vec<String>, Error> {
-    let entries = std::fs::read_dir(path).map_err(Error::IoError)?;
+    let entries = std::fs::read_dir(path).map_err(Error::from)?;
     let mut names = Vec::new();
     for entry in entries {
-      let entry = entry.map_err(Error::IoError)?;
+      let entry = entry.map_err(Error::from)?;
       if let Some(name) = entry.file_name().to_str() {
         names.push(name.to_owned());
       }
@@ -307,19 +307,19 @@ impl FileSystem for PosixFileSystem {
       .read(true)
       .write(true)
       .open(path)
-      .map_err(Error::IoError)?;
+      .map_err(Error::from)?;
     // Non-blocking exclusive flock.
     use std::os::unix::io::AsRawFd;
     // SAFETY: fd is valid for the lifetime of `file`; flock does not alias memory.
     let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if ret != 0 {
-      return Err(Error::IoError(std::io::Error::last_os_error()));
+      return Err(Error::from(std::io::Error::last_os_error()));
     }
     Ok(Box::new(PosixFileLock { _file: file }))
   }
 
   fn read_string_from_file(&self, path: &Path) -> Result<String, Error> {
-    std::fs::read_to_string(path).map_err(Error::IoError)
+    std::fs::read_to_string(path).map_err(Error::from)
   }
 }
 
@@ -459,7 +459,7 @@ mod memfs {
   }
 
   fn not_found(path: &Path) -> Error {
-    Error::IoError(std::io::Error::new(
+    Error::from(std::io::Error::new(
       ErrorKind::NotFound,
       format!("no such file: {}", path.display()),
     ))
@@ -619,7 +619,7 @@ mod memfs {
       let non_empty = st.files.keys().any(|p| p.parent() == Some(path))
         || st.dirs.iter().any(|p| p.parent() == Some(path));
       if non_empty {
-        return Err(Error::IoError(std::io::Error::other(format!(
+        return Err(Error::from(std::io::Error::other(format!(
           "directory not empty: {}",
           path.display()
         ))));
@@ -654,7 +654,7 @@ mod memfs {
     fn lock_file(&self, path: &Path) -> Result<Box<dyn FileLock>, Error> {
       let mut st = self.state.lock().unwrap();
       if st.locks.contains(path) {
-        return Err(Error::IoError(std::io::Error::new(
+        return Err(Error::from(std::io::Error::new(
           ErrorKind::WouldBlock,
           format!("lock held: {}", path.display()),
         )));

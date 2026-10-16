@@ -1596,7 +1596,7 @@ impl Db {
 
     // ── Phase 1: find_files ────────────────────────────────────────────────────
     let names = fs.children(path).map_err(|e| {
-      Error::IoError(std::io::Error::other(format!(
+      Error::from(std::io::Error::other(format!(
         "repair: cannot read directory {}: {e}",
         path.display()
       )))
@@ -5612,9 +5612,7 @@ mod tests {
     impl WritableFile for GatedWal {
       fn write(&mut self, data: &[u8]) -> Result<(), Error> {
         if self.gate.fail.load(SeqCst) {
-          return Err(Error::IoError(std::io::Error::other(
-            "injected WAL failure",
-          )));
+          return Err(Error::from(std::io::Error::other("injected WAL failure")));
         }
         if self.gate.arm_block.swap(false, SeqCst) {
           self.gate.park();
@@ -5637,7 +5635,7 @@ mod tests {
     impl WritableFile for GatedManifest {
       fn write(&mut self, data: &[u8]) -> Result<(), Error> {
         if self.gate.fail_manifest_append.load(SeqCst) {
-          return Err(Error::IoError(std::io::Error::other(
+          return Err(Error::from(std::io::Error::other(
             "injected MANIFEST append failure",
           )));
         }
@@ -5650,7 +5648,7 @@ mod tests {
         if self.gate.fail_manifest_sync.load(SeqCst)
           || countdown(&self.gate.manifest_syncs_until_failure)
         {
-          return Err(Error::IoError(std::io::Error::other(
+          return Err(Error::from(std::io::Error::other(
             "injected MANIFEST sync failure",
           )));
         }
@@ -5709,7 +5707,7 @@ mod tests {
             self.gate.park();
           }
           if countdown(&self.gate.table_creates_until_failure) {
-            return Err(Error::IoError(std::io::Error::other(
+            return Err(Error::from(std::io::Error::other(
               "injected SSTable create failure",
             )));
           }
