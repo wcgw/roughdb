@@ -109,7 +109,9 @@ change no public API.  Items 6–10 do, and are acceptable as a 0.x minor bump.
 - [x] `Snapshot` is `#[must_use]` (`let _ = db.get_snapshot()` releases it immediately).  *Done:* the attribute
   warns on a discarded `db.snapshot();`; a `let _ =` binding is an explicit discard and stays silent, so the entry
   above overstated what it catches.
-- [ ] `Drop for Db` reports a background-thread panic instead of discarding it (`t.join().ok()`).
+- [x] `Drop for Db` reports a background-thread panic instead of discarding it (`t.join().ok()`).  *Done:* logged
+  at error level; not re-raised, since panicking in `drop` aborts when already unwinding.  Untested: nothing can
+  make the background thread panic on demand.
 - [ ] Public functions document `# Errors` and `# Panics` (34 and 8 missing under clippy's pedantic lints); the 4
   wildcard matches on crate enums become exhaustive.
 - [ ] `Cargo.toml` declares a `rust-version`.

@@ -708,7 +708,11 @@ impl Drop for Db {
       self.inner.bg_condvar.notify_one();
       drop(g);
       if let Some(t) = self.bg_thread.take() {
-        t.join().ok();
+        // A panic there is a bug; report it rather than panic in drop.  The
+        // writes it may have left unflushed are still in the WAL.
+        if t.join().is_err() {
+          log::error!("background thread panicked; its last flush or compaction did not finish");
+        }
       }
     }
   }
