@@ -117,4 +117,6 @@ change no public API.  Items 6–10 do, and are acceptable as a 0.x minor bump.
   documents its errors (`put` and `delete` had no docs at all); the `# Panics` sections name the only cause, a lock
   poisoned by an earlier panic.  The wildcard over `std::cmp::Ordering` in `skiplist.rs` stays.  The four broken
   intra-doc links `cargo doc` warned about are fixed too.
-- [ ] `Cargo.toml` declares a `rust-version`.
+- [x] `Cargo.toml` declares a `rust-version`.  *Done:* `1.92`, the oldest installed toolchain that builds and passes
+  the suite (`cargo +1.92.0 test --locked`; 1.81 fails).  The newest std API in use, `<[T]>::as_chunks`, is from
+  1.88, so the floor may be lower; unverified, since no 1.88–1.91 toolchain is installed.

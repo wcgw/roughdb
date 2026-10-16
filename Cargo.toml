@@ -4,6 +4,9 @@ description = "Embedded persistent key-value store — a LevelDB port to Rust wi
 license = "Apache-2.0"
 version = "0.10.1"
 edition = '2021'
+# Lowest toolchain the crate is checked against.  The newest std API in use is
+# `<[T]>::as_chunks` (1.88); lower this once an older toolchain is verified.
+rust-version = "1.92"
 repository = "https://github.com/wcgw/roughdb/"
 authors = ["Alex Snaps <alex@wcgw.dev>"]
 categories = ["database-implementations"]
