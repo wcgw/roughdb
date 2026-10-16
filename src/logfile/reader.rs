@@ -107,13 +107,6 @@ impl Reader {
     loop {
       let pr = self.read_physical_record();
 
-      // Physical offset of this record's header: end of buffer minus
-      // remaining bytes minus the header and payload we just consumed.
-      let physical_record_offset = self.end_of_buffer_offset
-        - (self.buf_end - self.buf_start) as u64
-        - HEADER_SIZE as u64
-        - pr.data_len as u64;
-
       // While resyncing after an initial-offset seek, skip Middle/Last
       // fragments that belong to a record that started before the seek point.
       if self.resyncing {
@@ -132,7 +125,7 @@ impl Reader {
           if in_fragmented && !scratch.is_empty() {
             self.report_corruption(scratch.len() as u64, "partial record without end(1)");
           }
-          self.last_record_offset = physical_record_offset;
+          self.last_record_offset = self.physical_record_offset(pr.data_len);
           return Some(self.backing[pr.data_start..pr.data_start + pr.data_len].to_vec());
         }
 
@@ -140,7 +133,7 @@ impl Reader {
           if in_fragmented && !scratch.is_empty() {
             self.report_corruption(scratch.len() as u64, "partial record without end(2)");
           }
-          prospective_record_offset = physical_record_offset;
+          prospective_record_offset = self.physical_record_offset(pr.data_len);
           scratch.clear();
           scratch.extend_from_slice(&self.backing[pr.data_start..pr.data_start + pr.data_len]);
           in_fragmented = true;
@@ -183,6 +176,20 @@ impl Reader {
         }
       }
     }
+  }
+
+  /// File offset of the header of the record `read_physical_record` just
+  /// returned, given its payload length: end of buffer minus remaining bytes
+  /// minus the header and payload just consumed.
+  ///
+  /// Only for an actual record.  At EOF or after a bad record fewer bytes than
+  /// a header may have been read in total (an empty or torn log file), and
+  /// the subtraction would underflow.
+  fn physical_record_offset(&self, data_len: usize) -> u64 {
+    self.end_of_buffer_offset
+      - (self.buf_end - self.buf_start) as u64
+      - HEADER_SIZE as u64
+      - data_len as u64
   }
 
   /// Seek the file to the first block that could contain `initial_offset`.

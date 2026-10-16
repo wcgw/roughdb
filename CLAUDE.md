@@ -46,12 +46,17 @@ The read path checks `mem` → `imm` → each level of SSTables (newest to oldes
   the `DbState` mutex, releases it for the WAL append / fsync / memtable insert (LevelDB's `mutex_.Unlock()` around
   `AddRecord`), then re-locks to publish `last_sequence` and retire the group.  `DbState::write_in_progress` marks
   that window; `Db::flush` waits for it before rotating the memtable or WAL.  A WAL write/sync error becomes the
-  sticky `background_error`.
+  sticky `background_error`, as does any flush or compaction failure (`record_background_error`, LevelDB's
+  `RecordBackgroundError`): a failed MANIFEST edit may or may not be on disk, so after one nothing more is
+  installed and file GC stops.
 - **Recovery watermark**: `VersionSet::last_sequence` (persisted in every MANIFEST edit) is the highest sequence
   whose data is in an SSTable, not the live write counter; `Db::open` skips WAL records at or below it.  Only a
   flush advances it (`last_sequence_at_rotation`); compactions and `reuse_logs` recovery must leave it alone, or a
   close after a compaction loses the writes still in the memtable
-  (`compaction_does_not_advance_recovery_watermark_past_unflushed_writes`).
+  (`compaction_does_not_advance_recovery_watermark_past_unflushed_writes`).  `Db::open` replays *every* `.log` at
+  or after `log_number`, not just that one: a flush switches writers to its new WAL before its MANIFEST edit names
+  it, so a crash in between leaves acknowledged writes there (`sync_write_during_flush_survives_crash`).  Each
+  replayed WAL's number is marked used (`VersionSet::mark_file_number_used`) so it is never allocated again.
 - **`src/db/compaction.rs`** — compaction planning + execution behind a pick → do → install seam.
   `pick_compaction`/`pick_range_compaction` produce a `Compaction` plan from a `Version` snapshot; `do_compaction`
   executes it with **no lock and no `DbState` dependency** (output file numbers come from an injected
@@ -269,7 +274,8 @@ what remains is compaction, the full Iterator/Snapshot API, and operational hygi
   live `.ldb` set (`VersionSet::add_live_files`), `log_number`, and `manifest_number`, then releases the lock and
   scans the directory. Keep rules: `.log` ≥ `log_number`, `MANIFEST-*` ≥ `manifest_number`, `.ldb` in live set,
   `CURRENT`/`LOCK` always kept. `parse_db_filename` mirrors LevelDB's `ParseFileName`. Called in `Db::write` after
-  `finish_flush` drops its lock. See `db/db_impl.cc: DBImpl::RemoveObsoleteFiles`.
+  `finish_flush` drops its lock. Skipped entirely while `background_error` is set: after a failed MANIFEST edit
+  neither disk nor memory says which files are obsolete. See `db/db_impl.cc: DBImpl::RemoveObsoleteFiles`.
 
 **Compaction**
 
