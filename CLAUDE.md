@@ -455,7 +455,8 @@ what remains is compaction, the full Iterator/Snapshot API, and operational hygi
   follows LevelDB and does not lock.
 - ✅ **`CompactionFilter` / `CompactionFilterFactory`** (RocksDB): `CompactionFilter` trait
   (`src/compaction_filter.rs`) with `filter(level, key, CompactionValue) -> CompactionDecision` (a `Value(&[u8])` or
-  a `Deletion`) returning `Keep`, `Remove`, or `ChangeValue(new_val)` (no effect on a deletion).  `CompactionFilterFactory` creates a fresh filter per compaction run
+  a `Deletion`) returning `Keep`, `Remove`, or `ChangeValue(new_val)` (no effect on a deletion).
+  `CompactionFilterFactory` creates a fresh filter per compaction run
   (allows per-compaction mutable state like timestamps for TTL).  `Options::compaction_filter_factory:
   Option<Arc<dyn CompactionFilterFactory>>` — `None` disables filtering (default).  The filter is called in
   `do_compaction` for the newest visible version of each key, after shadow-key pruning, before writing to the output
