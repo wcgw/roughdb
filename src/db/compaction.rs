@@ -853,6 +853,25 @@ mod tests {
   use super::*;
 
   #[test]
+  fn file_overlaps_range_honours_each_bound_kind() {
+    use std::ops::Bound::{Excluded, Included, Unbounded};
+    let cmp = crate::comparator::BytewiseComparator;
+    // A file holding user keys "c" through "f".
+    let overlaps =
+      |start: std::ops::Bound<&[u8]>, end| file_overlaps_range(b"c", b"f", (start, end), &cmp);
+    assert!(overlaps(Unbounded, Unbounded));
+    // The file's last key is the range start: in only when the start is inclusive.
+    assert!(overlaps(Included(b"f"), Unbounded));
+    assert!(!overlaps(Excluded(b"f"), Unbounded));
+    // The file's first key is the range end: in only when the end is inclusive.
+    assert!(overlaps(Unbounded, Included(b"c")));
+    assert!(!overlaps(Unbounded, Excluded(b"c")));
+    assert!(overlaps(Excluded(b"a"), Excluded(b"d")));
+    assert!(!overlaps(Included(b"g"), Unbounded));
+    assert!(!overlaps(Unbounded, Excluded(b"a")));
+  }
+
+  #[test]
   fn add_boundary_inputs_includes_same_user_key() {
     use crate::db::version::Version;
     use crate::db::version_edit::FileMetaData;
