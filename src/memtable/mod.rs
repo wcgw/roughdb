@@ -51,10 +51,18 @@ impl<T> MemtableResult<T> {
 /// `Memtable` is `Sync` (the skip list's reads are lock-free), but writes are
 /// *not* internally synchronised: [`Memtable::add`] and [`Memtable::delete`]
 /// are `unsafe fn` and require the caller to serialise writers.  `Db` does so
-/// by inserting only while holding the `DbState` mutex, matching LevelDB.
+/// by inserting only through `insert_batch` (see its `# Safety`).
 pub struct Memtable {
   table: SkipList,
   comparator: Arc<dyn Comparator>,
+}
+
+impl std::fmt::Debug for Memtable {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("Memtable")
+      .field("approximate_memory_usage", &self.approximate_memory_usage())
+      .finish_non_exhaustive()
+  }
 }
 
 impl Memtable {
@@ -159,6 +167,14 @@ pub struct MemTableIterator<'a> {
   /// Value of the current entry (empty for tombstones), borrowed from the
   /// arena.  Decoded once per position, alongside `cached_key`.
   cached_value: &'a [u8],
+}
+
+impl std::fmt::Debug for MemTableIterator<'_> {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("MemTableIterator")
+      .field("valid", &self.valid())
+      .finish_non_exhaustive()
+  }
 }
 
 impl<'a> MemTableIterator<'a> {
