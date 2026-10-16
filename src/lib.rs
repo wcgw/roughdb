@@ -22,10 +22,10 @@
 //! ## Opening a database
 //!
 //! ```no_run
-//! use roughdb::{Db, Options};
+//! use roughdb::{Db, OpenMode, Options};
 //!
 //! let mut opts = Options::default();
-//! opts.create_if_missing = true;
+//! opts.open_mode = OpenMode::CreateIfMissing;
 //!
 //! let db = Db::open("/tmp/my_db", opts)?;
 //! # Ok::<(), roughdb::Error>(())
@@ -134,7 +134,7 @@ pub use error::Error;
 pub mod filter;
 pub use filter::BloomFilterPolicy;
 pub mod options;
-pub use options::{CompressionType, FlushOptions, Options, WriteOptions};
+pub use options::{CompressionType, FlushOptions, OpenMode, Options, WriteOptions};
 pub(crate) mod coding;
 pub(crate) mod db;
 pub(crate) mod iter;
@@ -690,13 +690,13 @@ impl Db {
   /// Open (or create) a persistent database at `path`.
   ///
   /// ## New database (no `CURRENT` file)
-  /// - Returns [`Error::InvalidArgument`] if `options.create_if_missing` is `false`.
+  /// - Returns [`Error::InvalidArgument`] if `options.open_mode` is [`OpenMode::Existing`].
   /// - Creates a `MANIFEST-000002` with the initial `VersionEdit`.
   /// - Creates `CURRENT` pointing to the MANIFEST.
   /// - Creates `000001.log` as the WAL.
   ///
   /// ## Existing database (`CURRENT` file present)
-  /// - Returns [`Error::InvalidArgument`] if `options.error_if_exists` is `true`.
+  /// - Returns [`Error::InvalidArgument`] if `options.open_mode` is [`OpenMode::CreateNew`].
   /// - Recovers the `VersionSet` from the MANIFEST (loads live SSTable files).
   /// - Replays every WAL numbered at or after the MANIFEST's log number, oldest
   ///   first, skipping records whose sequence number is already reflected in
@@ -713,17 +713,20 @@ impl Db {
     let current_path = path.join("CURRENT");
     let db_exists = fs.file_exists(&current_path);
 
-    if db_exists && options.error_if_exists {
-      return Err(Error::InvalidArgument(format!(
-        "database already exists at {}",
-        path.display()
-      )));
-    }
-    if !db_exists && !options.create_if_missing {
-      return Err(Error::InvalidArgument(format!(
-        "database does not exist at {}",
-        path.display()
-      )));
+    match (db_exists, options.open_mode) {
+      (true, OpenMode::CreateNew) => {
+        return Err(Error::InvalidArgument(format!(
+          "database already exists at {}",
+          path.display()
+        )));
+      }
+      (false, OpenMode::Existing) => {
+        return Err(Error::InvalidArgument(format!(
+          "database does not exist at {}",
+          path.display()
+        )));
+      }
+      _ => {}
     }
 
     // Create the directory only when we are going to create a new database.
@@ -2796,9 +2799,9 @@ mod tests {
   }
 
   #[test]
-  fn open_fails_when_missing_and_create_if_missing_false() {
+  fn open_existing_fails_when_the_database_is_missing() {
     let dir = tempfile::tempdir().unwrap();
-    let opts = Options::default(); // create_if_missing = false
+    let opts = Options::default(); // OpenMode::Existing
     let err = Db::open(dir.path(), opts).err().unwrap();
     assert!(
       matches!(err, Error::InvalidArgument(_)),
@@ -2807,7 +2810,7 @@ mod tests {
   }
 
   #[test]
-  fn open_succeeds_when_missing_and_create_if_missing_true() {
+  fn create_if_missing_creates_a_missing_database() {
     let dir = tempfile::tempdir().unwrap();
     let db = Db::open(dir.path(), create_options()).unwrap();
     db.put(b"k", b"v").unwrap();
@@ -2815,13 +2818,13 @@ mod tests {
   }
 
   #[test]
-  fn open_fails_when_exists_and_error_if_exists_true() {
+  fn create_new_fails_when_the_database_exists() {
     let dir = tempfile::tempdir().unwrap();
     // Create the database first.
     Db::open(dir.path(), create_options()).unwrap();
-    // Second open with error_if_exists must fail.
+    // A second open that must create it fails.
     let opts = Options {
-      error_if_exists: true,
+      open_mode: crate::OpenMode::CreateNew,
       ..Options::default()
     };
     let err = Db::open(dir.path(), opts).err().unwrap();
@@ -2832,25 +2835,37 @@ mod tests {
   }
 
   #[test]
-  fn open_succeeds_when_exists_and_error_if_exists_false() {
+  fn create_new_creates_a_missing_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let opts = Options {
+      open_mode: crate::OpenMode::CreateNew,
+      ..Options::default()
+    };
+    let db = Db::open(dir.path().join("fresh"), opts).unwrap();
+    db.put(b"k", b"v").unwrap();
+    assert_eq!(db.get(b"k").unwrap().unwrap(), b"v");
+  }
+
+  #[test]
+  fn open_existing_opens_an_existing_database() {
     let dir = tempfile::tempdir().unwrap();
     Db::open(dir.path(), create_options()).unwrap();
-    // Default error_if_exists = false — reopening must succeed.
+    // The default, OpenMode::Existing, reopens it.
     let db = Db::open(dir.path(), Options::default()).unwrap();
     // DB is empty but opens without error.
     assert!(db.get(b"k").unwrap().is_none());
   }
 
   #[test]
-  fn create_if_missing_does_not_create_directory_on_failure() {
-    // When create_if_missing = false, Db::open must not create the directory.
+  fn open_existing_does_not_create_the_directory() {
+    // With OpenMode::Existing, a failed Db::open must not create the directory.
     let base = tempfile::tempdir().unwrap();
     let db_path = base.path().join("nonexistent");
     assert!(!db_path.exists());
     let _ = Db::open(&db_path, Options::default());
     assert!(
       !db_path.exists(),
-      "Db::open must not create the directory when create_if_missing = false"
+      "Db::open must not create the directory with OpenMode::Existing"
     );
   }
 
@@ -2969,7 +2984,7 @@ mod tests {
 
   fn create_options() -> Options {
     Options {
-      create_if_missing: true,
+      open_mode: crate::OpenMode::CreateIfMissing,
       ..Options::default()
     }
   }
@@ -2977,7 +2992,7 @@ mod tests {
   fn small_options() -> Options {
     // write_buffer_size small enough to flush after a handful of entries.
     Options {
-      create_if_missing: true,
+      open_mode: crate::OpenMode::CreateIfMissing,
       write_buffer_size: 512,
       ..Options::default()
     }
@@ -3195,7 +3210,7 @@ mod tests {
     let path = std::path::Path::new("/db");
 
     let opts = |fs: &Arc<dyn FileSystem>| Options {
-      create_if_missing: true,
+      open_mode: crate::OpenMode::CreateIfMissing,
       write_buffer_size: 512,
       file_system: Arc::clone(fs),
       ..Options::default()
@@ -3564,7 +3579,7 @@ mod tests {
   /// Options that produce many small flushes so L0 fills quickly.
   fn tiny_options() -> Options {
     Options {
-      create_if_missing: true,
+      open_mode: crate::OpenMode::CreateIfMissing,
       write_buffer_size: 128,
       ..Options::default()
     }
@@ -3814,7 +3829,7 @@ mod tests {
   fn paranoid_checks_does_not_break_normal_operation() {
     let dir = tempfile::tempdir().unwrap();
     let opts = Options {
-      create_if_missing: true,
+      open_mode: crate::OpenMode::CreateIfMissing,
       paranoid_checks: true,
       ..Options::default()
     };
@@ -4017,7 +4032,7 @@ mod tests {
     use std::sync::Arc;
     let fs: Arc<dyn FileSystem> = Arc::new(MemFileSystem::new());
     let opts = Options {
-      create_if_missing: true,
+      open_mode: crate::OpenMode::CreateIfMissing,
       max_file_size: 4 << 10,
       file_system: Arc::clone(&fs),
       ..Options::default()
@@ -4071,7 +4086,7 @@ mod tests {
     use std::sync::Arc;
     let fs: Arc<dyn FileSystem> = Arc::new(MemFileSystem::new());
     let opts = Options {
-      create_if_missing: true,
+      open_mode: crate::OpenMode::CreateIfMissing,
       file_system: Arc::clone(&fs),
       ..Options::default()
     };
@@ -4107,7 +4122,7 @@ mod tests {
 
   fn bloom_options() -> Options {
     Options {
-      create_if_missing: true,
+      open_mode: crate::OpenMode::CreateIfMissing,
       write_buffer_size: 512,
       filter_policy: Some(std::sync::Arc::new(crate::BloomFilterPolicy::new(10))),
       ..Options::default()
@@ -4173,10 +4188,7 @@ mod tests {
         db.put(format!("key{i:04}").as_bytes(), b"val").unwrap();
       }
     }
-    let opts_no_filter = Options {
-      create_if_missing: false,
-      ..Options::default()
-    };
+    let opts_no_filter = Options::default();
     let db2 = Db::open(dir.path(), opts_no_filter).unwrap();
     for i in 0u32..50 {
       assert_eq!(
@@ -4193,7 +4205,7 @@ mod tests {
   fn db_with_l0_files() -> (tempfile::TempDir, Db) {
     let dir = tempfile::tempdir().unwrap();
     let opts = Options {
-      create_if_missing: true,
+      open_mode: crate::OpenMode::CreateIfMissing,
       write_buffer_size: 4096, // tiny buffer → fast flush
       ..Options::default()
     };
@@ -4592,7 +4604,7 @@ mod tests {
   fn flush_placement_skips_l0_on_first_flush() {
     let dir = tempfile::tempdir().unwrap();
     let opts = Options {
-      create_if_missing: true,
+      open_mode: crate::OpenMode::CreateIfMissing,
       write_buffer_size: 4 * 1024,
       max_file_size: 2 * 1024 * 1024,
       block_cache: None,
@@ -4632,7 +4644,7 @@ mod tests {
   fn flush_placement_stays_at_l0_when_overlap() {
     let dir = tempfile::tempdir().unwrap();
     let opts = Options {
-      create_if_missing: true,
+      open_mode: crate::OpenMode::CreateIfMissing,
       write_buffer_size: 4 * 1024,
       max_file_size: 2 * 1024 * 1024,
       block_cache: None,
@@ -4672,7 +4684,7 @@ mod tests {
     let dir = tempfile::tempdir().unwrap();
     let value_size = 1024usize; // 1 KiB per value
     let opts = Options {
-      create_if_missing: true,
+      open_mode: crate::OpenMode::CreateIfMissing,
       write_buffer_size: 32 * 1024,
       max_file_size: 64 * 1024,
       // Disable block cache and filter to avoid interference.
@@ -4727,7 +4739,7 @@ mod tests {
     // after the DB is opened and a compaction cycle runs, L2 gains the file.
     let dir = tempfile::tempdir().unwrap();
     let opts = Options {
-      create_if_missing: true,
+      open_mode: crate::OpenMode::CreateIfMissing,
       write_buffer_size: 512,
       max_file_size: 64 * 1024,
       block_cache: None,
@@ -4774,7 +4786,7 @@ mod tests {
     //   - Verify all keys remain readable after compaction.
     let dir = tempfile::tempdir().unwrap();
     let opts = Options {
-      create_if_missing: true,
+      open_mode: crate::OpenMode::CreateIfMissing,
       write_buffer_size: 512,
       max_file_size: 2 * 1024,
       block_cache: None,
@@ -4936,7 +4948,7 @@ mod tests {
     // compaction loop should fire and reduce L0.
     let dir = tempfile::tempdir().unwrap();
     let opts = Options {
-      create_if_missing: true,
+      open_mode: crate::OpenMode::CreateIfMissing,
       write_buffer_size: 512,
       max_file_size: 4 * 1024,
       block_cache: None,
@@ -5256,7 +5268,7 @@ mod tests {
   fn custom_comparator_persistent() {
     let dir = tempfile::tempdir().unwrap();
     let opts = Options {
-      create_if_missing: true,
+      open_mode: crate::OpenMode::CreateIfMissing,
       comparator: std::sync::Arc::new(ReverseBytewiseComparator),
       ..Options::default()
     };
@@ -5283,7 +5295,7 @@ mod tests {
     // Create with reverse comparator.
     {
       let opts = Options {
-        create_if_missing: true,
+        open_mode: crate::OpenMode::CreateIfMissing,
         comparator: std::sync::Arc::new(ReverseBytewiseComparator),
         ..Options::default()
       };
@@ -5440,7 +5452,7 @@ mod tests {
   fn compaction_filter_removes_keys() {
     let dir = tempfile::tempdir().unwrap();
     let opts = Options {
-      create_if_missing: true,
+      open_mode: crate::OpenMode::CreateIfMissing,
       write_buffer_size: 512,
       max_file_size: 4 * 1024,
       block_cache: None,
@@ -5483,7 +5495,7 @@ mod tests {
   fn compaction_filter_changes_values() {
     let dir = tempfile::tempdir().unwrap();
     let opts = Options {
-      create_if_missing: true,
+      open_mode: crate::OpenMode::CreateIfMissing,
       write_buffer_size: 512,
       max_file_size: 4 * 1024,
       block_cache: None,
@@ -5765,7 +5777,7 @@ mod tests {
       Db::open(
         "/db",
         Options {
-          create_if_missing: true,
+          open_mode: crate::OpenMode::CreateIfMissing,
           file_system: fs,
           ..Options::default()
         },
@@ -5820,7 +5832,7 @@ mod tests {
     let fs: Arc<dyn FileSystem> = Arc::new(MemFileSystem::new());
     let path = std::path::Path::new("/db");
     let opts = |fs: &Arc<dyn FileSystem>| Options {
-      create_if_missing: true,
+      open_mode: crate::OpenMode::CreateIfMissing,
       write_buffer_size: 4096,
       file_system: Arc::clone(fs),
       ..Options::default()
@@ -5871,7 +5883,7 @@ mod tests {
     let db = Db::open(
       "/db",
       Options {
-        create_if_missing: true,
+        open_mode: crate::OpenMode::CreateIfMissing,
         file_system: fs,
         ..Options::default()
       },
@@ -5902,7 +5914,7 @@ mod tests {
     let fs: Arc<dyn FileSystem> = Arc::new(MemFileSystem::new());
     let path = std::path::Path::new("/db");
     let opts = |fs: &Arc<dyn FileSystem>| Options {
-      create_if_missing: true,
+      open_mode: crate::OpenMode::CreateIfMissing,
       file_system: Arc::clone(fs),
       ..Options::default()
     };
@@ -5960,7 +5972,7 @@ mod tests {
     let db = Db::open(
       "/db",
       Options {
-        create_if_missing: true,
+        open_mode: crate::OpenMode::CreateIfMissing,
         file_system: fs,
         ..Options::default()
       },
@@ -5999,7 +6011,7 @@ mod tests {
     use crate::env::MemFileSystem;
     use std::sync::Arc;
     let opts = |fs| Options {
-      create_if_missing: true,
+      open_mode: crate::OpenMode::CreateIfMissing,
       file_system: fs,
       ..Options::default()
     };
@@ -6036,7 +6048,7 @@ mod tests {
     // Keep the replayed memtable on open, so the recovered write stays in
     // the WAL rather than being flushed to an SSTable by `Db::open`.
     let opts = |fs| Options {
-      create_if_missing: true,
+      open_mode: crate::OpenMode::CreateIfMissing,
       reuse_logs: true,
       file_system: fs,
       ..Options::default()
@@ -6074,7 +6086,7 @@ mod tests {
     use std::sync::Arc;
     let (fs, gate) = gated_fs::GatedFs::gated();
     let opts = || Options {
-      create_if_missing: true,
+      open_mode: crate::OpenMode::CreateIfMissing,
       file_system: Arc::clone(&fs),
       ..Options::default()
     };
@@ -6098,7 +6110,7 @@ mod tests {
     use std::sync::Arc;
     let (fs, gate) = gated_fs::GatedFs::gated();
     let opts = || Options {
-      create_if_missing: true,
+      open_mode: crate::OpenMode::CreateIfMissing,
       file_system: Arc::clone(&fs),
       ..Options::default()
     };
@@ -6125,7 +6137,7 @@ mod tests {
     use std::sync::Arc;
     let (fs, gate) = gated_fs::GatedFs::gated();
     let opts = || Options {
-      create_if_missing: true,
+      open_mode: crate::OpenMode::CreateIfMissing,
       file_system: Arc::clone(&fs),
       ..Options::default()
     };
@@ -6158,7 +6170,7 @@ mod tests {
     let db = Db::open(
       "/db",
       Options {
-        create_if_missing: true,
+        open_mode: crate::OpenMode::CreateIfMissing,
         file_system: fs,
         ..Options::default()
       },
@@ -6216,7 +6228,7 @@ mod tests {
     use std::sync::Arc;
     let (fs, gate) = gated_fs::GatedFs::gated();
     let opts = || Options {
-      create_if_missing: true,
+      open_mode: crate::OpenMode::CreateIfMissing,
       file_system: Arc::clone(&fs),
       ..Options::default()
     };
@@ -6245,7 +6257,7 @@ mod tests {
     let db = Db::open(
       "/db",
       Options {
-        create_if_missing: true,
+        open_mode: crate::OpenMode::CreateIfMissing,
         file_system: fs,
         ..Options::default()
       },
@@ -6270,7 +6282,7 @@ mod tests {
     use std::sync::Arc;
     let fs: Arc<dyn FileSystem> = Arc::new(MemFileSystem::new());
     let opts = || Options {
-      create_if_missing: true,
+      open_mode: crate::OpenMode::CreateIfMissing,
       file_system: Arc::clone(&fs),
       ..Options::default()
     };
@@ -6293,7 +6305,7 @@ mod tests {
     use std::sync::Arc;
     let fs: Arc<dyn FileSystem> = Arc::new(MemFileSystem::new());
     let opts = || Options {
-      create_if_missing: true,
+      open_mode: crate::OpenMode::CreateIfMissing,
       file_system: Arc::clone(&fs),
       ..Options::default()
     };

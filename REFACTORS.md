@@ -73,9 +73,11 @@ change no public API.  Items 6–10 do, and are acceptable as a 0.x minor bump.
   slices such as `start..=end`; literal keys need `.as_slice()`).  The old `get_approximate_sizes` docs claimed an
   empty `limit` meant "to the end": it sorts first, so such a range measured 0 bytes; the claim is gone.
 
-- [ ] **9. Open mode as an enum.**  `Options::create_if_missing` and `error_if_exists` admit "may not create, must
+- [x] **9. Open mode as an enum.**  `Options::create_if_missing` and `error_if_exists` admit "may not create, must
   not exist", which can only fail.  One `OpenMode` (open existing / open or create / create new, like
   `std::fs::OpenOptions`) replaces both; clippy's `struct_excessive_bools` flags `Options` today.
+  *Done:* `Options::open_mode: OpenMode::{Existing (default), CreateIfMissing, CreateNew}`, `#[non_exhaustive]` and
+  re-exported at the crate root; `struct_excessive_bools` no longer fires.
 
 - [ ] **10. `WriteBatch` iteration as an iterator.**  `iterate(&mut dyn Handler)` is a visitor callback; an
   iterator of `BatchOp`s is the idiomatic shape.  `Inserter` becomes a plain loop and the public `Handler` trait

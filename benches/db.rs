@@ -221,7 +221,7 @@ fn compaction_benchmarks(c: &mut Criterion) {
       || {
         let dir = tempfile::tempdir().unwrap();
         let opts = Options {
-          create_if_missing: true,
+          open_mode: roughdb::OpenMode::CreateIfMissing,
           ..Options::default()
         };
         let db = Db::open(dir.path(), opts).unwrap();
@@ -245,7 +245,7 @@ fn compaction_benchmarks(c: &mut Criterion) {
       || {
         let dir = tempfile::tempdir().unwrap();
         let opts = Options {
-          create_if_missing: true,
+          open_mode: roughdb::OpenMode::CreateIfMissing,
           ..Options::default()
         };
         let db = Db::open(dir.path(), opts).unwrap();
@@ -286,7 +286,7 @@ fn disk_read_benchmarks(c: &mut Criterion) {
 
   let dir = tempfile::tempdir().unwrap();
   let opts = Options {
-    create_if_missing: true,
+    open_mode: roughdb::OpenMode::CreateIfMissing,
     max_file_size: 64 << 10,
     ..Options::default()
   };
@@ -342,7 +342,7 @@ fn concurrency_benchmarks(c: &mut Criterion) {
 
   let dir = tempfile::tempdir().unwrap();
   let opts = Options {
-    create_if_missing: true,
+    open_mode: roughdb::OpenMode::CreateIfMissing,
     ..Options::default()
   };
   let db = Arc::new(Db::open(dir.path(), opts).unwrap());

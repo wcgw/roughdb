@@ -24,7 +24,7 @@ pub enum Error {
   /// malformed block, log record or MANIFEST edit.
   Corruption(String),
   /// The operation cannot accept an argument, or the database's state, as
-  /// given: e.g. opening a missing database without `create_if_missing`.
+  /// given: e.g. opening a missing database with `OpenMode::Existing`.
   InvalidArgument(String),
   /// The data asks for something this build does not support, such as an
   /// unknown compression type.

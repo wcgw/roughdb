@@ -66,7 +66,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
   let cli = Cli::parse();
 
   let opts = roughdb::Options {
-    create_if_missing: true,
+    open_mode: roughdb::OpenMode::CreateIfMissing,
     ..Default::default()
   };
   let db = Db::open(&cli.dir, opts)?;

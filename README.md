@@ -24,10 +24,10 @@ cargo add roughdb
 ### Opening a database
 
 ```rust
-use roughdb::{Db, Options};
+use roughdb::{Db, OpenMode, Options};
 
-let opts = roughdb::Options {
-    create_if_missing: true,
+let opts = Options {
+    open_mode: OpenMode::CreateIfMissing,
     ..Default::default()
 };
 
