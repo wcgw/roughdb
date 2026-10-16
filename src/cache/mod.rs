@@ -18,7 +18,7 @@
 //! already cloned the `Arc<Vec<u8>>` remains valid independently.
 //!
 //! The key is `(cache_id, block_offset)`.  Each `Table` gets a unique `cache_id`
-//! from [`BlockCache::new_id`] so blocks from different files never collide even
+//! from `BlockCache::new_id` so blocks from different files never collide even
 //! when file numbers are reused after compaction.
 //!
 //! Default capacity: 8 MiB (matching LevelDB's `Options::block_cache` default).

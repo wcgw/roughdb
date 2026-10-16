@@ -384,8 +384,8 @@ impl FlushState {
         *self = FlushState::Writing(Arc::clone(&prep.old_mem));
         Some(prep)
       }
-      other => {
-        *self = other;
+      not_pending @ (FlushState::Idle | FlushState::Writing(_)) => {
+        *self = not_pending;
         None
       }
     }
@@ -739,6 +739,13 @@ impl Db {
   /// immediately rather than blocking.  The lock is released when the `Db` is dropped.
   ///
   /// `Db::default()` is retained for in-memory / test use (no WAL, no flush).
+  ///
+  /// # Errors
+  ///
+  /// [`Error::InvalidArgument`] if `options.open_mode` rules the database out (see
+  /// above), or if it was created with a comparator of a different name;
+  /// [`Error::IoError`] if another process holds the `LOCK` or a file operation
+  /// fails; [`Error::Corruption`] if `CURRENT` or the MANIFEST is damaged.
   pub fn open<P: AsRef<std::path::Path>>(path: P, options: Options) -> Result<Self, Error> {
     let path = path.as_ref();
     let fs = Arc::clone(&options.file_system);
@@ -941,6 +948,11 @@ impl Db {
   /// Equivalent to calling [`get_with_options`] with [`ReadOptions::default`].
   ///
   /// [`get_with_options`]: Db::get_with_options
+  ///
+  /// # Errors
+  ///
+  /// [`Error::IoError`] if reading an SSTable fails, [`Error::Corruption`] if one is
+  /// damaged, or [`Error::NotSupported`] for a block compressed with an unknown codec.
   pub fn get<K>(&self, key: K) -> Result<Option<Vec<u8>>, Error>
   where
     K: AsRef<[u8]>,
@@ -964,6 +976,16 @@ impl Db {
   /// the read sees all writes committed before this call.
   ///
   /// See `db/db_impl.cc: DBImpl::Get`.
+  ///
+  /// # Errors
+  ///
+  /// [`Error::IoError`] if reading an SSTable fails, [`Error::Corruption`] if one is
+  /// damaged, or [`Error::NotSupported`] for a block compressed with an unknown codec.
+  ///
+  /// # Panics
+  ///
+  /// Only if a panic on another thread left the database's internal lock
+  /// poisoned, which is a bug.
   pub fn get_with_options<K>(&self, opts: &ReadOptions, key: K) -> Result<Option<Vec<u8>>, Error>
   where
     K: AsRef<[u8]>,
@@ -1034,6 +1056,11 @@ impl Db {
   /// longer than necessary.
   ///
   /// See `include/leveldb/db.h: DB::GetSnapshot`.
+  ///
+  /// # Panics
+  ///
+  /// Only if a panic on another thread left the database's internal lock
+  /// poisoned, which is a bug.
   pub fn snapshot(&self) -> Snapshot<'_> {
     let mut state = self.inner.state.lock().unwrap();
     let seq = state.last_sequence;
@@ -1054,6 +1081,11 @@ impl Db {
   /// | `"leveldb.approximate-memory-usage"` | Memtable bytes as a decimal string |
   ///
   /// See `include/leveldb/db.h: DB::GetProperty`.
+  ///
+  /// # Panics
+  ///
+  /// Only if a panic on another thread left the database's internal lock
+  /// poisoned, which is a bug.
   pub fn property(&self, property: &str) -> Option<String> {
     let prop = property.strip_prefix("leveldb.")?;
 
@@ -1113,6 +1145,11 @@ impl Db {
   ///
   /// See `include/leveldb/db.h: DB::GetApproximateSizes` and
   /// `db/db_impl.cc: DBImpl::GetApproximateSizes`.
+  ///
+  /// # Panics
+  ///
+  /// Only if a panic on another thread left the database's internal lock
+  /// poisoned, which is a bug.
   pub fn approximate_sizes(&self, ranges: &[Range<&[u8]>]) -> Vec<u64> {
     use crate::table::format::{make_internal_key, MAX_SEQUENCE_NUMBER, VALUE_TYPE_FOR_SEEK};
 
@@ -1136,6 +1173,12 @@ impl Db {
       .collect()
   }
 
+  /// Set `key` to `value`, replacing any previous value.  A shorthand for a
+  /// [`write`](Db::write) of a one-operation batch with default options.
+  ///
+  /// # Errors
+  ///
+  /// As for [`write`](Db::write).
   pub fn put<K, V>(&self, key: K, value: V) -> Result<(), Error>
   where
     K: AsRef<[u8]>,
@@ -1146,6 +1189,12 @@ impl Db {
     self.write(&WriteOptions::default(), batch)
   }
 
+  /// Delete `key`; deleting an absent key succeeds.  A shorthand for a
+  /// [`write`](Db::write) of a one-operation batch with default options.
+  ///
+  /// # Errors
+  ///
+  /// As for [`write`](Db::write).
   pub fn delete<K>(&self, key: K) -> Result<(), Error>
   where
     K: AsRef<[u8]>,
@@ -1162,6 +1211,16 @@ impl Db {
   ///
   /// The memtable(s) and all SSTable file handles are pinned for the lifetime
   /// of the returned `DbIter`; reads and writes proceed concurrently.
+  ///
+  /// # Errors
+  ///
+  /// [`Error::IoError`] or [`Error::Corruption`] if an SSTable cannot be opened.
+  /// Errors met while iterating are reported by [`DbIter::status`].
+  ///
+  /// # Panics
+  ///
+  /// Only if a panic on another thread left the database's internal lock
+  /// poisoned, which is a bug.
   pub fn new_iterator(&self, opts: &ReadOptions<'_>) -> Result<DbIter, Error> {
     use crate::db::db_iter::DbIterator;
     use crate::db::merge_iter::MergingIterator;
@@ -1225,6 +1284,11 @@ impl Db {
   /// Returns `Ok(())` if `path` does not exist.
   ///
   /// See `db/db_impl.cc: DestroyDB`.
+  ///
+  /// # Errors
+  ///
+  /// [`Error::IoError`] if the lock cannot be acquired or the directory cannot be
+  /// listed.  Failures to remove individual files are ignored.
   pub fn destroy<P: AsRef<std::path::Path>>(path: P) -> Result<(), Error> {
     let path = path.as_ref();
     let fs: Arc<dyn crate::env::FileSystem> = Arc::new(crate::env::PosixFileSystem);
@@ -1277,11 +1341,18 @@ impl Db {
   /// compaction the updated version is used for the next level, so newly
   /// created files are eligible for further compaction in the same call.
   ///
-  /// A failed compaction stops the database, as a failed flush does: the error
-  /// is returned here and by every later write, flush, and `compact_range`
-  /// until the database is reopened.
-  ///
   /// No-op for in-memory databases (`Db::default()`).
+  ///
+  /// # Errors
+  ///
+  /// A failed compaction stops the database, as a failed flush does: its
+  /// error is returned here and by every later write, flush, and
+  /// `compact_range` until the database is reopened.
+  ///
+  /// # Panics
+  ///
+  /// Only if a panic on another thread left the database's internal lock
+  /// poisoned, which is a bug.
   pub fn compact_range<'k>(&self, range: impl RangeBounds<&'k [u8]>) -> Result<(), Error> {
     use crate::db::version::NUM_LEVELS;
 
@@ -1340,6 +1411,17 @@ impl Db {
   /// Always a no-op on in-memory databases (`Db::default()`).
   ///
   /// See `include/rocksdb/db.h: DB::Flush`.
+  ///
+  /// # Errors
+  ///
+  /// The database's sticky error: a failed WAL write ([`Error::IoError`]), or an
+  /// earlier failed flush or compaction, which every later call returns until the
+  /// database is reopened.  With `opts.wait`, that includes this flush failing.
+  ///
+  /// # Panics
+  ///
+  /// Only if a panic on another thread left the database's internal lock
+  /// poisoned, which is a bug.
   pub fn flush(&self, opts: &FlushOptions) -> Result<(), Error> {
     let mut g = self.inner.state.lock().unwrap();
 
@@ -1430,6 +1512,17 @@ impl Db {
   /// readers and the background thread are never blocked on a disk write.  See `write_in_progress`.
   ///
   /// See `db/db_impl.cc: DBImpl::Write`.
+  ///
+  /// # Errors
+  ///
+  /// The database's sticky error: a failed WAL write ([`Error::IoError`]), or an
+  /// earlier failed flush or compaction, which every later write returns until the
+  /// database is reopened.
+  ///
+  /// # Panics
+  ///
+  /// Only if a panic on another thread left the database's internal lock
+  /// poisoned, which is a bug.
   pub fn write(&self, opts: &WriteOptions, batch: WriteBatch) -> Result<(), Error> {
     // ── Phase 1: Enqueue this write request ──────────────────────────────────
     //
@@ -1627,6 +1720,11 @@ impl Db {
   /// database open.  Call [`Db::open`] after repair to use the recovered database.
   ///
   /// See `db/repair.cc: RepairDB`.
+  ///
+  /// # Errors
+  ///
+  /// [`Error::IoError`] if the directory cannot be read or the new MANIFEST or
+  /// `CURRENT` cannot be written.  Damaged files are skipped, not reported.
   pub fn repair<P: AsRef<std::path::Path>>(path: P, options: Options) -> Result<(), Error> {
     use crate::iter::InternalIterator;
     use crate::table::format::parse_internal_key;
@@ -1656,7 +1754,7 @@ impl Db {
           FileKind::Log => logs.push(number),
           FileKind::Table => table_numbers.push(number),
           FileKind::Manifest => manifests.push(name.to_string()),
-          _ => {}
+          FileKind::Current | FileKind::Lock | FileKind::Temp => {}
         }
       }
     }

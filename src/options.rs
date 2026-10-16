@@ -53,12 +53,16 @@ pub struct Options {
   /// Aggressively check data integrity; stop early on any detected error.
   ///
   /// When set, acts as a database-wide `verify_checksums = true`: every SSTable block read
-  /// (both point lookups via [`Db::get`] and iterator block reads) verifies its CRC32c checksum,
-  /// and WAL and MANIFEST records are checksum-verified during recovery.  Any mismatch returns
-  /// [`Error::Corruption`].
+  /// (both point lookups via [`Db::get`] and iterator block reads) verifies its CRC32c
+  /// checksum, and WAL and MANIFEST records are checksum-verified during recovery.  Any
+  /// mismatch returns [`Error::Corruption`].
   ///
   /// This flag is OR-ed with [`ReadOptions::verify_checksums`] on each individual read, so
   /// per-read verification can also be enabled independently.
+  ///
+  /// [`Db::get`]: crate::Db::get
+  /// [`Error::Corruption`]: crate::Error::Corruption
+  /// [`ReadOptions::verify_checksums`]: crate::ReadOptions::verify_checksums
   ///
   /// Default: false.
   pub paranoid_checks: bool,

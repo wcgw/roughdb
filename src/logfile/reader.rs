@@ -116,7 +116,9 @@ impl Reader {
             self.resyncing = false;
             continue;
           }
-          _ => self.resyncing = false,
+          PhysKind::Rec(RecordType::Zero | RecordType::Full | RecordType::First)
+          | PhysKind::Eof
+          | PhysKind::Bad => self.resyncing = false,
         }
       }
 

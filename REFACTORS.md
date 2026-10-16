@@ -112,6 +112,9 @@ change no public API.  Items 6–10 do, and are acceptable as a 0.x minor bump.
 - [x] `Drop for Db` reports a background-thread panic instead of discarding it (`t.join().ok()`).  *Done:* logged
   at error level; not re-raised, since panicking in `drop` aborts when already unwinding.  Untested: nothing can
   make the background thread panic on demand.
-- [ ] Public functions document `# Errors` and `# Panics` (34 and 8 missing under clippy's pedantic lints); the 4
-  wildcard matches on crate enums become exhaustive.
+- [x] Public functions document `# Errors` and `# Panics` (34 and 8 missing under clippy's pedantic lints); the 4
+  wildcard matches on crate enums become exhaustive.  *Done:* every `Db` method and `FileSystem` / file-trait method
+  documents its errors (`put` and `delete` had no docs at all); the `# Panics` sections name the only cause, a lock
+  poisoned by an earlier panic.  The wildcard over `std::cmp::Ordering` in `skiplist.rs` stays.  The four broken
+  intra-doc links `cargo doc` warned about are fixed too.
 - [ ] `Cargo.toml` declares a `rust-version`.

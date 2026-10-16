@@ -33,10 +33,18 @@ use std::sync::Arc;
 pub trait SequentialFile: Send {
   /// Read up to `buf.len()` bytes into `buf`.  Returns the number of bytes
   /// read (0 at EOF).
+  ///
+  /// # Errors
+  ///
+  /// [`Error::IoError`] if the read fails.
   fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error>;
 
   /// Skip `n` bytes from the current position.  This may be faster than
   /// reading and discarding for backends that support seeking.
+  ///
+  /// # Errors
+  ///
+  /// [`Error::IoError`] if the file cannot be advanced.
   fn skip(&mut self, n: u64) -> Result<(), Error>;
 }
 
@@ -46,6 +54,10 @@ pub trait SequentialFile: Send {
 pub trait RandomAccessFile: Send + Sync {
   /// Read up to `buf.len()` bytes starting at `offset`.  Returns the number
   /// of bytes read (may be less than `buf.len()` near EOF).
+  ///
+  /// # Errors
+  ///
+  /// [`Error::IoError`] if the read fails.
   fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<usize, Error>;
 }
 
@@ -55,12 +67,24 @@ pub trait RandomAccessFile: Send + Sync {
 /// to the OS and [`sync`](WritableFile::sync) to `fsync`.
 pub trait WritableFile: Send {
   /// Append `data` to the file.
+  ///
+  /// # Errors
+  ///
+  /// [`Error::IoError`] if the write fails.
   fn write(&mut self, data: &[u8]) -> Result<(), Error>;
 
   /// Flush any internal buffer to the OS page cache.
+  ///
+  /// # Errors
+  ///
+  /// [`Error::IoError`] if the flush fails.
   fn flush(&mut self) -> Result<(), Error>;
 
   /// Durably persist all previously written data (`fsync`).
+  ///
+  /// # Errors
+  ///
+  /// [`Error::IoError`] if the data cannot be made durable.
   fn sync(&mut self) -> Result<(), Error>;
 }
 
@@ -74,38 +98,77 @@ pub trait FileLock: Send + Sync {}
 /// Pluggable filesystem backend.
 ///
 /// All database I/O (file creation, reading, writing, directory operations,
-/// and file locking) goes through this trait.
+/// and file locking) goes through this trait.  Implementations report every
+/// failure as [`Error::IoError`]; the database wraps it in context where it
+/// matters (e.g. "cannot open SSTable") and treats any as fatal for the
+/// operation at hand.
 ///
 /// See `include/rocksdb/file_system.h: FileSystem`.
 pub trait FileSystem: Send + Sync {
   /// Open an existing file for sequential reading.
+  ///
+  /// # Errors
+  ///
+  /// [`Error::IoError`] if the file does not exist or cannot be opened.
   fn open_sequential(&self, path: &Path) -> Result<Box<dyn SequentialFile>, Error>;
 
   /// Open an existing file for random-access reading (pread).
+  ///
+  /// # Errors
+  ///
+  /// [`Error::IoError`] if the file does not exist or cannot be opened.
   fn open_random_access(&self, path: &Path) -> Result<Arc<dyn RandomAccessFile>, Error>;
 
   /// Open an existing file for appending (used to resume a WAL or MANIFEST).
+  ///
+  /// # Errors
+  ///
+  /// [`Error::IoError`] if the file cannot be opened.
   fn open_appendable(&self, path: &Path) -> Result<Box<dyn WritableFile>, Error>;
 
   /// Create a new file for writing (truncates if it exists).
+  ///
+  /// # Errors
+  ///
+  /// [`Error::IoError`] if the file cannot be created.
   fn create_writable(&self, path: &Path) -> Result<Box<dyn WritableFile>, Error>;
 
   /// Return the size of the file in bytes.
+  ///
+  /// # Errors
+  ///
+  /// [`Error::IoError`] if the file does not exist or cannot be inspected.
   fn file_size(&self, path: &Path) -> Result<u64, Error>;
 
   /// Returns `true` if the path exists.
   fn file_exists(&self, path: &Path) -> bool;
 
   /// Atomically rename `src` to `dst`.
+  ///
+  /// # Errors
+  ///
+  /// [`Error::IoError`] if the rename fails.
   fn rename(&self, src: &Path, dst: &Path) -> Result<(), Error>;
 
   /// Delete a file.
+  ///
+  /// # Errors
+  ///
+  /// [`Error::IoError`] if the file does not exist or cannot be deleted.
   fn remove_file(&self, path: &Path) -> Result<(), Error>;
 
   /// Create directory and all parent directories.
+  ///
+  /// # Errors
+  ///
+  /// [`Error::IoError`] if a directory cannot be created.
   fn create_dir_all(&self, path: &Path) -> Result<(), Error>;
 
   /// Remove an empty directory.
+  ///
+  /// # Errors
+  ///
+  /// [`Error::IoError`] if the directory does not exist, is not empty, or cannot be removed.
   fn remove_dir(&self, path: &Path) -> Result<(), Error>;
 
   /// Durably persist the directory entries of `path` (`fsync` on the directory).
@@ -113,14 +176,25 @@ pub trait FileSystem: Send + Sync {
   /// Required after creating or renaming a file for the new directory entry to
   /// survive a crash — syncing the file itself only persists its contents.
   /// Backends without directory metadata (e.g. in-memory) may no-op.
+  ///
+  /// # Errors
+  ///
+  /// [`Error::IoError`] if the directory cannot be synced.
   fn sync_dir(&self, path: &Path) -> Result<(), Error>;
 
   /// List the names of files and subdirectories in `path`.
+  ///
+  /// # Errors
+  ///
+  /// [`Error::IoError`] if the directory cannot be listed.
   fn children(&self, path: &Path) -> Result<Vec<String>, Error>;
 
   /// Acquire an exclusive, non-blocking file lock.
   ///
-  /// Returns `Err` immediately if the lock is held by another process.
+  /// # Errors
+  ///
+  /// [`Error::IoError`], immediately, if another process holds the lock, or if
+  /// the lock file cannot be opened.
   fn lock_file(&self, path: &Path) -> Result<Box<dyn FileLock>, Error>;
 
   /// Write `data` to `path` durably (create or overwrite, then `fsync`).
@@ -128,6 +202,10 @@ pub trait FileSystem: Send + Sync {
   /// Not atomic: a crash mid-write can leave a truncated file.  Callers that
   /// need atomic replacement must write to a temporary file and [`rename`]
   /// (see `write_current_file` in `db/version_set.rs`).
+  ///
+  /// # Errors
+  ///
+  /// [`Error::IoError`] if creating, writing or syncing the file fails.
   ///
   /// [`rename`]: FileSystem::rename
   fn write_string_to_file(&self, path: &Path, data: &str) -> Result<(), Error> {
@@ -139,6 +217,11 @@ pub trait FileSystem: Send + Sync {
   }
 
   /// Read the entire contents of `path` as a UTF-8 string.
+  ///
+  /// # Errors
+  ///
+  /// [`Error::IoError`] if the file cannot be opened or read, or
+  /// [`Error::Corruption`] if its contents are not UTF-8.
   fn read_string_from_file(&self, path: &Path) -> Result<String, Error> {
     let mut f = self.open_sequential(path)?;
     let mut buf = Vec::new();
