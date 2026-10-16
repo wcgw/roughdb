@@ -6288,4 +6288,60 @@ mod tests {
     wait_for_background_error(&db);
     assert!(db.put(b"b", b"1").is_err());
   }
+
+  // ── Log files shorter than a record header ──────────────────────────────────
+
+  /// Right after a flush the current WAL is empty, and repair reads every WAL.
+  #[test]
+  fn repair_after_a_flush_keeps_the_data() {
+    use crate::env::{FileSystem, MemFileSystem};
+    use std::sync::Arc;
+    let fs: Arc<dyn FileSystem> = Arc::new(MemFileSystem::new());
+    let opts = || Options {
+      create_if_missing: true,
+      file_system: Arc::clone(&fs),
+      ..Options::default()
+    };
+    let db = Db::open("/db", opts()).unwrap();
+    db.put(b"a", b"1").unwrap();
+    db.flush(&crate::FlushOptions { wait: true }).unwrap();
+    drop(db);
+
+    Db::repair("/db", opts()).unwrap();
+    let db = Db::open("/db", opts()).unwrap();
+    assert_eq!(db.get(b"a").unwrap(), b"1");
+  }
+
+  /// A crash during the first write to a fresh WAL can leave less than one
+  /// record header in it: a torn write, which recovery skips.
+  #[test]
+  fn open_skips_a_wal_holding_a_torn_first_header() {
+    use crate::env::{FileSystem, MemFileSystem};
+    use std::path::Path;
+    use std::sync::Arc;
+    let fs: Arc<dyn FileSystem> = Arc::new(MemFileSystem::new());
+    let opts = || Options {
+      create_if_missing: true,
+      file_system: Arc::clone(&fs),
+      ..Options::default()
+    };
+    let db = Db::open("/db", opts()).unwrap();
+    db.put(b"a", b"1").unwrap();
+    db.flush(&crate::FlushOptions { wait: true }).unwrap();
+    drop(db);
+
+    // The flush left one, empty, WAL behind.  Tear its first header.
+    let wal = fs
+      .children(Path::new("/db"))
+      .unwrap()
+      .into_iter()
+      .find(|name| name.ends_with(".log"))
+      .unwrap();
+    let mut file = fs.open_appendable(&Path::new("/db").join(wal)).unwrap();
+    file.write(&[0x12, 0x34, 0x56]).unwrap();
+    drop(file);
+
+    let db = Db::open("/db", opts()).unwrap();
+    assert_eq!(db.get(b"a").unwrap(), b"1");
+  }
 }
