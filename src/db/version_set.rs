@@ -12,7 +12,7 @@
 
 use crate::db::table_cache::TableCache;
 use crate::db::version::Version;
-use crate::db::version_edit::{FileMetaData, VersionEdit};
+use crate::db::version_edit::{CompactPointer, DeletedFile, FileMetaData, NewFile, VersionEdit};
 use crate::error::Error;
 use crate::logfile::reader::Reader as LogReader;
 use crate::logfile::writer::Writer as LogWriter;
@@ -83,7 +83,38 @@ pub(crate) struct VersionSet {
   comparator: Arc<dyn crate::comparator::Comparator>,
 }
 
+/// The MANIFEST of an in-memory database, which never records an edit: such a
+/// database never flushes or compacts, so a write here is a bug.
+struct NoManifest;
+
+impl crate::env::WritableFile for NoManifest {
+  fn write(&mut self, _data: &[u8]) -> Result<(), Error> {
+    unreachable!("an in-memory database applied a VersionEdit")
+  }
+  fn flush(&mut self) -> Result<(), Error> {
+    unreachable!("an in-memory database applied a VersionEdit")
+  }
+  fn sync(&mut self) -> Result<(), Error> {
+    unreachable!("an in-memory database applied a VersionEdit")
+  }
+}
+
 impl VersionSet {
+  /// The `VersionSet` of an in-memory database: an empty `Version` that never
+  /// changes, and no MANIFEST.  `log_and_apply` on it panics.
+  pub(crate) fn in_memory(comparator: Arc<dyn crate::comparator::Comparator>) -> Self {
+    VersionSet {
+      current: Arc::new(Version::new(Arc::clone(&comparator))),
+      next_file_number: 1,
+      last_sequence: 0,
+      log_number: 0,
+      manifest_log: LogWriter::new(Box::new(NoManifest), 0),
+      manifest_number: 0,
+      compact_pointer: std::array::from_fn(|_| Vec::new()),
+      comparator,
+    }
+  }
+
   /// Create a brand-new `VersionSet` for a database that has never been opened.
   ///
   /// - Creates `MANIFEST-000002` and writes the initial `VersionEdit`.
@@ -220,13 +251,11 @@ impl VersionSet {
     let mut new_files: [Vec<Arc<FileMetaData>>; 7] =
       std::array::from_fn(|i| self.current.files_at(i).to_vec());
 
-    for &(level, number) in &edit.deleted_files {
-      let level = level as usize;
+    for &DeletedFile { level, number } in &edit.deleted_files {
       new_files[level].retain(|m| m.number != number);
       tc.evict(number);
     }
-    for (level, meta) in &edit.new_files {
-      let level = *level as usize;
+    for &NewFile { level, ref meta } in &edit.new_files {
       if level == 0 {
         // L0: newest-first — prepend.
         new_files[0].insert(0, Arc::clone(meta));
@@ -248,8 +277,8 @@ impl VersionSet {
     }
 
     // Apply compact-pointer updates from this edit.
-    for (level, key) in &edit.compact_pointers {
-      self.compact_pointer[*level as usize] = key.clone();
+    for CompactPointer { level, key } in &edit.compact_pointers {
+      self.compact_pointer[*level] = key.clone();
     }
 
     let mut v = Version::from_files(new_files, Arc::clone(&self.comparator));
@@ -332,9 +361,9 @@ impl VersionSet {
 /// and constructs the initial `Version`.
 struct Builder {
   /// Live files keyed by `(level, file_number)`.
-  added: HashMap<(i32, u64), Arc<FileMetaData>>,
+  added: HashMap<(usize, u64), Arc<FileMetaData>>,
   /// Files that have been explicitly deleted (supersedes any prior addition).
-  deleted: HashSet<(i32, u64)>,
+  deleted: HashSet<(usize, u64)>,
   next_file_number: u64,
   last_sequence: u64,
   log_number: u64,
@@ -364,17 +393,17 @@ impl Builder {
     if let Some(v) = edit.last_sequence {
       self.last_sequence = v;
     }
-    for &(level, number) in &edit.deleted_files {
+    for &DeletedFile { level, number } in &edit.deleted_files {
       self.deleted.insert((level, number));
       self.added.remove(&(level, number));
     }
-    for (level, meta) in &edit.new_files {
+    for NewFile { level, meta } in &edit.new_files {
       let key = (*level, meta.number);
       self.deleted.remove(&key);
       self.added.insert(key, Arc::clone(meta));
     }
-    for (level, key) in &edit.compact_pointers {
-      self.compact_pointer[*level as usize] = key.clone();
+    for CompactPointer { level, key } in &edit.compact_pointers {
+      self.compact_pointer[*level] = key.clone();
     }
   }
 
@@ -389,7 +418,7 @@ impl Builder {
     // Collect live files per level (stable insertion order for L0).
     let mut by_level: Vec<Vec<(u64, Arc<FileMetaData>)>> = vec![Vec::new(); 7];
     for ((level, number), meta) in self.added {
-      by_level[level as usize].push((number, meta));
+      by_level[level].push((number, meta));
     }
 
     for (level, mut level_files) in by_level.into_iter().enumerate() {
@@ -432,7 +461,7 @@ mod tests {
   use crate::db::table_cache::{TableCache, NUM_NON_TABLE_CACHE_FILES};
   use crate::options::Options;
   use crate::table::builder::TableBuilder;
-  use crate::table::format::make_internal_key;
+  use crate::table::format::{make_internal_key, ValueType};
 
   fn make_tc(dir: &Path) -> TableCache {
     let opts = Options::default();
@@ -447,7 +476,11 @@ mod tests {
   }
 
   /// Write a minimal SSTable at `path/NNNNNN.ldb` and return (file_number, file_size).
-  fn write_sst(dir: &Path, file_number: u64, entries: &[(&[u8], u64, u8, &[u8])]) -> (u64, u64) {
+  fn write_sst(
+    dir: &Path,
+    file_number: u64,
+    entries: &[(&[u8], u64, ValueType, &[u8])],
+  ) -> (u64, u64) {
     let sst_path = dir.join(format!("{file_number:06}.ldb"));
     let file = std::fs::OpenOptions::new()
       .write(true)
@@ -497,10 +530,10 @@ mod tests {
     let tc = make_tc(dir.path());
 
     // Simulate flushing file 3.
-    let (fnum, fsize) = write_sst(dir.path(), 3, &[(b"hello", 1, 1, b"world")]);
+    let (fnum, fsize) = write_sst(dir.path(), 3, &[(b"hello", 1, ValueType::Value, b"world")]);
     let meta = FileMetaData::new(fnum, fsize, b"hello".to_vec(), b"hello".to_vec());
     let mut edit = VersionEdit::new();
-    edit.new_files.push((0, meta));
+    edit.add_file(0, meta);
     vs.log_and_apply(&mut edit, &tc).unwrap();
 
     // Current version must have file 3 in L0.
@@ -533,10 +566,10 @@ mod tests {
     .unwrap();
     let tc = make_tc(dir.path());
 
-    let (fnum, fsize) = write_sst(dir.path(), 3, &[(b"key", 1, 1, b"val")]);
+    let (fnum, fsize) = write_sst(dir.path(), 3, &[(b"key", 1, ValueType::Value, b"val")]);
     let meta = FileMetaData::new(fnum, fsize, b"key".to_vec(), b"key".to_vec());
     let mut edit = VersionEdit::new();
-    edit.new_files.push((0, meta));
+    edit.add_file(0, meta);
     vs.log_and_apply(&mut edit, &tc).unwrap();
     drop(vs);
 
@@ -581,5 +614,39 @@ mod tests {
     )
     .unwrap();
     assert_eq!(vs2.last_sequence(), 42);
+  }
+
+  /// A level number read from the MANIFEST is untrusted input: one past the
+  /// last level must be reported as corruption, not used as an index.
+  #[test]
+  fn recover_rejects_an_out_of_range_level() {
+    use crate::env::{FileSystem, MemFileSystem};
+    let fs = MemFileSystem::new();
+    let dir = Path::new("/db");
+    let cmp: Arc<dyn crate::comparator::Comparator> =
+      Arc::new(crate::comparator::BytewiseComparator);
+    let vs = VersionSet::create(dir, Arc::clone(&cmp), &fs).unwrap();
+    drop(vs);
+
+    let mut edit = VersionEdit::new();
+    let ikey = make_internal_key(b"k", 1, ValueType::Value);
+    edit.add_file(
+      crate::db::version::NUM_LEVELS,
+      FileMetaData::new(9, 100, ikey.clone(), ikey),
+    );
+    let manifest = dir.join(manifest_filename(2));
+    let len = fs.file_size(&manifest).unwrap();
+    let mut log = LogWriter::new(fs.open_appendable(&manifest).unwrap(), len);
+    log.add_record(&edit.encode()).unwrap();
+    drop(log);
+
+    match VersionSet::recover(dir, false, cmp, &fs) {
+      Err(Error::Corruption(_)) => {}
+      Err(e) => panic!("expected corruption, got {e:?}"),
+      Ok(_) => panic!(
+        "recovered a MANIFEST naming level {}",
+        crate::db::version::NUM_LEVELS
+      ),
+    }
   }
 }

@@ -65,8 +65,10 @@ The read path checks `mem` → `imm` → each level of SSTables (newest to oldes
   `overlaps_level`, `files_at`, `num_files`. It owns an `Arc<dyn Comparator>` (as does `VersionSet`), so overlap/range
   queries never take a comparator parameter. `L0_COMPACTION_TRIGGER` lives here, next to `finalize`.
 - **`src/table/format.rs`** — canonical internal-key helpers: `user_key` (strip the 8-byte tag; never open-code
-  `&ikey[..len-8]`), `make_internal_key`, `encode_internal_key_into` (in-place, for hot paths), `parse_internal_key`,
-  `cmp_internal_keys`. Also `MAX_BLOCK_SIZE` (16 MiB), the allocation cap for block reads and decompression.
+  `&ikey[..len-8]`), `make_internal_key`, `encode_internal_key_into` (in-place, for hot paths), `parse_internal_key`
+  (→ `ParsedInternalKey`; `None` for a short key or unknown type), `cmp_internal_keys`.  `ValueType` is the one
+  value-type encoding, shared with memtable entries and `WriteBatch` records — never compare against `0`/`1`.
+  Also `MAX_BLOCK_SIZE` (16 MiB), the allocation cap for block reads and decompression.
 - **`src/env.rs`** — `FileSystem` trait with two adapters: `PosixFileSystem` (production) and `MemFileSystem`
   (`#[cfg(test)]`, in-memory). Prefer `MemFileSystem` over tempdirs for new DB-lifecycle tests — it is deterministic
   and disk-free (see `full_db_lifecycle_on_mem_filesystem` in `lib.rs`).
@@ -86,9 +88,9 @@ The read path checks `mem` → `imm` → each level of SSTables (newest to oldes
 - `Splice` caches `prev`/`next` from the last insert for O(1) amortised sequential inserts.
 - Lock-free reads (Acquire/Release atomics). Writes must be serialised externally: `SkipList::alloc_and_insert`
   and `Memtable::add`/`delete` are `unsafe fn` whose contract is "no concurrent writer"; `Db` satisfies it by
-  inserting only while holding the `DbState` mutex (see `Inserter` in `lib.rs`). Writer-only state (`Splice`,
-  RNG) lives in an `UnsafeCell<WriterState>` so inserts go through `&SkipList` like reads and never create a
-  `&mut SkipList` that would alias readers' shared borrows.
+  inserting only through `unsafe fn insert_batch` in `lib.rs`, from the write leader, recovery or repair (see its
+  `# Safety`). Writer-only state (`Splice`, RNG) lives in an `UnsafeCell<WriterState>` so inserts go through
+  `&SkipList` like reads and never create a `&mut SkipList` that would alias readers' shared borrows.
 - The `bench` Cargo feature exposes `roughdb::bench::{Memtable, MemTableIterator}` (doc-hidden) for
   `benches/skiplist.rs`; it is not a public API.
 
@@ -121,11 +123,13 @@ Features are listed in dependency order. Each phase must be complete before the 
 
 *Prerequisite for everything.*
 
-- [x] **`Error`** (`src/error.rs`): `Result`-based error type with variants `NotFound`, `Corruption`, `InvalidArgument`,
-  `NotSupported`, `IoError`. `Db::get/put/delete` now return `Result<_, Error>`. See `include/leveldb/status.h`.
+- [x] **`Error`** (`src/error.rs`): `Result`-based error type with variants `Corruption`, `InvalidArgument`,
+  `NotSupported`, `IoError`. `Db::get/put/delete` now return `Result<_, Error>`; `get` returns `Ok(None)` for an
+  absent key (LevelDB's `NotFound` status is not an error variant). See `include/leveldb/status.h`.
 - [x] **`WriteBatch`**: Serialises a sequence of Put/Delete operations into a byte buffer. Batch format: `[seq:
   u64][count: u32][records…]` where each record is `[vtype: u8][klen: varint][key][vlen: varint][value]`. Exposes `put`,
-  `delete`, `iterate(Handler)`, `approximate_size`. `Clone`-able. `Db::put`/`delete` are thin wrappers over `Db::write`.
+  `delete`, `iter()` (→ `Result<BatchOp>`), `approximate_size`. `Clone`-able. `Db::put`/`delete` are thin wrappers
+  over `Db::write`.
   See `include/leveldb/write_batch.h` and `db/write_batch.cc`.
 - [x] **`Options` / `ReadOptions` / `WriteOptions`**: Configuration structs. `Options` carries the write-buffer size,
   block size, compression type, filter policy, block cache handle. `WriteOptions` adds a sync flag. `ReadOptions` adds a
@@ -170,7 +174,7 @@ Features are listed in dependency order. Each phase must be complete before the 
   The stamp must precede the log write so WAL records carry the correct embedded sequence for recovery replay.
   `Db::put`/`delete` updated to forward a default `WriteOptions`.
 - [x] **Recovery** (`Db::open` calls this when WAL exists): Construct a `logfile::Reader` from offset 0; for each record
-  decode it as a `WriteBatch` and replay via `batch.iterate(&mut inserter)` using the batch's embedded sequence; after
+  decode it as a `WriteBatch` and replay via `insert_batch` using the batch's embedded sequence; after
   all records restore `last_sequence` to the highest sequence seen. Incomplete trailing records (torn write on crash)
   are silently ignored.
 
@@ -293,8 +297,8 @@ what remains is compaction, the full Iterator/Snapshot API, and operational hygi
   (`L0_STOP_WRITES_TRIGGER`), and waits for an in-progress flush if `imm` is occupied. Level-score scheduling,
   compact-pointer round-robin, seek-based compaction, trivial-move optimisation, and grandparent-overlap limiting
   are all implemented. See `db/db_impl.cc: DBImpl::BackgroundCompaction`, `DoCompactionWork`, `MakeRoomForWrite`.
-- [x] **`Db::compact_range(begin, end)`**: Manual compaction of a user-key range (`Option<&[u8]>` for open bounds).
-  Finds the deepest level with files overlapping `[begin, end]`, then calls `compact_level_range` for each level
+- [x] **`Db::compact_range(range)`**: Manual compaction of a user-key range (`impl RangeBounds<&[u8]>`; `..` for all).
+  Finds the deepest level with files overlapping the range, then calls `compact_level_range` for each level
   from 0 to `max_level - 1`.  Each call uses the three-phase lock protocol; newly compacted files are visible to
   subsequent levels' compactions via a fresh version snapshot.  `pick_range_compaction` selects files at `level`
   that overlap `[begin, end]` plus next-level files that overlap the union range; reuses `do_compaction` and
@@ -314,8 +318,8 @@ what remains is compaction, the full Iterator/Snapshot API, and operational hygi
   `TwoLevelIterator` per SSTable from the current `Version`. Builds `MergingIterator` → `DbIterator`. Exposes:
   `valid`, `seek_to_first`, `seek_to_last`, `seek`, `next`, `prev`, `key`, `value`, `status`. `DbState.mem` and
   `.imm` changed to `Arc<Memtable>` to enable Arc cloning for the iterator. See `db/db_impl.cc`.
-- [x] **`Db::GetSnapshot` / `ReleaseSnapshot`**: `get_snapshot()` locks, reads `last_sequence`, inserts into
-  `DbState::snapshots: BTreeSet<u64>`, returns `Snapshot(seq)`. `release_snapshot(snap)` removes from the set.
+- [x] **`Db::GetSnapshot` / `ReleaseSnapshot`**: `snapshot()` locks, reads `last_sequence`, inserts into
+  `DbState::snapshots` (a refcount per sequence), returns a `Snapshot` whose `Drop` releases it.
   Compaction (`do_compaction`, `maybe_compact`, `compact_level_range`) uses `oldest_snapshot = snapshots.min()
   .unwrap_or(last_sequence)` as the visibility cutoff so entries observable through any live snapshot are not
   pruned. See `db/snapshot.h`.
@@ -327,14 +331,14 @@ what remains is compaction, the full Iterator/Snapshot API, and operational hygi
 
 **Remaining user-facing API surface** *(in `include/leveldb/db.h`)*
 
-- [x] **`Db::GetProperty(property)`**: `get_property(&self, property: &str) -> Option<String>`. Supported
+- [x] **`Db::GetProperty(property)`**: `property(&self, property: &str) -> Option<String>`. Supported
   properties: `"leveldb.num-files-at-level<N>"` (file count at level N), `"leveldb.stats"` (per-level file
   count and size; time/read/write columns emit `0` since compaction stats are not tracked),
   `"leveldb.sstables"` (one line per SSTable with file number, size, and escaped user-key range),
   `"leveldb.approximate-memory-usage"` (memtable bytes). Returns `None` for unknown properties or invalid level
   numbers. Helpers `num_files`, `level_bytes`, `debug_string` added to `Version`.
   See `db/db_impl.cc: DBImpl::GetProperty`.
-- [x] **`Db::GetApproximateSizes(ranges)`**: Given a slice of `(start_key, end_key)` ranges, return approximate
+- [x] **`Db::GetApproximateSizes(ranges)`**: `approximate_sizes(&[Range<&[u8]>])`: return approximate
   on-disk byte count for each range by walking the index blocks of overlapping SSTables. Used by tools to estimate
   data distribution. `Version::approximate_offset_of` accumulates `file_size` for files entirely before the key
   and delegates to `Table::approximate_offset_of` (index-block seek, returns block start offset or `metaindex_offset`
@@ -450,8 +454,9 @@ what remains is compaction, the full Iterator/Snapshot API, and operational hygi
   LevelDB does not lock during repair; RocksDB does (`env_->LockFile` in `db/repair.cc`). Our current implementation
   follows LevelDB and does not lock.
 - ✅ **`CompactionFilter` / `CompactionFilterFactory`** (RocksDB): `CompactionFilter` trait
-  (`src/compaction_filter.rs`) with `filter(level, key, value, value_type) -> CompactionDecision` returning `Keep`,
-  `Remove`, or `ChangeValue(new_val)`.  `CompactionFilterFactory` creates a fresh filter per compaction run
+  (`src/compaction_filter.rs`) with `filter(level, key, CompactionValue) -> CompactionDecision` (a `Value(&[u8])` or
+  a `Deletion`) returning `Keep`, `Remove`, or `ChangeValue(new_val)` (no effect on a deletion).
+  `CompactionFilterFactory` creates a fresh filter per compaction run
   (allows per-compaction mutable state like timestamps for TTL).  `Options::compaction_filter_factory:
   Option<Arc<dyn CompactionFilterFactory>>` — `None` disables filtering (default).  The filter is called in
   `do_compaction` for the newest visible version of each key, after shadow-key pruning, before writing to the output
@@ -466,7 +471,7 @@ what remains is compaction, the full Iterator/Snapshot API, and operational hygi
 - `unsafe` blocks must carry a `// SAFETY:` comment; `unsafe fn` must carry a `# Safety` doc section. A safe function
   must have no soundness preconditions: if correctness depends on something only the caller can guarantee (writer
   serialisation, a pointer's provenance, a level being below a node's height), make it an `unsafe fn` and state the
-  requirement in `# Safety` — see `Memtable::add`, `Node::load_next`, and the `Inserter` contract in `lib.rs`.
+  requirement in `# Safety` — see `Memtable::add`, `Node::load_next`, and `insert_batch` in `lib.rs`.
 - `find_splice_for_level` and `recompute_splice_levels` are free functions (not `SkipList` methods) that take the
   comparator explicitly; this keeps the insert hot path free of `&self` entanglement and is the pattern to follow
   whenever a method would otherwise need both `&self` and `&mut self.field`.

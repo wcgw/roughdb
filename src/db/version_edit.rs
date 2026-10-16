@@ -11,6 +11,7 @@
 //    limitations under the License.
 
 use crate::coding::{read_varu64, write_varu64};
+use crate::db::version::NUM_LEVELS;
 use crate::error::Error;
 use std::sync::atomic::AtomicI32;
 use std::sync::Arc;
@@ -62,22 +63,42 @@ impl FileMetaData {
   }
 }
 
+/// A file a [`VersionEdit`] adds to a level.
+pub(crate) struct NewFile {
+  pub level: usize,
+  pub meta: Arc<FileMetaData>,
+}
+
+/// A file a [`VersionEdit`] removes from a level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct DeletedFile {
+  pub level: usize,
+  pub number: u64,
+}
+
+/// The round-robin compaction cursor of a level: the largest internal key the
+/// level's last compaction took as input.  The next compaction of the level
+/// starts after it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CompactPointer {
+  pub level: usize,
+  pub key: Vec<u8>,
+}
+
 /// An atomic delta to the set of live SSTable files.
 ///
 /// Written to the MANIFEST log for crash-safe recovery. LevelDB-compatible
-/// tag-based binary encoding (see `encode` / `decode`).
+/// tag-based binary encoding (see `encode` / `decode`).  Every level it holds
+/// is below [`NUM_LEVELS`]; `decode` rejects any other as corruption.
 pub(crate) struct VersionEdit {
   pub comparator_name: Option<String>,
   pub log_number: Option<u64>,
   pub prev_log_number: Option<u64>,
   pub next_file_number: Option<u64>,
   pub last_sequence: Option<u64>,
-  /// Files added: `(level, metadata)`.
-  pub new_files: Vec<(i32, Arc<FileMetaData>)>,
-  /// Files removed: `(level, file_number)`.
-  pub deleted_files: Vec<(i32, u64)>,
-  /// Compact pointers: `(level, largest_internal_key)` — round-robin compaction cursor.
-  pub compact_pointers: Vec<(i32, Vec<u8>)>,
+  pub new_files: Vec<NewFile>,
+  pub deleted_files: Vec<DeletedFile>,
+  pub compact_pointers: Vec<CompactPointer>,
 }
 
 impl VersionEdit {
@@ -92,6 +113,16 @@ impl VersionEdit {
       deleted_files: Vec::new(),
       compact_pointers: Vec::new(),
     }
+  }
+
+  /// Add `meta` at `level`.  Port of LevelDB's `VersionEdit::AddFile`.
+  pub(crate) fn add_file(&mut self, level: usize, meta: Arc<FileMetaData>) {
+    self.new_files.push(NewFile { level, meta });
+  }
+
+  /// Remove file `number` from `level`.  Port of LevelDB's `RemoveFile`.
+  pub(crate) fn delete_file(&mut self, level: usize, number: u64) {
+    self.deleted_files.push(DeletedFile { level, number });
   }
 
   /// Serialise the edit to bytes for storage in the MANIFEST log.
@@ -129,17 +160,17 @@ impl VersionEdit {
       push_varint!(TAG_LAST_SEQUENCE);
       push_varint!(v);
     }
-    for (level, key) in &self.compact_pointers {
+    for CompactPointer { level, key } in &self.compact_pointers {
       push_varint!(TAG_COMPACT_POINTER);
       push_varint!(*level as u64);
       encode_bytes(&mut buf, key);
     }
-    for &(level, number) in &self.deleted_files {
+    for &DeletedFile { level, number } in &self.deleted_files {
       push_varint!(TAG_DELETED_FILE);
       push_varint!(level as u64);
       push_varint!(number);
     }
-    for (level, meta) in &self.new_files {
+    for NewFile { level, meta } in &self.new_files {
       push_varint!(TAG_NEW_FILE);
       push_varint!(*level as u64);
       push_varint!(meta.number);
@@ -201,23 +232,17 @@ impl VersionEdit {
           edit.last_sequence = Some(v);
         }
         TAG_DELETED_FILE => {
-          let (level, n) = read_varu64(&data[pos..]);
-          if n == 0 {
-            return Err(trunc("deleted_file level"));
-          }
+          let (level, n) = decode_level(&data[pos..], "deleted_file")?;
           pos += n;
           let (number, n) = read_varu64(&data[pos..]);
           if n == 0 {
             return Err(trunc("deleted_file number"));
           }
           pos += n;
-          edit.deleted_files.push((level as i32, number));
+          edit.delete_file(level, number);
         }
         TAG_NEW_FILE => {
-          let (level, n) = read_varu64(&data[pos..]);
-          if n == 0 {
-            return Err(trunc("new_file level"));
-          }
+          let (level, n) = decode_level(&data[pos..], "new_file")?;
           pos += n;
           let (number, n) = read_varu64(&data[pos..]);
           if n == 0 {
@@ -233,20 +258,17 @@ impl VersionEdit {
           pos += n;
           let (largest, n) = decode_bytes(&data[pos..])?;
           pos += n;
-          edit.new_files.push((
-            level as i32,
+          edit.add_file(
+            level,
             FileMetaData::new(number, file_size, smallest, largest),
-          ));
+          );
         }
         TAG_COMPACT_POINTER => {
-          let (level, n) = read_varu64(&data[pos..]);
-          if n == 0 {
-            return Err(trunc("compact_pointer level"));
-          }
+          let (level, n) = decode_level(&data[pos..], "compact_pointer")?;
           pos += n;
           let (key, n) = decode_bytes(&data[pos..])?;
           pos += n;
-          edit.compact_pointers.push((level as i32, key));
+          edit.compact_pointers.push(CompactPointer { level, key });
         }
         TAG_COMPARATOR => {
           let (name_bytes, n) = decode_bytes(&data[pos..])?;
@@ -292,6 +314,22 @@ fn decode_bytes(data: &[u8]) -> Result<(Vec<u8>, usize), Error> {
   Ok((data[n..end].to_vec(), end))
 }
 
+/// Decode the level of a `field` entry, returning it with the bytes consumed.
+/// A level at or past [`NUM_LEVELS`] is corruption.  Port of LevelDB's
+/// `GetLevel`.
+fn decode_level(data: &[u8], field: &str) -> Result<(usize, usize), Error> {
+  let (level, n) = read_varu64(data);
+  if n == 0 {
+    return Err(trunc(&format!("{field} level")));
+  }
+  match usize::try_from(level) {
+    Ok(level) if level < NUM_LEVELS => Ok((level, n)),
+    _ => Err(Error::Corruption(format!(
+      "VersionEdit: {field} level {level} out of range"
+    ))),
+  }
+}
+
 fn trunc(field: &str) -> Error {
   Error::Corruption(format!("VersionEdit: truncated {field}"))
 }
@@ -309,9 +347,9 @@ mod tests {
     edit.prev_log_number = Some(41);
     edit.next_file_number = Some(100);
     edit.last_sequence = Some(999);
-    edit.deleted_files.push((0, 5));
-    edit.deleted_files.push((1, 10));
-    edit.new_files.push((
+    edit.delete_file(0, 5);
+    edit.delete_file(1, 10);
+    edit.add_file(
       0,
       FileMetaData::new(
         7,
@@ -319,7 +357,11 @@ mod tests {
         b"aaa\x01\x00\x00\x00\x00\x00\x00\x00\x00".to_vec(),
         b"zzz\x01\x00\x00\x00\x00\x00\x00\x00\x00".to_vec(),
       ),
-    ));
+    );
+    edit.compact_pointers.push(CompactPointer {
+      level: 2,
+      key: b"mmm".to_vec(),
+    });
 
     let encoded = edit.encode();
     let decoded = VersionEdit::decode(&encoded).unwrap();
@@ -328,14 +370,43 @@ mod tests {
     assert_eq!(decoded.prev_log_number, Some(41));
     assert_eq!(decoded.next_file_number, Some(100));
     assert_eq!(decoded.last_sequence, Some(999));
-    assert_eq!(decoded.deleted_files, vec![(0, 5), (1, 10)]);
+    assert_eq!(
+      decoded.deleted_files,
+      [
+        DeletedFile {
+          level: 0,
+          number: 5
+        },
+        DeletedFile {
+          level: 1,
+          number: 10
+        }
+      ]
+    );
+    assert_eq!(decoded.compact_pointers, edit.compact_pointers);
     assert_eq!(decoded.new_files.len(), 1);
-    let (level, meta) = &decoded.new_files[0];
+    let NewFile { level, meta } = &decoded.new_files[0];
     assert_eq!(*level, 0);
     assert_eq!(meta.number, 7);
     assert_eq!(meta.file_size, 1024);
     assert_eq!(meta.smallest, b"aaa\x01\x00\x00\x00\x00\x00\x00\x00\x00");
     assert_eq!(meta.largest, b"zzz\x01\x00\x00\x00\x00\x00\x00\x00\x00");
+  }
+
+  #[test]
+  fn decode_rejects_out_of_range_levels() {
+    for tag in [TAG_NEW_FILE, TAG_DELETED_FILE, TAG_COMPACT_POINTER] {
+      let mut buf = Vec::new();
+      let mut tmp = [0u8; 10];
+      for n in [tag, NUM_LEVELS as u64] {
+        let len = write_varu64(&mut tmp, n);
+        buf.extend_from_slice(&tmp[..len]);
+      }
+      assert!(
+        matches!(VersionEdit::decode(&buf), Err(Error::Corruption(_))),
+        "tag {tag}"
+      );
+    }
   }
 
   #[test]

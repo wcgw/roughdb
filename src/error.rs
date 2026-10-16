@@ -11,31 +11,37 @@
 //    limitations under the License.
 
 use std::fmt;
+use std::sync::Arc;
 
-/// Mirrors LevelDB's `Status` error codes (excluding `Ok`, which is `Result::Ok`).
-#[derive(Debug)]
+/// An error from a database operation.
+///
+/// Mirrors LevelDB's `Status` codes, except `Ok` (which is `Result::Ok`) and
+/// `NotFound` (an absent key is `Ok(None)`, not an error).
+#[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum Error {
-  NotFound,
+  /// Stored data failed a consistency check: a checksum mismatch, or a
+  /// malformed block, log record or MANIFEST edit.
   Corruption(String),
+  /// The operation cannot accept an argument, or the database's state, as
+  /// given: e.g. opening a missing database with `OpenMode::Existing`.
   InvalidArgument(String),
+  /// The data asks for something this build does not support, such as an
+  /// unknown compression type.
   NotSupported(String),
-  IoError(std::io::Error),
-}
-
-impl Error {
-  pub fn is_not_found(&self) -> bool {
-    matches!(self, Error::NotFound)
-  }
+  /// A file-system operation failed.  Shared, so that cloning the error (a
+  /// failed background write is reported to every later caller) keeps the
+  /// original rather than a copy of its message.
+  IoError(Arc<std::io::Error>),
 }
 
 impl fmt::Display for Error {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     match self {
-      Error::NotFound => write!(f, "NotFound"),
-      Error::Corruption(msg) => write!(f, "Corruption: {msg}"),
-      Error::InvalidArgument(msg) => write!(f, "InvalidArgument: {msg}"),
-      Error::NotSupported(msg) => write!(f, "NotSupported: {msg}"),
-      Error::IoError(e) => write!(f, "IO error: {e}"),
+      Error::Corruption(msg) => write!(f, "corruption: {msg}"),
+      Error::InvalidArgument(msg) => write!(f, "invalid argument: {msg}"),
+      Error::NotSupported(msg) => write!(f, "not supported: {msg}"),
+      Error::IoError(e) => write!(f, "I/O error: {e}"),
     }
   }
 }
@@ -43,27 +49,37 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {
   fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
     match self {
-      Error::IoError(e) => Some(e),
-      _ => None,
+      Error::IoError(e) => Some(&**e),
+      Error::Corruption(_) | Error::InvalidArgument(_) | Error::NotSupported(_) => None,
     }
   }
 }
 
 impl From<std::io::Error> for Error {
   fn from(e: std::io::Error) -> Self {
-    Error::IoError(e)
+    Error::IoError(Arc::new(e))
   }
 }
 
-impl Clone for Error {
-  fn clone(&self) -> Self {
-    match self {
-      Error::NotFound => Error::NotFound,
-      Error::Corruption(s) => Error::Corruption(s.clone()),
-      Error::InvalidArgument(s) => Error::InvalidArgument(s.clone()),
-      Error::NotSupported(s) => Error::NotSupported(s.clone()),
-      // `std::io::Error` isn't Clone; preserve kind + message.
-      Error::IoError(e) => Error::IoError(std::io::Error::new(e.kind(), e.to_string())),
-    }
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn error_is_send_sync_and_static() {
+    fn assert_bounds<T: Send + Sync + 'static>() {}
+    assert_bounds::<Error>();
+  }
+
+  #[test]
+  fn a_cloned_io_error_keeps_the_original() {
+    let e = Error::from(std::io::Error::other("disk on fire"));
+    let clone = e.clone();
+    let (Error::IoError(a), Error::IoError(b)) = (&e, &clone) else {
+      unreachable!()
+    };
+    assert!(Arc::ptr_eq(a, b));
+    assert_eq!(clone.to_string(), "I/O error: disk on fire");
+    assert!(std::error::Error::source(&clone).is_some());
   }
 }

@@ -33,10 +33,18 @@ use std::sync::Arc;
 pub trait SequentialFile: Send {
   /// Read up to `buf.len()` bytes into `buf`.  Returns the number of bytes
   /// read (0 at EOF).
+  ///
+  /// # Errors
+  ///
+  /// [`Error::IoError`] if the read fails.
   fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error>;
 
   /// Skip `n` bytes from the current position.  This may be faster than
   /// reading and discarding for backends that support seeking.
+  ///
+  /// # Errors
+  ///
+  /// [`Error::IoError`] if the file cannot be advanced.
   fn skip(&mut self, n: u64) -> Result<(), Error>;
 }
 
@@ -46,6 +54,10 @@ pub trait SequentialFile: Send {
 pub trait RandomAccessFile: Send + Sync {
   /// Read up to `buf.len()` bytes starting at `offset`.  Returns the number
   /// of bytes read (may be less than `buf.len()` near EOF).
+  ///
+  /// # Errors
+  ///
+  /// [`Error::IoError`] if the read fails.
   fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<usize, Error>;
 }
 
@@ -55,12 +67,24 @@ pub trait RandomAccessFile: Send + Sync {
 /// to the OS and [`sync`](WritableFile::sync) to `fsync`.
 pub trait WritableFile: Send {
   /// Append `data` to the file.
+  ///
+  /// # Errors
+  ///
+  /// [`Error::IoError`] if the write fails.
   fn write(&mut self, data: &[u8]) -> Result<(), Error>;
 
   /// Flush any internal buffer to the OS page cache.
+  ///
+  /// # Errors
+  ///
+  /// [`Error::IoError`] if the flush fails.
   fn flush(&mut self) -> Result<(), Error>;
 
   /// Durably persist all previously written data (`fsync`).
+  ///
+  /// # Errors
+  ///
+  /// [`Error::IoError`] if the data cannot be made durable.
   fn sync(&mut self) -> Result<(), Error>;
 }
 
@@ -74,38 +98,77 @@ pub trait FileLock: Send + Sync {}
 /// Pluggable filesystem backend.
 ///
 /// All database I/O (file creation, reading, writing, directory operations,
-/// and file locking) goes through this trait.
+/// and file locking) goes through this trait.  Implementations report every
+/// failure as [`Error::IoError`]; the database wraps it in context where it
+/// matters (e.g. "cannot open SSTable") and treats any as fatal for the
+/// operation at hand.
 ///
 /// See `include/rocksdb/file_system.h: FileSystem`.
 pub trait FileSystem: Send + Sync {
   /// Open an existing file for sequential reading.
+  ///
+  /// # Errors
+  ///
+  /// [`Error::IoError`] if the file does not exist or cannot be opened.
   fn open_sequential(&self, path: &Path) -> Result<Box<dyn SequentialFile>, Error>;
 
   /// Open an existing file for random-access reading (pread).
+  ///
+  /// # Errors
+  ///
+  /// [`Error::IoError`] if the file does not exist or cannot be opened.
   fn open_random_access(&self, path: &Path) -> Result<Arc<dyn RandomAccessFile>, Error>;
 
   /// Open an existing file for appending (used to resume a WAL or MANIFEST).
+  ///
+  /// # Errors
+  ///
+  /// [`Error::IoError`] if the file cannot be opened.
   fn open_appendable(&self, path: &Path) -> Result<Box<dyn WritableFile>, Error>;
 
   /// Create a new file for writing (truncates if it exists).
+  ///
+  /// # Errors
+  ///
+  /// [`Error::IoError`] if the file cannot be created.
   fn create_writable(&self, path: &Path) -> Result<Box<dyn WritableFile>, Error>;
 
   /// Return the size of the file in bytes.
+  ///
+  /// # Errors
+  ///
+  /// [`Error::IoError`] if the file does not exist or cannot be inspected.
   fn file_size(&self, path: &Path) -> Result<u64, Error>;
 
   /// Returns `true` if the path exists.
   fn file_exists(&self, path: &Path) -> bool;
 
   /// Atomically rename `src` to `dst`.
+  ///
+  /// # Errors
+  ///
+  /// [`Error::IoError`] if the rename fails.
   fn rename(&self, src: &Path, dst: &Path) -> Result<(), Error>;
 
   /// Delete a file.
+  ///
+  /// # Errors
+  ///
+  /// [`Error::IoError`] if the file does not exist or cannot be deleted.
   fn remove_file(&self, path: &Path) -> Result<(), Error>;
 
   /// Create directory and all parent directories.
+  ///
+  /// # Errors
+  ///
+  /// [`Error::IoError`] if a directory cannot be created.
   fn create_dir_all(&self, path: &Path) -> Result<(), Error>;
 
   /// Remove an empty directory.
+  ///
+  /// # Errors
+  ///
+  /// [`Error::IoError`] if the directory does not exist, is not empty, or cannot be removed.
   fn remove_dir(&self, path: &Path) -> Result<(), Error>;
 
   /// Durably persist the directory entries of `path` (`fsync` on the directory).
@@ -113,14 +176,25 @@ pub trait FileSystem: Send + Sync {
   /// Required after creating or renaming a file for the new directory entry to
   /// survive a crash — syncing the file itself only persists its contents.
   /// Backends without directory metadata (e.g. in-memory) may no-op.
+  ///
+  /// # Errors
+  ///
+  /// [`Error::IoError`] if the directory cannot be synced.
   fn sync_dir(&self, path: &Path) -> Result<(), Error>;
 
   /// List the names of files and subdirectories in `path`.
+  ///
+  /// # Errors
+  ///
+  /// [`Error::IoError`] if the directory cannot be listed.
   fn children(&self, path: &Path) -> Result<Vec<String>, Error>;
 
   /// Acquire an exclusive, non-blocking file lock.
   ///
-  /// Returns `Err` immediately if the lock is held by another process.
+  /// # Errors
+  ///
+  /// [`Error::IoError`], immediately, if another process holds the lock, or if
+  /// the lock file cannot be opened.
   fn lock_file(&self, path: &Path) -> Result<Box<dyn FileLock>, Error>;
 
   /// Write `data` to `path` durably (create or overwrite, then `fsync`).
@@ -128,6 +202,10 @@ pub trait FileSystem: Send + Sync {
   /// Not atomic: a crash mid-write can leave a truncated file.  Callers that
   /// need atomic replacement must write to a temporary file and [`rename`]
   /// (see `write_current_file` in `db/version_set.rs`).
+  ///
+  /// # Errors
+  ///
+  /// [`Error::IoError`] if creating, writing or syncing the file fails.
   ///
   /// [`rename`]: FileSystem::rename
   fn write_string_to_file(&self, path: &Path, data: &str) -> Result<(), Error> {
@@ -139,6 +217,11 @@ pub trait FileSystem: Send + Sync {
   }
 
   /// Read the entire contents of `path` as a UTF-8 string.
+  ///
+  /// # Errors
+  ///
+  /// [`Error::IoError`] if the file cannot be opened or read, or
+  /// [`Error::Corruption`] if its contents are not UTF-8.
   fn read_string_from_file(&self, path: &Path) -> Result<String, Error> {
     let mut f = self.open_sequential(path)?;
     let mut buf = Vec::new();
@@ -171,7 +254,7 @@ struct PosixSequentialFile {
 impl SequentialFile for PosixSequentialFile {
   fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
     use std::io::Read;
-    self.inner.read(buf).map_err(Error::IoError)
+    self.inner.read(buf).map_err(Error::from)
   }
 
   fn skip(&mut self, n: u64) -> Result<(), Error> {
@@ -179,7 +262,7 @@ impl SequentialFile for PosixSequentialFile {
     self
       .inner
       .seek(SeekFrom::Current(n as i64))
-      .map_err(Error::IoError)?;
+      .map_err(Error::from)?;
     Ok(())
   }
 }
@@ -191,7 +274,7 @@ struct PosixRandomAccessFile {
 impl RandomAccessFile for PosixRandomAccessFile {
   fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<usize, Error> {
     use std::os::unix::fs::FileExt;
-    self.inner.read_at(buf, offset).map_err(Error::IoError)
+    self.inner.read_at(buf, offset).map_err(Error::from)
   }
 }
 
@@ -202,19 +285,19 @@ struct PosixWritableFile {
 impl WritableFile for PosixWritableFile {
   fn write(&mut self, data: &[u8]) -> Result<(), Error> {
     use std::io::Write;
-    self.inner.write_all(data).map_err(Error::IoError)
+    self.inner.write_all(data).map_err(Error::from)
   }
 
   fn flush(&mut self) -> Result<(), Error> {
     use std::io::Write;
-    self.inner.flush().map_err(Error::IoError)
+    self.inner.flush().map_err(Error::from)
   }
 
   fn sync(&mut self) -> Result<(), Error> {
     // Flush the BufWriter first, then fsync the underlying file.
     use std::io::Write;
-    self.inner.flush().map_err(Error::IoError)?;
-    self.inner.get_ref().sync_all().map_err(Error::IoError)
+    self.inner.flush().map_err(Error::from)?;
+    self.inner.get_ref().sync_all().map_err(Error::from)
   }
 }
 
@@ -229,12 +312,12 @@ impl FileLock for PosixFileLock {}
 
 impl FileSystem for PosixFileSystem {
   fn open_sequential(&self, path: &Path) -> Result<Box<dyn SequentialFile>, Error> {
-    let file = std::fs::File::open(path).map_err(Error::IoError)?;
+    let file = std::fs::File::open(path).map_err(Error::from)?;
     Ok(Box::new(PosixSequentialFile { inner: file }))
   }
 
   fn open_random_access(&self, path: &Path) -> Result<Arc<dyn RandomAccessFile>, Error> {
-    let file = std::fs::File::open(path).map_err(Error::IoError)?;
+    let file = std::fs::File::open(path).map_err(Error::from)?;
     Ok(Arc::new(PosixRandomAccessFile { inner: file }))
   }
 
@@ -244,21 +327,21 @@ impl FileSystem for PosixFileSystem {
       .append(true)
       .create(true)
       .open(path)
-      .map_err(Error::IoError)?;
+      .map_err(Error::from)?;
     Ok(Box::new(PosixWritableFile {
       inner: std::io::BufWriter::new(file),
     }))
   }
 
   fn create_writable(&self, path: &Path) -> Result<Box<dyn WritableFile>, Error> {
-    let file = std::fs::File::create(path).map_err(Error::IoError)?;
+    let file = std::fs::File::create(path).map_err(Error::from)?;
     Ok(Box::new(PosixWritableFile {
       inner: std::io::BufWriter::new(file),
     }))
   }
 
   fn file_size(&self, path: &Path) -> Result<u64, Error> {
-    let meta = std::fs::metadata(path).map_err(Error::IoError)?;
+    let meta = std::fs::metadata(path).map_err(Error::from)?;
     Ok(meta.len())
   }
 
@@ -267,32 +350,32 @@ impl FileSystem for PosixFileSystem {
   }
 
   fn rename(&self, src: &Path, dst: &Path) -> Result<(), Error> {
-    std::fs::rename(src, dst).map_err(Error::IoError)
+    std::fs::rename(src, dst).map_err(Error::from)
   }
 
   fn remove_file(&self, path: &Path) -> Result<(), Error> {
-    std::fs::remove_file(path).map_err(Error::IoError)
+    std::fs::remove_file(path).map_err(Error::from)
   }
 
   fn create_dir_all(&self, path: &Path) -> Result<(), Error> {
-    std::fs::create_dir_all(path).map_err(Error::IoError)
+    std::fs::create_dir_all(path).map_err(Error::from)
   }
 
   fn remove_dir(&self, path: &Path) -> Result<(), Error> {
-    std::fs::remove_dir(path).map_err(Error::IoError)
+    std::fs::remove_dir(path).map_err(Error::from)
   }
 
   fn sync_dir(&self, path: &Path) -> Result<(), Error> {
     // Opening a directory read-only and fsync-ing it persists its entries.
-    let dir = std::fs::File::open(path).map_err(Error::IoError)?;
-    dir.sync_all().map_err(Error::IoError)
+    let dir = std::fs::File::open(path).map_err(Error::from)?;
+    dir.sync_all().map_err(Error::from)
   }
 
   fn children(&self, path: &Path) -> Result<Vec<String>, Error> {
-    let entries = std::fs::read_dir(path).map_err(Error::IoError)?;
+    let entries = std::fs::read_dir(path).map_err(Error::from)?;
     let mut names = Vec::new();
     for entry in entries {
-      let entry = entry.map_err(Error::IoError)?;
+      let entry = entry.map_err(Error::from)?;
       if let Some(name) = entry.file_name().to_str() {
         names.push(name.to_owned());
       }
@@ -307,19 +390,19 @@ impl FileSystem for PosixFileSystem {
       .read(true)
       .write(true)
       .open(path)
-      .map_err(Error::IoError)?;
+      .map_err(Error::from)?;
     // Non-blocking exclusive flock.
     use std::os::unix::io::AsRawFd;
     // SAFETY: fd is valid for the lifetime of `file`; flock does not alias memory.
     let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if ret != 0 {
-      return Err(Error::IoError(std::io::Error::last_os_error()));
+      return Err(Error::from(std::io::Error::last_os_error()));
     }
     Ok(Box::new(PosixFileLock { _file: file }))
   }
 
   fn read_string_from_file(&self, path: &Path) -> Result<String, Error> {
-    std::fs::read_to_string(path).map_err(Error::IoError)
+    std::fs::read_to_string(path).map_err(Error::from)
   }
 }
 
@@ -410,6 +493,12 @@ mod memfs {
     state: Arc<Mutex<State>>,
   }
 
+  impl std::fmt::Debug for MemFileSystem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+      f.debug_struct("MemFileSystem").finish_non_exhaustive()
+    }
+  }
+
   impl MemFileSystem {
     pub fn new() -> Self {
       MemFileSystem {
@@ -459,7 +548,7 @@ mod memfs {
   }
 
   fn not_found(path: &Path) -> Error {
-    Error::IoError(std::io::Error::new(
+    Error::from(std::io::Error::new(
       ErrorKind::NotFound,
       format!("no such file: {}", path.display()),
     ))
@@ -619,7 +708,7 @@ mod memfs {
       let non_empty = st.files.keys().any(|p| p.parent() == Some(path))
         || st.dirs.iter().any(|p| p.parent() == Some(path));
       if non_empty {
-        return Err(Error::IoError(std::io::Error::other(format!(
+        return Err(Error::from(std::io::Error::other(format!(
           "directory not empty: {}",
           path.display()
         ))));
@@ -654,7 +743,7 @@ mod memfs {
     fn lock_file(&self, path: &Path) -> Result<Box<dyn FileLock>, Error> {
       let mut st = self.state.lock().unwrap();
       if st.locks.contains(path) {
-        return Err(Error::IoError(std::io::Error::new(
+        return Err(Error::from(std::io::Error::new(
           ErrorKind::WouldBlock,
           format!("lock held: {}", path.display()),
         )));

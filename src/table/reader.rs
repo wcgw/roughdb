@@ -18,7 +18,9 @@ use crate::filter::FilterPolicy;
 use crate::iter::InternalIterator;
 use crate::table::block::Block;
 use crate::table::filter_block::FilterBlockReader;
-use crate::table::format::{read_block, read_exact_at, BlockHandle, Footer, FOOTER_ENCODED_LENGTH};
+use crate::table::format::{
+  read_block, read_exact_at, BlockHandle, Footer, ValueType, FOOTER_ENCODED_LENGTH,
+};
 use crate::table::two_level_iterator::TwoLevelIterator;
 use std::sync::Arc;
 
@@ -30,7 +32,7 @@ pub(crate) enum LookupResult {
   /// The key was found and has this value.
   Value(Vec<u8>),
   /// The key has a deletion tombstone in this table.  The caller should
-  /// return `NotFound` without consulting older files.
+  /// report the key as absent without consulting older files.
   Deleted,
   /// The key is not present in this table at all.  The caller may check
   /// older (lower-numbered) L0 files.
@@ -194,16 +196,15 @@ impl Table {
             "invalid internal key in data block".to_owned(),
           ))
         }
-        Some((found_user_key, _seq, vtype)) => {
-          if self.comparator.compare(found_user_key, user_key) != std::cmp::Ordering::Equal {
+        Some(found) => {
+          if self.comparator.compare(found.user_key, user_key) != std::cmp::Ordering::Equal {
             return Ok(LookupResult::NotInTable);
           }
-          // we did find the key, we can ignore `_seq`, as it will be <= `sequence` by definition
-          // no need to recheck for that
-          match vtype {
-            1 => return Ok(LookupResult::Value(it.value().to_vec())),
-            0 => return Ok(LookupResult::Deleted),
-            _ => return Err(Error::Corruption(format!("unknown vtype {vtype}"))),
+          // we did find the key, we can ignore its sequence, as it will be <= `sequence` by
+          // definition; no need to recheck for that
+          match found.value_type {
+            ValueType::Value => return Ok(LookupResult::Value(it.value().to_vec())),
+            ValueType::Deletion => return Ok(LookupResult::Deleted),
           }
         }
       }
@@ -351,10 +352,12 @@ fn read_filter_block(
 mod tests {
   use super::*;
   use crate::table::builder::TableBuilder;
-  use crate::table::format::make_internal_key;
+  use crate::table::format::{make_internal_key, ValueType};
 
   /// Build a table with internal keys (as TableBuilder receives from the flusher).
-  fn write_table_internal(pairs: &[(&[u8], u64, u8, &[u8])]) -> (tempfile::NamedTempFile, u64) {
+  fn write_table_internal(
+    pairs: &[(&[u8], u64, ValueType, &[u8])],
+  ) -> (tempfile::NamedTempFile, u64) {
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let file = tmp.reopen().unwrap();
     let mut b = TableBuilder::new(
@@ -375,7 +378,7 @@ mod tests {
 
   #[test]
   fn open_and_get_user_key() {
-    let (tmp, size) = write_table_internal(&[(b"hello", 1, 1, b"world")]);
+    let (tmp, size) = write_table_internal(&[(b"hello", 1, ValueType::Value, b"world")]);
     let table = Table::open(
       crate::env::random_access_from_file(tmp.reopen().unwrap()),
       size,
@@ -385,13 +388,13 @@ mod tests {
     )
     .unwrap();
     assert!(
-      matches!(table.get(&make_internal_key(b"hello", u64::MAX, 1), false, true).unwrap(), LookupResult::Value(v) if v == b"world")
+      matches!(table.get(&make_internal_key(b"hello", u64::MAX, ValueType::Value), false, true).unwrap(), LookupResult::Value(v) if v == b"world")
     );
   }
 
   #[test]
   fn get_missing_key() {
-    let (tmp, size) = write_table_internal(&[(b"a", 1, 1, b"1")]);
+    let (tmp, size) = write_table_internal(&[(b"a", 1, ValueType::Value, b"1")]);
     let table = Table::open(
       crate::env::random_access_from_file(tmp.reopen().unwrap()),
       size,
@@ -402,7 +405,11 @@ mod tests {
     .unwrap();
     assert!(matches!(
       table
-        .get(&make_internal_key(b"z", u64::MAX, 1), false, true)
+        .get(
+          &make_internal_key(b"z", u64::MAX, ValueType::Value),
+          false,
+          true
+        )
         .unwrap(),
       LookupResult::NotInTable
     ));
@@ -411,7 +418,7 @@ mod tests {
   #[test]
   fn get_tombstone_returns_deleted() {
     // vtype=0 is a deletion tombstone — must return Deleted, not NotInTable.
-    let (tmp, size) = write_table_internal(&[(b"gone", 1, 0, b"")]);
+    let (tmp, size) = write_table_internal(&[(b"gone", 1, ValueType::Deletion, b"")]);
     let table = Table::open(
       crate::env::random_access_from_file(tmp.reopen().unwrap()),
       size,
@@ -422,7 +429,11 @@ mod tests {
     .unwrap();
     assert!(matches!(
       table
-        .get(&make_internal_key(b"gone", u64::MAX, 1), false, true)
+        .get(
+          &make_internal_key(b"gone", u64::MAX, ValueType::Value),
+          false,
+          true
+        )
         .unwrap(),
       LookupResult::Deleted
     ));
@@ -430,7 +441,10 @@ mod tests {
 
   #[test]
   fn get_newest_version_wins() {
-    let (tmp, size) = write_table_internal(&[(b"key", 10, 1, b"new"), (b"key", 5, 1, b"old")]);
+    let (tmp, size) = write_table_internal(&[
+      (b"key", 10, ValueType::Value, b"new"),
+      (b"key", 5, ValueType::Value, b"old"),
+    ]);
     let table = Table::open(
       crate::env::random_access_from_file(tmp.reopen().unwrap()),
       size,
@@ -440,14 +454,17 @@ mod tests {
     )
     .unwrap();
     assert!(
-      matches!(table.get(&make_internal_key(b"key", u64::MAX, 1), false, true).unwrap(), LookupResult::Value(v) if v == b"new")
+      matches!(table.get(&make_internal_key(b"key", u64::MAX, ValueType::Value), false, true).unwrap(), LookupResult::Value(v) if v == b"new")
     );
   }
 
   #[test]
   fn get_respects_sequence_number() {
     // Two versions of "key": seq=10 ("new") and seq=5 ("old").
-    let (tmp, size) = write_table_internal(&[(b"key", 10, 1, b"new"), (b"key", 5, 1, b"old")]);
+    let (tmp, size) = write_table_internal(&[
+      (b"key", 10, ValueType::Value, b"new"),
+      (b"key", 5, ValueType::Value, b"old"),
+    ]);
     let table = Table::open(
       crate::env::random_access_from_file(tmp.reopen().unwrap()),
       size,
@@ -458,16 +475,16 @@ mod tests {
     .unwrap();
     // With sequence=u64::MAX, we see the newest (seq=10).
     assert!(
-      matches!(table.get(&make_internal_key(b"key", u64::MAX, 1), false, true).unwrap(), LookupResult::Value(v) if v == b"new")
+      matches!(table.get(&make_internal_key(b"key", u64::MAX, ValueType::Value), false, true).unwrap(), LookupResult::Value(v) if v == b"new")
     );
     // With sequence=7, seq=10 is invisible — we see seq=5.
     assert!(
-      matches!(table.get(&make_internal_key(b"key", 7, 1), false, true).unwrap(), LookupResult::Value(v) if v == b"old")
+      matches!(table.get(&make_internal_key(b"key", 7, ValueType::Value), false, true).unwrap(), LookupResult::Value(v) if v == b"old")
     );
     // With sequence=3, both versions are invisible.
     assert!(matches!(
       table
-        .get(&make_internal_key(b"key", 3, 1), false, true)
+        .get(&make_internal_key(b"key", 3, ValueType::Value), false, true)
         .unwrap(),
       LookupResult::NotInTable
     ));
@@ -475,7 +492,7 @@ mod tests {
 
   #[test]
   fn verify_checksums_passes_on_valid_block() {
-    let (tmp, size) = write_table_internal(&[(b"k", 1, 1, b"v")]);
+    let (tmp, size) = write_table_internal(&[(b"k", 1, ValueType::Value, b"v")]);
     let table = Table::open(
       crate::env::random_access_from_file(tmp.reopen().unwrap()),
       size,
@@ -486,7 +503,11 @@ mod tests {
     .unwrap();
     assert!(matches!(
       table
-        .get(&make_internal_key(b"k", u64::MAX, 1), true, true)
+        .get(
+          &make_internal_key(b"k", u64::MAX, ValueType::Value),
+          true,
+          true
+        )
         .unwrap(),
       LookupResult::Value(_)
     ));

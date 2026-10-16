@@ -15,7 +15,7 @@ use crate::iter::InternalIterator;
 
 /// Given the value bytes of an index entry (an encoded `BlockHandle`), open
 /// the corresponding data block and return an iterator over it.
-pub(crate) type BlockFn = Box<dyn Fn(&[u8]) -> Result<Box<dyn InternalIterator>, Error>>;
+pub(crate) type BlockFn = Box<dyn Fn(&[u8]) -> Result<Box<dyn InternalIterator>, Error> + Send>;
 
 /// Composes an index iterator with a block-opener function to provide a
 /// transparent, seek-able view over all entries in an SSTable.
@@ -180,7 +180,7 @@ impl InternalIterator for TwoLevelIterator {
 mod tests {
   use super::*;
   use crate::table::builder::TableBuilder;
-  use crate::table::format::{make_internal_key, parse_internal_key};
+  use crate::table::format::{make_internal_key, parse_internal_key, ValueType};
   use crate::table::reader::Table;
 
   fn build_table(pairs: &[(&[u8], &[u8])], block_size: usize) -> (tempfile::NamedTempFile, u64) {
@@ -195,7 +195,7 @@ mod tests {
       std::sync::Arc::new(crate::comparator::BytewiseComparator),
     );
     for (seq, &(k, v)) in pairs.iter().enumerate() {
-      let ikey = make_internal_key(k, seq as u64 + 1, 1);
+      let ikey = make_internal_key(k, seq as u64 + 1, ValueType::Value);
       builder.add(&ikey, v).unwrap();
     }
     let size = builder.finish().unwrap();
@@ -204,8 +204,8 @@ mod tests {
 
   fn user_key(ikey: &[u8]) -> &[u8] {
     parse_internal_key(ikey)
-      .map(|(uk, _, _)| uk)
       .expect("valid internal key")
+      .user_key
   }
 
   #[test]
@@ -261,7 +261,7 @@ mod tests {
     .unwrap();
     let mut it = table.new_iterator(false, true).unwrap();
     // Lookup key with max sequence number seeks to the newest version.
-    let target = make_internal_key(b"b", u64::MAX >> 8, 1);
+    let target = make_internal_key(b"b", u64::MAX >> 8, ValueType::Value);
     it.seek(&target);
     assert!(it.valid());
     assert_eq!(user_key(it.key()), b"b");
@@ -281,7 +281,7 @@ mod tests {
     )
     .unwrap();
     let mut it = table.new_iterator(false, true).unwrap();
-    let target = make_internal_key(b"z", u64::MAX >> 8, 1);
+    let target = make_internal_key(b"z", u64::MAX >> 8, ValueType::Value);
     it.seek(&target);
     assert!(!it.valid());
   }
@@ -308,7 +308,7 @@ mod tests {
       std::sync::Arc::new(crate::comparator::BytewiseComparator),
     );
     for (seq, (k, v)) in pairs.iter().enumerate() {
-      let ikey = make_internal_key(k, seq as u64 + 1, 1);
+      let ikey = make_internal_key(k, seq as u64 + 1, ValueType::Value);
       builder.add(&ikey, v).unwrap();
     }
     let size = builder.finish().unwrap();
@@ -352,7 +352,7 @@ mod tests {
       std::sync::Arc::new(crate::comparator::BytewiseComparator),
     );
     for (seq, (k, v)) in pairs.iter().enumerate() {
-      let ikey = make_internal_key(k, seq as u64 + 1, 1);
+      let ikey = make_internal_key(k, seq as u64 + 1, ValueType::Value);
       builder.add(&ikey, v).unwrap();
     }
     let size = builder.finish().unwrap();
@@ -366,7 +366,7 @@ mod tests {
     .unwrap();
     let mut it = table.new_iterator(false, true).unwrap();
     // Seek to the middle; verify we land at the right key and can iterate forward.
-    let target = make_internal_key(b"key00025", u64::MAX >> 8, 1);
+    let target = make_internal_key(b"key00025", u64::MAX >> 8, ValueType::Value);
     it.seek(&target);
     assert!(it.valid());
     assert_eq!(user_key(it.key()), b"key00025");

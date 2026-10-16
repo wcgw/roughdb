@@ -10,13 +10,13 @@
 //    See the License for the specific language governing permissions and
 //    limitations under the License.
 
+use crate::cache::lru::Lru;
 use crate::cache::BlockCache;
 use crate::comparator::Comparator;
 use crate::env::FileSystem;
 use crate::error::Error;
 use crate::filter::FilterPolicy;
 use crate::table::reader::Table;
-use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -31,31 +31,15 @@ struct Inner {
   filter_policy: Option<Arc<dyn FilterPolicy>>,
   block_cache: Option<Arc<BlockCache>>,
   comparator: Arc<dyn Comparator>,
-  /// Maximum number of open `Table` handles the cache will hold at once.
-  capacity: usize,
-  /// LRU order: front = least-recently used, back = most-recently used.
-  order: VecDeque<u64>,
-  /// Maps file number → open Table handle.
-  map: HashMap<u64, Arc<Table>>,
+  /// Open tables by file number, each charged 1 against the capacity.
+  tables: Lru<u64, Arc<Table>>,
 }
 
 impl Inner {
   /// Return the open `Table` for `number`, opening (and possibly evicting) as needed.
   fn get_or_open(&mut self, number: u64, file_size: u64) -> Result<Arc<Table>, Error> {
-    if let Some(t) = self.map.get(&number) {
-      // Cache hit: promote to MRU position.
-      if let Some(pos) = self.order.iter().position(|&n| n == number) {
-        self.order.remove(pos);
-      }
-      self.order.push_back(number);
-      return Ok(Arc::clone(t));
-    }
-
-    // Cache miss: evict LRU entry if at capacity.
-    if self.map.len() >= self.capacity {
-      if let Some(evict) = self.order.pop_front() {
-        self.map.remove(&evict);
-      }
+    if let Some(table) = self.tables.get(&number) {
+      return Ok(Arc::clone(table));
     }
 
     // Open the SSTable file and parse the footer + index block.
@@ -71,37 +55,8 @@ impl Inner {
       self.block_cache.clone(),
       Arc::clone(&self.comparator),
     )?);
-
-    self.order.push_back(number);
-    self.map.insert(number, Arc::clone(&table));
+    self.tables.insert(number, Arc::clone(&table), 1);
     Ok(table)
-  }
-
-  /// Insert a `Table` that was just built (no need to open from disk).
-  ///
-  /// If `number` is already present, the existing entry is replaced.
-  /// Evicts LRU if at capacity before inserting a new entry.
-  fn insert(&mut self, number: u64, table: Arc<Table>) {
-    if !self.map.contains_key(&number) && self.map.len() >= self.capacity {
-      if let Some(evict) = self.order.pop_front() {
-        self.map.remove(&evict);
-      }
-    }
-    // Promote / insert.
-    if let Some(pos) = self.order.iter().position(|&n| n == number) {
-      self.order.remove(pos);
-    }
-    self.order.push_back(number);
-    self.map.insert(number, table);
-  }
-
-  /// Remove the entry for `number` (called when the file is deleted by compaction).
-  fn evict(&mut self, number: u64) {
-    if self.map.remove(&number).is_some() {
-      if let Some(pos) = self.order.iter().position(|&n| n == number) {
-        self.order.remove(pos);
-      }
-    }
   }
 }
 
@@ -139,9 +94,7 @@ impl TableCache {
       filter_policy,
       block_cache,
       comparator,
-      capacity: capacity.max(1),
-      order: VecDeque::new(),
-      map: HashMap::new(),
+      tables: Lru::new(capacity.max(1)),
     })))
   }
 
@@ -159,12 +112,12 @@ impl TableCache {
   ///
   /// Avoids a redundant file-open when we already have the handle in memory.
   pub(crate) fn insert(&self, number: u64, table: Arc<Table>) {
-    self.0.lock().unwrap().insert(number, table);
+    self.0.lock().unwrap().tables.insert(number, table, 1);
   }
 
   /// Evict the entry for `number` (called when the file is garbage-collected).
   pub(crate) fn evict(&self, number: u64) {
-    self.0.lock().unwrap().evict(number);
+    self.0.lock().unwrap().tables.remove(&number);
   }
 }
 
@@ -174,7 +127,7 @@ mod tests {
   use crate::env::PosixFileSystem;
   use crate::options::CompressionType;
   use crate::table::builder::TableBuilder;
-  use crate::table::format::make_internal_key;
+  use crate::table::format::{make_internal_key, ValueType};
 
   fn write_sst(dir: &Path, number: u64, entries: &[(&[u8], &[u8])]) -> u64 {
     let path = dir.join(format!("{number:06}.ldb"));
@@ -188,7 +141,8 @@ mod tests {
       Arc::new(crate::comparator::BytewiseComparator),
     );
     for &(k, v) in entries {
-      b.add(&make_internal_key(k, 1, 1), v).unwrap();
+      b.add(&make_internal_key(k, 1, ValueType::Value), v)
+        .unwrap();
     }
     b.finish().unwrap()
   }
@@ -208,7 +162,7 @@ mod tests {
     let table = tc.get_or_open(3, size).unwrap();
     use crate::table::reader::LookupResult;
     assert!(
-      matches!(table.get(&make_internal_key(b"hello", u64::MAX, 1), false, true).unwrap(), LookupResult::Value(v) if v == b"world")
+      matches!(table.get(&make_internal_key(b"hello", u64::MAX, ValueType::Value), false, true).unwrap(), LookupResult::Value(v) if v == b"world")
     );
   }
 
@@ -281,8 +235,8 @@ mod tests {
                                     // 3 was evicted — the Arc count inside the cache is 0.
                                     // Opening it again must succeed (re-open from disk).
     let inner = tc.0.lock().unwrap();
-    assert!(!inner.map.contains_key(&3));
-    assert!(inner.map.contains_key(&4));
-    assert!(inner.map.contains_key(&5));
+    assert!(!inner.tables.contains_key(&3));
+    assert!(inner.tables.contains_key(&4));
+    assert!(inner.tables.contains_key(&5));
   }
 }

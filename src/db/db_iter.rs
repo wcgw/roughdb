@@ -13,7 +13,9 @@
 use crate::comparator::Comparator;
 use crate::error::Error;
 use crate::iter::InternalIterator;
-use crate::table::format::{make_internal_key, parse_internal_key};
+use crate::table::format::{
+  make_internal_key, parse_internal_key, ParsedInternalKey, ValueType, VALUE_TYPE_FOR_SEEK,
+};
 use std::sync::Arc;
 
 /// Direction of the last positioning or movement operation.
@@ -110,26 +112,23 @@ impl DbIterator {
 
       let ikey = self.iter.key();
       match parse_internal_key(ikey) {
-        Some((user_key, seq, vtype)) if seq <= self.sequence => match vtype {
-          0 => {
+        Some(ParsedInternalKey {
+          user_key,
+          sequence,
+          value_type,
+        }) if sequence <= self.sequence => match value_type {
+          ValueType::Deletion => {
             // Deletion: arrange to skip all upcoming entries for this key.
             skip.clear();
             skip.extend_from_slice(user_key);
             skipping = true;
           }
-          1 => {
+          ValueType::Value => {
             // Value: accept unless it is hidden by a prior tombstone.
             if !skipping || self.comparator.compare(user_key, skip.as_slice()).is_gt() {
               self.valid = true;
               return;
             }
-          }
-          _ => {
-            // Unknown value type — treat as corruption and record it.
-            self.status = Some(Error::Corruption(format!(
-              "unknown value type {} in internal key",
-              vtype
-            )));
           }
         },
         None => {
@@ -162,17 +161,22 @@ impl DbIterator {
   fn find_prev_user_entry(&mut self) {
     debug_assert_eq!(self.direction, Direction::Reverse);
     // `value_type` tracks whether we have saved a Value entry in this call.
-    // Starts as 0 (Deletion) so the break condition does not fire on the
-    // first visible entry.
-    let mut value_type: u8 = 0; // 0 = Deletion, 1 = Value
+    // Starts as Deletion so the break condition does not fire on the first
+    // visible entry.
+    let mut value_type = ValueType::Deletion;
 
     while self.iter.valid() {
       let ikey = self.iter.key();
-      if let Some((user_key, seq, vtype)) = parse_internal_key(ikey) {
-        if seq <= self.sequence {
+      if let Some(ParsedInternalKey {
+        user_key,
+        sequence,
+        value_type: vtype,
+      }) = parse_internal_key(ikey)
+      {
+        if sequence <= self.sequence {
           // Stop when we encounter a value entry for a user key that is
           // strictly smaller than the one we saved (we've found our answer).
-          if value_type != 0
+          if value_type == ValueType::Value
             && self
               .comparator
               .compare(user_key, self.saved_key.as_slice())
@@ -181,7 +185,7 @@ impl DbIterator {
             break;
           }
           value_type = vtype;
-          if vtype == 0 {
+          if vtype == ValueType::Deletion {
             // Deletion marker: clear the saved entry (this key is deleted).
             self.saved_key.clear();
             self.saved_value.clear();
@@ -203,7 +207,7 @@ impl DbIterator {
       self.iter.prev();
     }
 
-    if value_type == 0 {
+    if value_type == ValueType::Deletion {
       // Reached the beginning without finding a visible entry.
       self.valid = false;
       self.saved_key.clear();
@@ -249,7 +253,7 @@ impl DbIterator {
     // Seek the internal iterator to `(user_key, snapshot_seq, Value)`, the
     // largest internal key that sorts at or before any real entry for this
     // user key at the snapshot.
-    let ikey = make_internal_key(user_key, self.sequence, 1);
+    let ikey = make_internal_key(user_key, self.sequence, VALUE_TYPE_FOR_SEEK);
     self.iter.seek(&ikey);
     if self.iter.valid() {
       let mut skip = Vec::new();
@@ -286,7 +290,7 @@ impl DbIterator {
       // then advance.  Borrowed parse + amortised buffer — no allocation
       // (matching LevelDB, where saved_key_ doubles as the skip scratch).
       self.saved_key.clear();
-      if let Some((uk, _, _)) = parse_internal_key(self.iter.key()) {
+      if let Some(ParsedInternalKey { user_key: uk, .. }) = parse_internal_key(self.iter.key()) {
         self.saved_key.extend_from_slice(uk);
       }
       self.iter.next();
@@ -316,7 +320,7 @@ impl DbIterator {
       // key, then scan backward until we see a different (smaller) user key.
       debug_assert!(self.iter.valid());
       self.saved_key.clear();
-      if let Some((uk, _, _)) = parse_internal_key(self.iter.key()) {
+      if let Some(ParsedInternalKey { user_key: uk, .. }) = parse_internal_key(self.iter.key()) {
         self.saved_key.extend_from_slice(uk);
       }
       loop {
@@ -327,7 +331,7 @@ impl DbIterator {
           self.saved_value.clear();
           return;
         }
-        if let Some((uk, _, _)) = parse_internal_key(self.iter.key()) {
+        if let Some(ParsedInternalKey { user_key: uk, .. }) = parse_internal_key(self.iter.key()) {
           if self
             .comparator
             .compare(uk, self.saved_key.as_slice())
@@ -351,9 +355,7 @@ impl DbIterator {
     debug_assert!(self.valid);
     if self.direction == Direction::Forward {
       let ikey = self.iter.key();
-      parse_internal_key(ikey)
-        .map(|(uk, _, _)| uk)
-        .unwrap_or(ikey)
+      parse_internal_key(ikey).map_or(ikey, |k| k.user_key)
     } else {
       &self.saved_key
     }
@@ -382,7 +384,7 @@ mod tests {
   use super::*;
   use crate::db::merge_iter::MergingIterator;
   use crate::table::builder::TableBuilder;
-  use crate::table::format::make_internal_key;
+  use crate::table::format::{make_internal_key, ValueType};
   use crate::table::reader::Table;
 
   fn bytewise_cmp() -> Arc<dyn Comparator> {
@@ -393,7 +395,7 @@ mod tests {
 
   /// Build an SSTable from internal-key / value pairs and return a boxed
   /// `TwoLevelIterator` over it.
-  fn table_iter(pairs: &[(&[u8], u64, u8, &[u8])]) -> Box<dyn InternalIterator> {
+  fn table_iter(pairs: &[(&[u8], u64, ValueType, &[u8])]) -> Box<dyn InternalIterator> {
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let file = tmp.reopen().unwrap();
     let mut builder = TableBuilder::new(
@@ -440,7 +442,7 @@ mod tests {
   #[test]
   fn single_value_visible() {
     // seq=1 entry, snapshot=10 → visible.
-    let child = table_iter(&[(b"foo", 1, 1, b"bar")]);
+    let child = table_iter(&[(b"foo", 1, ValueType::Value, b"bar")]);
     let mut it = make_db_iter(vec![child], 10);
     it.seek_to_first();
     assert!(it.valid());
@@ -453,7 +455,7 @@ mod tests {
   #[test]
   fn entry_above_snapshot_invisible() {
     // Entry written at seq=5 is not visible at snapshot=4.
-    let child = table_iter(&[(b"foo", 5, 1, b"bar")]);
+    let child = table_iter(&[(b"foo", 5, ValueType::Value, b"bar")]);
     let mut it = make_db_iter(vec![child], 4);
     it.seek_to_first();
     assert!(!it.valid());
@@ -464,7 +466,10 @@ mod tests {
     // Higher-seq entries must come first in the SSTable (internal key: seq DESC).
     // seq=2: delete "foo" (comes first); seq=1: put "foo"="bar" (comes second).
     // At snapshot=10 "foo" is deleted.
-    let child = table_iter(&[(b"foo", 2, 0, b""), (b"foo", 1, 1, b"bar")]);
+    let child = table_iter(&[
+      (b"foo", 2, ValueType::Deletion, b""),
+      (b"foo", 1, ValueType::Value, b"bar"),
+    ]);
     let mut it = make_db_iter(vec![child], 10);
     it.seek_to_first();
     assert!(!it.valid(), "tombstone should hide the older value");
@@ -473,7 +478,10 @@ mod tests {
   #[test]
   fn tombstone_below_snapshot_hides_value() {
     // Tombstone at seq=3 (comes first), value at seq=1.  Snapshot=5 sees both → key deleted.
-    let child = table_iter(&[(b"a", 3, 0, b""), (b"a", 1, 1, b"v1")]);
+    let child = table_iter(&[
+      (b"a", 3, ValueType::Deletion, b""),
+      (b"a", 1, ValueType::Value, b"v1"),
+    ]);
     let mut it = make_db_iter(vec![child], 5);
     it.seek_to_first();
     assert!(!it.valid());
@@ -483,7 +491,10 @@ mod tests {
   fn tombstone_above_snapshot_does_not_hide_value() {
     // Tombstone at seq=5 (comes first in SSTable), value at seq=1.
     // Snapshot=3: tombstone seq=5 > snapshot → invisible; value seq=1 ≤ snapshot → visible.
-    let child = table_iter(&[(b"a", 5, 0, b""), (b"a", 1, 1, b"v1")]);
+    let child = table_iter(&[
+      (b"a", 5, ValueType::Deletion, b""),
+      (b"a", 1, ValueType::Value, b"v1"),
+    ]);
     let mut it = make_db_iter(vec![child], 3);
     it.seek_to_first();
     assert!(it.valid());
@@ -495,7 +506,10 @@ mod tests {
   fn newest_version_wins() {
     // Two versions of "foo".  Higher seq (3) comes first in SSTable.
     // Snapshot sees both; newest (seq=3) is returned; older (seq=1) is skipped.
-    let child = table_iter(&[(b"foo", 3, 1, b"new"), (b"foo", 1, 1, b"old")]);
+    let child = table_iter(&[
+      (b"foo", 3, ValueType::Value, b"new"),
+      (b"foo", 1, ValueType::Value, b"old"),
+    ]);
     let mut it = make_db_iter(vec![child], 10);
     it.seek_to_first();
     assert!(it.valid());
@@ -507,7 +521,11 @@ mod tests {
 
   #[test]
   fn iterate_multiple_keys() {
-    let child = table_iter(&[(b"a", 1, 1, b"1"), (b"b", 2, 1, b"2"), (b"c", 3, 1, b"3")]);
+    let child = table_iter(&[
+      (b"a", 1, ValueType::Value, b"1"),
+      (b"b", 2, ValueType::Value, b"2"),
+      (b"c", 3, ValueType::Value, b"3"),
+    ]);
     let mut it = make_db_iter(vec![child], 10);
     it.seek_to_first();
     for (k, v) in [(b"a" as &[u8], b"1" as &[u8]), (b"b", b"2"), (b"c", b"3")] {
@@ -522,9 +540,9 @@ mod tests {
   #[test]
   fn seek_positions_at_correct_key() {
     let child = table_iter(&[
-      (b"apple", 1, 1, b"a"),
-      (b"banana", 2, 1, b"b"),
-      (b"cherry", 3, 1, b"c"),
+      (b"apple", 1, ValueType::Value, b"a"),
+      (b"banana", 2, ValueType::Value, b"b"),
+      (b"cherry", 3, ValueType::Value, b"c"),
     ]);
     let mut it = make_db_iter(vec![child], 10);
     it.seek(b"banana");
@@ -540,9 +558,9 @@ mod tests {
   fn seek_skips_to_next_visible_key() {
     // "b" is deleted; seeking to "b" should yield "c".
     let child = table_iter(&[
-      (b"a", 1, 1, b"a"),
-      (b"b", 2, 0, b""), // tombstone
-      (b"c", 3, 1, b"c"),
+      (b"a", 1, ValueType::Value, b"a"),
+      (b"b", 2, ValueType::Deletion, b""), // tombstone
+      (b"c", 3, ValueType::Value, b"c"),
     ]);
     let mut it = make_db_iter(vec![child], 10);
     it.seek(b"b");
@@ -552,7 +570,7 @@ mod tests {
 
   #[test]
   fn seek_past_all_keys_not_valid() {
-    let child = table_iter(&[(b"a", 1, 1, b"1")]);
+    let child = table_iter(&[(b"a", 1, ValueType::Value, b"1")]);
     let mut it = make_db_iter(vec![child], 10);
     it.seek(b"z");
     assert!(!it.valid());
@@ -564,14 +582,14 @@ mod tests {
     // Source 1 (older, L0): put a@2, put b@1, put d@1
     // Snapshot = 10.  Expected visible keys: a@5=v2, c@3=vc, d@1=vd (b deleted).
     let c0 = table_iter(&[
-      (b"a", 5, 1, b"v2"),
-      (b"b", 4, 0, b""), // tombstone
-      (b"c", 3, 1, b"vc"),
+      (b"a", 5, ValueType::Value, b"v2"),
+      (b"b", 4, ValueType::Deletion, b""), // tombstone
+      (b"c", 3, ValueType::Value, b"vc"),
     ]);
     let c1 = table_iter(&[
-      (b"a", 2, 1, b"v1"),
-      (b"b", 1, 1, b"vb"),
-      (b"d", 1, 1, b"vd"),
+      (b"a", 2, ValueType::Value, b"v1"),
+      (b"b", 1, ValueType::Value, b"vb"),
+      (b"d", 1, ValueType::Value, b"vd"),
     ]);
     let mut it = make_db_iter(vec![c0, c1], 10);
     it.seek_to_first();
@@ -602,7 +620,11 @@ mod tests {
 
   #[test]
   fn seek_to_last_basic() {
-    let child = table_iter(&[(b"a", 1, 1, b"1"), (b"b", 2, 1, b"2"), (b"c", 3, 1, b"3")]);
+    let child = table_iter(&[
+      (b"a", 1, ValueType::Value, b"1"),
+      (b"b", 2, ValueType::Value, b"2"),
+      (b"c", 3, ValueType::Value, b"3"),
+    ]);
     let mut it = make_db_iter(vec![child], 10);
     it.seek_to_last();
     assert!(it.valid());
@@ -612,7 +634,11 @@ mod tests {
 
   #[test]
   fn prev_iterates_all_backward() {
-    let child = table_iter(&[(b"a", 1, 1, b"1"), (b"b", 2, 1, b"2"), (b"c", 3, 1, b"3")]);
+    let child = table_iter(&[
+      (b"a", 1, ValueType::Value, b"1"),
+      (b"b", 2, ValueType::Value, b"2"),
+      (b"c", 3, ValueType::Value, b"3"),
+    ]);
     let mut it = make_db_iter(vec![child], 10);
     it.seek_to_last();
     let mut result: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
@@ -634,10 +660,10 @@ mod tests {
   fn prev_tombstone_hides_deleted_key() {
     // del b@3 (first in SSTable for "b"), put b@1; snapshot=10 → "b" deleted.
     let child = table_iter(&[
-      (b"a", 1, 1, b"va"),
-      (b"b", 3, 0, b""), // tombstone
-      (b"b", 1, 1, b"vb"),
-      (b"c", 2, 1, b"vc"),
+      (b"a", 1, ValueType::Value, b"va"),
+      (b"b", 3, ValueType::Deletion, b""), // tombstone
+      (b"b", 1, ValueType::Value, b"vb"),
+      (b"c", 2, ValueType::Value, b"vc"),
     ]);
     let mut it = make_db_iter(vec![child], 10);
     it.seek_to_last();
@@ -652,7 +678,11 @@ mod tests {
   #[test]
   fn prev_snapshot_filters_future_entries() {
     // "c" written at seq=5 is invisible at snapshot=3.
-    let child = table_iter(&[(b"a", 1, 1, b"a"), (b"b", 2, 1, b"b"), (b"c", 5, 1, b"c")]);
+    let child = table_iter(&[
+      (b"a", 1, ValueType::Value, b"a"),
+      (b"b", 2, ValueType::Value, b"b"),
+      (b"c", 5, ValueType::Value, b"c"),
+    ]);
     let mut it = make_db_iter(vec![child], 3);
     it.seek_to_last();
     assert!(it.valid());
@@ -666,7 +696,11 @@ mod tests {
 
   #[test]
   fn prev_after_forward_seek() {
-    let child = table_iter(&[(b"a", 1, 1, b"a"), (b"b", 2, 1, b"b"), (b"c", 3, 1, b"c")]);
+    let child = table_iter(&[
+      (b"a", 1, ValueType::Value, b"a"),
+      (b"b", 2, ValueType::Value, b"b"),
+      (b"c", 3, ValueType::Value, b"c"),
+    ]);
     let mut it = make_db_iter(vec![child], 10);
     it.seek(b"b");
     assert_eq!(it.key(), b"b");
@@ -679,7 +713,11 @@ mod tests {
 
   #[test]
   fn next_after_prev_switches_direction() {
-    let child = table_iter(&[(b"a", 1, 1, b"a"), (b"b", 2, 1, b"b"), (b"c", 3, 1, b"c")]);
+    let child = table_iter(&[
+      (b"a", 1, ValueType::Value, b"a"),
+      (b"b", 2, ValueType::Value, b"b"),
+      (b"c", 3, ValueType::Value, b"c"),
+    ]);
     let mut it = make_db_iter(vec![child], 10);
     it.seek_to_last();
     assert_eq!(it.key(), b"c");

@@ -66,21 +66,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
   let cli = Cli::parse();
 
   let opts = roughdb::Options {
-    create_if_missing: true,
+    open_mode: roughdb::OpenMode::CreateIfMissing,
     ..Default::default()
   };
   let db = Db::open(&cli.dir, opts)?;
 
   match cli.command {
-    Command::Get { key } => match db.get(&key) {
-      Ok(value) => println!("{}", String::from_utf8_lossy(&value)),
-      Err(e) if e.is_not_found() => eprintln!("not found: {key}"),
-      Err(e) => return Err(e.into()),
+    Command::Get { key } => match db.get(&key)? {
+      Some(value) => println!("{}", String::from_utf8_lossy(&value)),
+      None => eprintln!("not found: {key}"),
     },
     Command::Put { key, value } => db.put(key, value)?,
     Command::Delete { key } => db.delete(key)?,
     Command::Flush => db.flush(&FlushOptions::default())?,
-    Command::Compact => db.compact_range(None, None)?,
+    Command::Compact => db.compact_range(..)?,
   }
 
   Ok(())

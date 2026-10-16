@@ -23,31 +23,46 @@ pub enum CompressionType {
   Zstd(i32),
 }
 
+/// Whether [`Db::open`](crate::Db::open) may create the database, or must.
+///
+/// Replaces LevelDB's `create_if_missing` and `error_if_exists` flags, whose
+/// fourth combination (may not create, must not exist) could only fail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum OpenMode {
+  /// Open an existing database; fail if there is none.
+  #[default]
+  Existing,
+  /// Open the database, creating it if it does not exist.
+  CreateIfMissing,
+  /// Create a new database; fail if one already exists.
+  CreateNew,
+}
+
 /// Options that control the overall behaviour of a database.
 ///
 /// See `include/leveldb/options.h`.
 #[derive(Clone)]
 pub struct Options {
   // ── Behaviour ───────────────────────────────────────────────────────────
-  /// Create the database if it does not already exist.
+  /// Whether opening may, or must, create the database.
   ///
-  /// Default: false.
-  pub create_if_missing: bool,
-
-  /// Return an error if the database already exists.
-  ///
-  /// Default: false.
-  pub error_if_exists: bool,
+  /// Default: [`OpenMode::Existing`].
+  pub open_mode: OpenMode,
 
   /// Aggressively check data integrity; stop early on any detected error.
   ///
   /// When set, acts as a database-wide `verify_checksums = true`: every SSTable block read
-  /// (both point lookups via [`Db::get`] and iterator block reads) verifies its CRC32c checksum,
-  /// and WAL and MANIFEST records are checksum-verified during recovery.  Any mismatch returns
-  /// [`Error::Corruption`].
+  /// (both point lookups via [`Db::get`] and iterator block reads) verifies its CRC32c
+  /// checksum, and WAL and MANIFEST records are checksum-verified during recovery.  Any
+  /// mismatch returns [`Error::Corruption`].
   ///
   /// This flag is OR-ed with [`ReadOptions::verify_checksums`] on each individual read, so
   /// per-read verification can also be enabled independently.
+  ///
+  /// [`Db::get`]: crate::Db::get
+  /// [`Error::Corruption`]: crate::Error::Corruption
+  /// [`ReadOptions::verify_checksums`]: crate::ReadOptions::verify_checksums
   ///
   /// Default: false.
   pub paranoid_checks: bool,
@@ -164,8 +179,7 @@ pub struct Options {
 impl Default for Options {
   fn default() -> Self {
     Options {
-      create_if_missing: false,
-      error_if_exists: false,
+      open_mode: OpenMode::Existing,
       paranoid_checks: false,
       write_buffer_size: 4 * 1024 * 1024,
       max_open_files: 1_000,
@@ -188,8 +202,7 @@ impl Default for Options {
 impl std::fmt::Debug for Options {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     f.debug_struct("Options")
-      .field("create_if_missing", &self.create_if_missing)
-      .field("error_if_exists", &self.error_if_exists)
+      .field("open_mode", &self.open_mode)
       .field("paranoid_checks", &self.paranoid_checks)
       .field("write_buffer_size", &self.write_buffer_size)
       .field("max_open_files", &self.max_open_files)

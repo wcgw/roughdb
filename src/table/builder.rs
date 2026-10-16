@@ -263,7 +263,7 @@ impl TableBuilder {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::table::format::make_internal_key;
+  use crate::table::format::{make_internal_key, ValueType};
   use crate::table::reader::{LookupResult as L, Table};
 
   /// Build a table from (user_key, value) pairs using internal keys with ascending sequence numbers.
@@ -279,7 +279,7 @@ mod tests {
       Arc::new(crate::comparator::BytewiseComparator),
     );
     for (seq, &(k, v)) in pairs.iter().enumerate() {
-      let ikey = make_internal_key(k, seq as u64 + 1, 1);
+      let ikey = make_internal_key(k, seq as u64 + 1, ValueType::Value);
       builder.add(&ikey, v).unwrap();
     }
     let size = builder.finish().unwrap();
@@ -315,11 +315,15 @@ mod tests {
     )
     .unwrap();
     assert!(
-      matches!(table.get(&make_internal_key(b"hello", u64::MAX, 1), false, true).unwrap(), L::Value(v) if v == b"world")
+      matches!(table.get(&make_internal_key(b"hello", u64::MAX, ValueType::Value), false, true).unwrap(), L::Value(v) if v == b"world")
     );
     assert!(matches!(
       table
-        .get(&make_internal_key(b"missing", u64::MAX, 1), false, true)
+        .get(
+          &make_internal_key(b"missing", u64::MAX, ValueType::Value),
+          false,
+          true
+        )
         .unwrap(),
       L::NotInTable
     ));
@@ -339,7 +343,7 @@ mod tests {
     .unwrap();
     for (k, v) in &pairs {
       assert!(
-        matches!(table.get(&make_internal_key(k, u64::MAX, 1), false, true).unwrap(), L::Value(ref val) if val == v)
+        matches!(table.get(&make_internal_key(k, u64::MAX, ValueType::Value), false, true).unwrap(), L::Value(ref val) if val == v)
       );
     }
   }
@@ -366,7 +370,7 @@ mod tests {
       Arc::new(crate::comparator::BytewiseComparator),
     );
     for (seq, (k, v)) in pairs.iter().enumerate() {
-      let ikey = make_internal_key(k, seq as u64 + 1, 1);
+      let ikey = make_internal_key(k, seq as u64 + 1, ValueType::Value);
       builder.add(&ikey, v).unwrap();
     }
     let size = builder.finish().unwrap();
@@ -380,7 +384,7 @@ mod tests {
     .unwrap();
     for (k, v) in &pairs {
       assert!(
-        matches!(table.get(&make_internal_key(k, u64::MAX, 1), false, true).unwrap(), L::Value(ref val) if val == v)
+        matches!(table.get(&make_internal_key(k, u64::MAX, ValueType::Value), false, true).unwrap(), L::Value(ref val) if val == v)
       );
     }
   }
@@ -400,7 +404,7 @@ mod tests {
       Arc::new(crate::comparator::BytewiseComparator),
     );
     for (seq, &(k, v)) in pairs.iter().enumerate() {
-      let ikey = make_internal_key(k, seq as u64 + 1, 1);
+      let ikey = make_internal_key(k, seq as u64 + 1, ValueType::Value);
       builder.add(&ikey, v).unwrap();
     }
     let size = builder.finish().unwrap();
@@ -421,7 +425,7 @@ mod tests {
     .unwrap();
     for (k, v) in &pairs {
       assert!(
-        matches!(table.get(&make_internal_key(k, u64::MAX, 1), false, true).unwrap(), L::Value(ref val) if val == v)
+        matches!(table.get(&make_internal_key(k, u64::MAX, ValueType::Value), false, true).unwrap(), L::Value(ref val) if val == v)
       );
     }
   }
@@ -440,7 +444,7 @@ mod tests {
     .unwrap();
     for (k, v) in &pairs {
       assert!(
-        matches!(table.get(&make_internal_key(k, u64::MAX, 1), false, true).unwrap(), L::Value(ref val) if val == v)
+        matches!(table.get(&make_internal_key(k, u64::MAX, ValueType::Value), false, true).unwrap(), L::Value(ref val) if val == v)
       );
     }
   }

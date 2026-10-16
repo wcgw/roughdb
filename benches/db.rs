@@ -112,7 +112,9 @@ fn read_benchmarks(c: &mut Criterion) {
   group.bench_function("sequential", |b| {
     b.iter(|| {
       for i in 0..N {
-        black_box(db.get(make_key(i))).unwrap();
+        black_box(db.get(make_key(i)))
+          .unwrap()
+          .expect("key present");
       }
     });
   });
@@ -146,7 +148,7 @@ fn read_benchmarks(c: &mut Criterion) {
   group.bench_function("missing", |b| {
     b.iter(|| {
       for i in N..2 * N {
-        black_box(db.get(make_key(i))).unwrap_err().is_not_found();
+        assert!(black_box(db.get(make_key(i))).unwrap().is_none());
       }
     });
   });
@@ -219,7 +221,7 @@ fn compaction_benchmarks(c: &mut Criterion) {
       || {
         let dir = tempfile::tempdir().unwrap();
         let opts = Options {
-          create_if_missing: true,
+          open_mode: roughdb::OpenMode::CreateIfMissing,
           ..Options::default()
         };
         let db = Db::open(dir.path(), opts).unwrap();
@@ -243,7 +245,7 @@ fn compaction_benchmarks(c: &mut Criterion) {
       || {
         let dir = tempfile::tempdir().unwrap();
         let opts = Options {
-          create_if_missing: true,
+          open_mode: roughdb::OpenMode::CreateIfMissing,
           ..Options::default()
         };
         let db = Db::open(dir.path(), opts).unwrap();
@@ -258,7 +260,7 @@ fn compaction_benchmarks(c: &mut Criterion) {
         (dir, db)
       },
       |(dir, db)| {
-        db.compact_range(None, None).unwrap();
+        db.compact_range(..).unwrap();
         black_box((dir, db));
       },
       BatchSize::PerIteration,
@@ -284,7 +286,7 @@ fn disk_read_benchmarks(c: &mut Criterion) {
 
   let dir = tempfile::tempdir().unwrap();
   let opts = Options {
-    create_if_missing: true,
+    open_mode: roughdb::OpenMode::CreateIfMissing,
     max_file_size: 64 << 10,
     ..Options::default()
   };
@@ -293,13 +295,15 @@ fn disk_read_benchmarks(c: &mut Criterion) {
     db.put(make_key(i), VALUE).unwrap();
   }
   db.flush(&FlushOptions { wait: true }).unwrap();
-  db.compact_range(None, None).unwrap();
+  db.compact_range(..).unwrap();
 
   // random gets against a leveled, on-disk database.
   group.bench_function("random", |b| {
     b.iter(|| {
       for &i in &order {
-        black_box(db.get(make_key(i))).unwrap();
+        black_box(db.get(make_key(i)))
+          .unwrap()
+          .expect("key present");
       }
     });
   });
@@ -309,7 +313,7 @@ fn disk_read_benchmarks(c: &mut Criterion) {
   group.bench_function("missing", |b| {
     b.iter(|| {
       for i in N..2 * N {
-        black_box(db.get(make_key(i))).unwrap_err().is_not_found();
+        assert!(black_box(db.get(make_key(i))).unwrap().is_none());
       }
     });
   });
@@ -338,7 +342,7 @@ fn concurrency_benchmarks(c: &mut Criterion) {
 
   let dir = tempfile::tempdir().unwrap();
   let opts = Options {
-    create_if_missing: true,
+    open_mode: roughdb::OpenMode::CreateIfMissing,
     ..Options::default()
   };
   let db = Arc::new(Db::open(dir.path(), opts).unwrap());
@@ -368,8 +372,9 @@ fn concurrency_benchmarks(c: &mut Criterion) {
       let start = std::time::Instant::now();
       for _ in 0..iters {
         for &i in &order {
-          if let Err(e) = black_box(db.get(make_key(i))) {
-            panic!("key {i} → {e:?} during concurrent sync writes");
+          match black_box(db.get(make_key(i))) {
+            Ok(Some(_)) => {}
+            other => panic!("key {i} → {other:?} during concurrent sync writes"),
           }
         }
       }

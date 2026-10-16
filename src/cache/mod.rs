@@ -18,68 +18,20 @@
 //! already cloned the `Arc<Vec<u8>>` remains valid independently.
 //!
 //! The key is `(cache_id, block_offset)`.  Each `Table` gets a unique `cache_id`
-//! from [`BlockCache::new_id`] so blocks from different files never collide even
+//! from `BlockCache::new_id` so blocks from different files never collide even
 //! when file numbers are reused after compaction.
 //!
 //! Default capacity: 8 MiB (matching LevelDB's `Options::block_cache` default).
 
+pub(crate) mod lru;
+
 use crate::table::block::Block;
-use std::collections::{HashMap, VecDeque};
+use lru::Lru;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Default block cache capacity in bytes.
 pub const DEFAULT_BLOCK_CACHE_CAPACITY: usize = 8 * 1024 * 1024;
-
-struct CacheInner {
-  /// Maximum total bytes of block data held in the cache.
-  capacity: usize,
-  /// Current total bytes charged (sum of `block.data().len()` for each entry).
-  usage: usize,
-  /// LRU order: front = least-recently used, back = most-recently used.
-  order: VecDeque<(u64, u64)>,
-  /// Maps `(cache_id, block_offset) → Block`.
-  map: HashMap<(u64, u64), Block>,
-}
-
-impl CacheInner {
-  fn get(&mut self, cache_id: u64, offset: u64) -> Option<Block> {
-    let key = (cache_id, offset);
-    let block = self.map.get(&key)?.clone();
-    // Promote to MRU.
-    if let Some(pos) = self.order.iter().position(|&k| k == key) {
-      self.order.remove(pos);
-    }
-    self.order.push_back(key);
-    Some(block)
-  }
-
-  fn insert(&mut self, cache_id: u64, offset: u64, block: Block) {
-    let key = (cache_id, offset);
-    let charge = block.data().len();
-
-    // If already present, replace and update usage.
-    if let Some(old) = self.map.remove(&key) {
-      self.usage = self.usage.saturating_sub(old.data().len());
-      if let Some(pos) = self.order.iter().position(|&k| k == key) {
-        self.order.remove(pos);
-      }
-    }
-
-    // Evict LRU entries until we have room (or only one entry remains).
-    while self.usage + charge > self.capacity && !self.order.is_empty() {
-      if let Some(evict_key) = self.order.pop_front() {
-        if let Some(evicted) = self.map.remove(&evict_key) {
-          self.usage = self.usage.saturating_sub(evicted.data().len());
-        }
-      }
-    }
-
-    self.order.push_back(key);
-    self.map.insert(key, block);
-    self.usage += charge;
-  }
-}
 
 /// An LRU cache of decompressed SSTable data blocks, keyed by `(cache_id, block_offset)`.
 ///
@@ -89,7 +41,14 @@ impl CacheInner {
 #[derive(Clone)]
 pub struct BlockCache {
   next_id: Arc<AtomicU64>,
-  inner: Arc<Mutex<CacheInner>>,
+  /// Blocks keyed by `(cache_id, block_offset)`, charged by their size in bytes.
+  blocks: Arc<Mutex<Lru<(u64, u64), Block>>>,
+}
+
+impl std::fmt::Debug for BlockCache {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("BlockCache").finish_non_exhaustive()
+  }
 }
 
 impl BlockCache {
@@ -97,12 +56,7 @@ impl BlockCache {
   pub fn new(capacity: usize) -> Self {
     BlockCache {
       next_id: Arc::new(AtomicU64::new(1)),
-      inner: Arc::new(Mutex::new(CacheInner {
-        capacity,
-        usage: 0,
-        order: VecDeque::new(),
-        map: HashMap::new(),
-      })),
+      blocks: Arc::new(Mutex::new(Lru::new(capacity))),
     }
   }
 
@@ -118,12 +72,22 @@ impl BlockCache {
   ///
   /// Returns a clone of the cached `Block` on hit (cheap — `Block` wraps `Arc<Vec<u8>>`).
   pub(crate) fn get(&self, cache_id: u64, offset: u64) -> Option<Block> {
-    self.inner.lock().unwrap().get(cache_id, offset)
+    self
+      .blocks
+      .lock()
+      .unwrap()
+      .get(&(cache_id, offset))
+      .cloned()
   }
 
   /// Insert `block` at `(cache_id, block_offset)`, evicting LRU entries as needed.
   pub(crate) fn insert(&self, cache_id: u64, offset: u64, block: Block) {
-    self.inner.lock().unwrap().insert(cache_id, offset, block);
+    let charge = block.data().len();
+    self
+      .blocks
+      .lock()
+      .unwrap()
+      .insert((cache_id, offset), block, charge);
   }
 }
 
