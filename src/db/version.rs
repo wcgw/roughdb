@@ -28,9 +28,14 @@ use std::sync::Arc;
 /// Port of LevelDB `Version::GetStats`.
 pub(crate) struct GetStats {
   /// The first file charged with a wasted seek, if any.
-  pub seek_file: Option<Arc<FileMetaData>>,
-  /// Level of `seek_file`.
-  pub seek_file_level: usize,
+  pub seek_file: Option<LevelFile>,
+}
+
+/// A live file together with the level it is at.
+#[derive(Clone)]
+pub(crate) struct LevelFile {
+  pub level: usize,
+  pub file: Arc<FileMetaData>,
 }
 
 /// Number of levels in the LSM tree.
@@ -61,8 +66,9 @@ pub(crate) struct Version {
   /// Best compaction score across all levels.  -1.0 before `finalize` is called.
   /// Score ≥ 1.0 means this level should be compacted.
   pub compaction_score: f64,
-  /// Level with the highest compaction score.  -1 before `finalize` is called.
-  pub compaction_level: i32,
+  /// Level with the highest compaction score; meaningless before `finalize`
+  /// is called, when the score is -1.0.
+  pub compaction_level: usize,
 }
 
 impl Version {
@@ -81,7 +87,7 @@ impl Version {
       files,
       comparator,
       compaction_score: -1.0,
-      compaction_level: -1,
+      compaction_level: 0,
     }
   }
 
@@ -120,12 +126,8 @@ impl Version {
     fill_cache: bool,
     tc: &TableCache,
   ) -> Result<(LookupResult, GetStats), Error> {
-    let mut stats = GetStats {
-      seek_file: None,
-      seek_file_level: 0,
-    };
-    let mut last_file_read: Option<Arc<FileMetaData>> = None;
-    let mut last_file_read_level: usize = 0;
+    let mut stats = GetStats { seek_file: None };
+    let mut last_file_read: Option<LevelFile> = None;
 
     // Build the lookup internal key once; every table probe reuses it.
     let lookup_key = crate::table::format::make_internal_key(
@@ -137,12 +139,13 @@ impl Version {
     // Helper: record blame on the previous file before moving to a new one.
     macro_rules! charge_prev {
       ($meta:expr, $level:expr) => {
-        if last_file_read.is_some() && stats.seek_file.is_none() {
-          stats.seek_file = last_file_read.clone();
-          stats.seek_file_level = last_file_read_level;
+        if stats.seek_file.is_none() {
+          stats.seek_file = last_file_read.take();
         }
-        last_file_read = Some(Arc::clone($meta));
-        last_file_read_level = $level;
+        last_file_read = Some(LevelFile {
+          level: $level,
+          file: Arc::clone($meta),
+        });
       };
     }
 
@@ -374,7 +377,7 @@ pub(crate) fn max_bytes_for_level(level: usize) -> f64 {
 /// Must be called on an owned `Version` before it is wrapped in `Arc`.  Uses
 /// [`L0_COMPACTION_TRIGGER`] as the L0 file-count threshold.
 pub(crate) fn finalize(version: &mut Version) {
-  let mut best_level = -1i32;
+  let mut best_level = 0;
   let mut best_score = -1.0f64;
 
   for level in 0..(NUM_LEVELS - 1) {
@@ -386,7 +389,7 @@ pub(crate) fn finalize(version: &mut Version) {
     };
     if score > best_score {
       best_score = score;
-      best_level = level as i32;
+      best_level = level;
     }
   }
 

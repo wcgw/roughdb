@@ -33,7 +33,8 @@
 //! (`DoCompactionWork`).
 
 use crate::cache::BlockCache;
-use crate::db::version_edit::{FileMetaData, VersionEdit};
+use crate::db::version::LevelFile;
+use crate::db::version_edit::{CompactPointer, FileMetaData};
 use crate::error::Error;
 use crate::options::Options;
 use crate::table::builder::TableBuilder;
@@ -226,8 +227,10 @@ pub(crate) struct Compaction {
   pub(crate) grandparents: Vec<Arc<FileMetaData>>,
   /// Version snapshot used to build this plan.
   input_version: Arc<crate::db::version::Version>,
-  /// VersionEdit carrying the compact_pointer update (filled by setup_other_inputs).
-  pub(crate) edit: VersionEdit,
+  /// Where `level`'s round-robin cursor moves once this compaction is
+  /// installed (set by `setup_other_inputs`); `None` for manual compactions,
+  /// which leave it alone.
+  pub(crate) compact_pointer: Option<CompactPointer>,
 
   // ── Gap 4: grandparent-overlap output limiting ────────────────────────────
   /// Index into `grandparents` of the next file to scan in `should_stop_before`.
@@ -249,7 +252,7 @@ impl Compaction {
       inputs: [Vec::new(), Vec::new()],
       grandparents: Vec::new(),
       input_version,
-      edit: VersionEdit::new(),
+      compact_pointer: None,
       grandparent_index: 0,
       seen_key: false,
       overlapped_bytes: 0,
@@ -266,7 +269,7 @@ impl Compaction {
 
 /// Populate `spec.inputs[1]` (level+1 files), try to expand inputs[0] without
 /// pulling in more level+1 files, populate grandparents, and record the
-/// compact-pointer update in `spec.edit`.
+/// compact-pointer update in `spec.compact_pointer`.
 ///
 /// Port of LevelDB's `VersionSet::SetupOtherInputs`.
 fn setup_other_inputs(
@@ -324,7 +327,10 @@ fn setup_other_inputs(
 
   // Update compact_pointer: advance past largest key of inputs[0].
   let (_, new_largest) = get_range(&spec.inputs[0], cmp);
-  spec.edit.compact_pointers.push((level as i32, new_largest));
+  spec.compact_pointer = Some(CompactPointer {
+    level,
+    key: new_largest,
+  });
 }
 
 /// Returns `true` when the current output SSTable should be closed because the
@@ -409,12 +415,12 @@ pub(crate) fn pick_compaction(
   version: &Arc<crate::db::version::Version>,
   compact_pointer: &[Vec<u8>; crate::db::version::NUM_LEVELS],
   opts: &Options,
-  seek_compact: Option<&(Arc<FileMetaData>, usize)>,
+  seek_compact: Option<&LevelFile>,
 ) -> Option<Compaction> {
   let cmp = &*opts.comparator;
   // ── Size-triggered (highest priority) ─────────────────────────────────────
   if version.compaction_score >= 1.0 {
-    let level = version.compaction_level as usize;
+    let level = version.compaction_level;
     let mut spec = Compaction::new(level, Arc::clone(version));
 
     if level == 0 {
@@ -462,7 +468,7 @@ pub(crate) fn pick_compaction(
   }
 
   // ── Seek-triggered fallback ────────────────────────────────────────────────
-  if let Some((file, level)) = seek_compact {
+  if let Some(LevelFile { level, file }) = seek_compact {
     let mut spec = Compaction::new(*level, Arc::clone(version));
     spec.inputs[0].push(Arc::clone(file));
     setup_other_inputs(&mut spec, version, compact_pointer, opts);
@@ -471,10 +477,6 @@ pub(crate) fn pick_compaction(
 
   None
 }
-/// Alias for a plain (level_inputs, next_level_inputs) pair returned by
-/// `pick_range_compaction`.  Used only internally by `compact_level_range`.
-type CompactionInputs = (Vec<Arc<FileMetaData>>, Vec<Arc<FileMetaData>>);
-
 /// A completed compaction output SSTable.
 pub(crate) struct CompactionOutput {
   pub(crate) file_number: u64,
@@ -756,18 +758,19 @@ pub(crate) fn file_overlaps_range(
     && end.is_none_or(|e| cmp.compare(file_small, e).is_le())
 }
 
-/// Select files for a range-based compaction of `level` → `level + 1`.
+/// Plan a manual compaction of `level` → `level + 1` over the user-key range
+/// `[begin, end]` (`None` = unbounded).
 ///
-/// Returns `(level_inputs, next_level_inputs)` for files at `level` that
-/// overlap `[begin, end]` and the `level+1` files that overlap their union
-/// range.  Returns `None` if there is nothing to compact.
+/// The inputs are the files at `level` that overlap the range and the
+/// `level+1` files that overlap their union.  Returns `None` if no file at
+/// `level` overlaps it.  Manual compactions leave the compact pointers alone.
 pub(crate) fn pick_range_compaction(
-  version: &crate::db::version::Version,
+  version: &Arc<crate::db::version::Version>,
   level: usize,
   begin: Option<&[u8]>,
   end: Option<&[u8]>,
   cmp: &dyn crate::comparator::Comparator,
-) -> Option<CompactionInputs> {
+) -> Option<Compaction> {
   use crate::db::version::NUM_LEVELS;
 
   if level + 1 >= NUM_LEVELS {
@@ -814,7 +817,14 @@ pub(crate) fn pick_range_compaction(
     .cloned()
     .collect();
 
-  Some((level_inputs, next_inputs))
+  let mut spec = Compaction::new(level, Arc::clone(version));
+  spec.inputs = [level_inputs, next_inputs];
+  if level + 2 < NUM_LEVELS {
+    let (smallest, largest) = get_range2(&spec.inputs[0], &spec.inputs[1], cmp);
+    spec.grandparents =
+      version.overlapping_inputs(level + 2, ikey_user_key(&smallest), ikey_user_key(&largest));
+  }
+  Some(spec)
 }
 /// Returns `true` when the compaction can be executed as a trivial move:
 /// a single file at `spec.level` with no `level+1` overlap and acceptable

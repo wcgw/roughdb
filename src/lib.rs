@@ -330,7 +330,7 @@ struct DbState {
   /// File + level nominated for seek-based compaction (its `allowed_seeks` hit
   /// zero).  `None` when no file is pending.  Cleared by `install_compaction`
   /// after the file is removed from the live set.
-  seek_compact_file: Option<(Arc<FileMetaData>, usize)>,
+  seek_compact_file: Option<crate::db::version::LevelFile>,
   /// Set to `true` when `seek_compact_file` is first populated, so the next
   /// `Db::write` compaction loop runs even without a preceding flush.
   compaction_needed: bool,
@@ -1778,7 +1778,7 @@ impl Db {
     edit.next_file_number = Some(next_file_number);
     edit.last_sequence = Some(max_sequence);
     for t in &tables {
-      edit.new_files.push((0, Arc::clone(&t.meta)));
+      edit.add_file(0, Arc::clone(&t.meta));
     }
 
     let manifest_path = path.join(crate::db::version_set::manifest_filename(1));
@@ -2075,7 +2075,7 @@ impl DbInner {
       )
     };
     let mut edit = VersionEdit::new();
-    edit.new_files.push((output_level as i32, meta));
+    edit.add_file(output_level, meta);
     let vs = &mut g.version_set;
     // Use the sequence number captured at rotation time, NOT the current
     // state.last_sequence.  Writes to the new WAL after begin_flush have
@@ -2200,7 +2200,7 @@ fn finish_flush_at_open(
     }
   };
   let mut edit = VersionEdit::new();
-  edit.new_files.push((output_level as i32, meta));
+  edit.add_file(output_level, meta);
   vs.log_and_apply(&mut edit, tc)?;
   log::info!(
     "open-time flush: file {} ({} bytes) at L{output_level}",
@@ -2296,9 +2296,8 @@ const L0_SLOWDOWN_WRITES_TRIGGER: usize = 8;
 const L0_STOP_WRITES_TRIGGER: usize = 12;
 
 use crate::db::compaction::{
-  do_compaction, file_overlaps_range, get_range2, is_trivial_move, needs_compaction,
-  pick_compaction, pick_level_for_memtable_output, pick_range_compaction, Compaction,
-  CompactionOutput,
+  do_compaction, file_overlaps_range, is_trivial_move, needs_compaction, pick_compaction,
+  pick_level_for_memtable_output, pick_range_compaction, Compaction, CompactionOutput,
 };
 /// Extract the user-key prefix from an SSTable internal key.
 /// Canonical implementation lives in `table::format`; aliased here for the
@@ -2324,10 +2323,10 @@ impl DbState {
   /// Called under the DB lock after every SSTable `get` that had to probe more
   /// than one file.  Port of LevelDB `Version::UpdateStats`.
   fn update_stats(&mut self, stats: &crate::db::version::GetStats) {
-    if let Some(ref file) = stats.seek_file {
-      let prev = file.allowed_seeks.fetch_sub(1, Ordering::Relaxed);
+    if let Some(seek_file) = &stats.seek_file {
+      let prev = seek_file.file.allowed_seeks.fetch_sub(1, Ordering::Relaxed);
       if prev <= 1 && self.seek_compact_file.is_none() {
-        self.seek_compact_file = Some((Arc::clone(file), stats.seek_file_level));
+        self.seek_compact_file = Some(seek_file.clone());
         self.compaction_needed = true;
       }
     }
@@ -2349,24 +2348,21 @@ impl DbState {
       return Err(e.clone());
     }
     let vs = &mut self.version_set;
-    let output_level = (spec.level + 1) as i32;
     let mut edit = VersionEdit::new();
     for f in &spec.inputs[0] {
-      edit.deleted_files.push((spec.level as i32, f.number));
+      edit.delete_file(spec.level, f.number);
     }
     for f in &spec.inputs[1] {
-      edit.deleted_files.push((spec.level as i32 + 1, f.number));
+      edit.delete_file(spec.level + 1, f.number);
     }
     for out in outputs {
       // Register the output table in the cache before installing the version.
       tc.insert(out.file_number, out.table);
       let meta = FileMetaData::new(out.file_number, out.file_size, out.smallest, out.largest);
-      edit.new_files.push((output_level, meta));
+      edit.add_file(spec.level + 1, meta);
     }
     // Persist the compact-pointer update so it survives a reopen.
-    for (lvl, key) in &spec.edit.compact_pointers {
-      edit.compact_pointers.push((*lvl, key.clone()));
-    }
+    edit.compact_pointers.extend(spec.compact_pointer.clone());
     // A compaction changes nothing about which writes are in SSTables, so the
     // recovery watermark (`vs.last_sequence`) stays as the last flush left it.
     // Recording `state.last_sequence` here would make recovery skip the WAL
@@ -2376,8 +2372,8 @@ impl DbState {
     // Clear seek_compact_file if the nominated file was removed by this compaction.
     let deleted_numbers: std::collections::HashSet<u64> =
       spec.all_input_files().map(|f| f.number).collect();
-    if let Some((ref f, _)) = self.seek_compact_file {
-      if deleted_numbers.contains(&f.number) {
+    if let Some(nominee) = &self.seek_compact_file {
+      if deleted_numbers.contains(&nominee.file.number) {
         self.seek_compact_file = None;
       }
     }
@@ -2406,14 +2402,10 @@ impl DbState {
 
     let file = Arc::clone(&spec.inputs[0][0]);
     let mut edit = VersionEdit::new();
-    edit.deleted_files.push((spec.level as i32, file.number));
-    edit
-      .new_files
-      .push((spec.level as i32 + 1, Arc::clone(&file)));
+    edit.delete_file(spec.level, file.number);
+    edit.add_file(spec.level + 1, Arc::clone(&file));
     // Persist the compact-pointer update.
-    for (lvl, key) in &spec.edit.compact_pointers {
-      edit.compact_pointers.push((*lvl, key.clone()));
-    }
+    edit.compact_pointers.extend(spec.compact_pointer.clone());
 
     // Keep the table warm: evict the old entry, re-insert under same number.
     // log_and_apply evicts the deleted file; re-insert it here so the next
@@ -2429,8 +2421,8 @@ impl DbState {
     }
 
     // Clear seek_compact_file if this file was the nominee.
-    if let Some((ref scf, _)) = self.seek_compact_file {
-      if scf.number == file.number {
+    if let Some(nominee) = &self.seek_compact_file {
+      if nominee.file.number == file.number {
         self.seek_compact_file = None;
       }
     }
@@ -2463,22 +2455,9 @@ impl DbInner {
     };
 
     let cmp = &*self.options.comparator;
-    let Some((level_inputs, next_inputs)) = pick_range_compaction(&version, level, begin, end, cmp)
-    else {
+    let Some(mut spec) = pick_range_compaction(&version, level, begin, end, cmp) else {
       return Ok(false);
     };
-
-    // Build a Compaction from the range-compaction inputs.
-    let mut spec = Compaction::new(level, Arc::clone(&version));
-    spec.inputs[0] = level_inputs;
-    spec.inputs[1] = next_inputs;
-    // No compact-pointer update for manual range compactions.
-    // Populate grandparents if level+2 < NUM_LEVELS.
-    if level + 2 < crate::db::version::NUM_LEVELS {
-      let (s, l) = get_range2(&spec.inputs[0], &spec.inputs[1], cmp);
-      spec.grandparents =
-        version.overlapping_inputs(level + 2, ikey_user_key(&s), ikey_user_key(&l));
-    }
 
     // Phase 2: I/O (no lock; the allocator takes it briefly per output file).
     let mut alloc = || {
@@ -4848,8 +4827,10 @@ mod tests {
     // Simulate the update_stats call that Db::get would make.
     use crate::db::version::GetStats;
     let stats = GetStats {
-      seek_file: Some(Arc::clone(&version.files_at(0)[0])),
-      seek_file_level: 0,
+      seek_file: Some(crate::db::version::LevelFile {
+        level: 0,
+        file: Arc::clone(&version.files_at(0)[0]),
+      }),
     };
     let cmp: Arc<dyn crate::comparator::Comparator> = Arc::new(crate::BytewiseComparator);
     let mut ds = super::DbState::new(
@@ -4903,8 +4884,10 @@ mod tests {
     file.allowed_seeks.store(1, Ordering::Relaxed);
 
     let stats = GetStats {
-      seek_file: Some(Arc::clone(&file)),
-      seek_file_level: 0,
+      seek_file: Some(crate::db::version::LevelFile {
+        level: 0,
+        file: Arc::clone(&file),
+      }),
     };
     let cmp: Arc<dyn crate::comparator::Comparator> = Arc::new(crate::BytewiseComparator);
     let mut ds = super::DbState::new(
@@ -4920,9 +4903,9 @@ mod tests {
       "seek_compact_file should be set once budget hits 0"
     );
     assert!(ds.compaction_needed, "compaction_needed should be set");
-    let (nominated, level) = ds.seek_compact_file.as_ref().unwrap();
-    assert_eq!(nominated.number, 1);
-    assert_eq!(*level, 0);
+    let nominee = ds.seek_compact_file.as_ref().unwrap();
+    assert_eq!(nominee.file.number, 1);
+    assert_eq!(nominee.level, 0);
   }
 
   #[test]

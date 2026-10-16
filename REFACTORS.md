@@ -41,10 +41,15 @@ change no public API.  Items 6–10 do, and are acceptable as a 0.x minor bump.
   caches.  `disk_read/random` went from 8.29 ms to 6.37 ms (−23%) per 10,000 gets; `disk_read/missing`, which takes
   no block-cache hits, is unchanged.
 
-- [ ] **5. Named types instead of tuples and mixed level integers.**  `VersionEdit` carries
+- [x] **5. Named types instead of tuples and mixed level integers.**  `VersionEdit` carries
   `Vec<(i32, Arc<FileMetaData>)>`, `Vec<(i32, u64)>` and `Vec<(i32, Vec<u8>)>`; `seek_compact_file` is an
   `Option<(Arc<FileMetaData>, usize)>`; `pick_range_compaction` returns a bare pair of input lists.  Levels are
   `i32` in edits but `usize` everywhere else (7 `as i32` casts in `lib.rs`): `i32` only in the encoder and decoder.
+  *Done:* `VersionEdit` holds `NewFile`, `DeletedFile` and `CompactPointer` entries (built with `add_file` /
+  `delete_file`), all with `usize` levels; `Version::compaction_level` is a `usize` too.  The seek nominee and
+  `GetStats` carry a `LevelFile`; `Compaction` carries an `Option<CompactPointer>` instead of a whole `VersionEdit`;
+  `pick_range_compaction` returns a complete `Compaction`, grandparents included.  Found on the way: `decode` did not
+  bound levels, so a corrupt MANIFEST level panicked recovery with an out-of-bounds index; it is now `Corruption`.
 
 ## Public API (breaking)
 
