@@ -95,12 +95,17 @@ change no public API.  Items 6–10 do, and are acceptable as a 0.x minor bump.
   bytes used to be stored as the tombstone's unread value).  Not covered by a test: a tombstone only reaches the
   filter when the key has data below the output level, which `compact_range` alone cannot set up.
 
+- [ ] **12. `DbIter` is `Send`.**  It boxes `dyn InternalIterator`, which has no `Send` bound, so an iterator cannot
+  move to another thread, as a LevelDB iterator can.  Adding `Send` is additive.  Found while doing the auto-trait
+  test below.
+
 ## Small items
 
 - [x] `Db`, `DbIter` and `WriteBatch` implement `Debug`.  *Done:* so do `ForwardIter`, `BlockCache` and
   `BloomFilterPolicy`, which also lacked it; `#![warn(missing_debug_implementations)]` keeps it that way.  `Db` gained
   the doc comment it was missing.
-- [ ] A test pins `Db: Send + Sync`.
+- [x] A test pins `Db: Send + Sync`.  *Done:* with `Snapshot`, `WriteBatch` and `Options` (`Error` has its own).
+  `DbIter` is not `Send`: see item 12.
 - [ ] `Snapshot` is `#[must_use]` (`let _ = db.get_snapshot()` releases it immediately).
 - [ ] `Drop for Db` reports a background-thread panic instead of discarding it (`t.join().ok()`).
 - [ ] Public functions document `# Errors` and `# Panics` (34 and 8 missing under clippy's pedantic lints); the 4

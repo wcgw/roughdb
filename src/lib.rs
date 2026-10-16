@@ -2783,6 +2783,16 @@ mod tests {
     }
   }
 
+  /// The handles a caller shares between threads must stay shareable.
+  #[test]
+  fn public_handles_are_send_and_sync() {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<Db>();
+    assert_send_sync::<crate::Snapshot<'static>>();
+    assert_send_sync::<WriteBatch>();
+    assert_send_sync::<Options>();
+  }
+
   #[test]
   fn in_memory_round_trip() {
     let db = Db::default();
