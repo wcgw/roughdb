@@ -23,7 +23,7 @@ cargo add roughdb
 
 ### Opening a database
 
-```rust
+```rust,no_run
 use roughdb::{Db, OpenMode, Options};
 
 let opts = Options {
@@ -32,18 +32,19 @@ let opts = Options {
 };
 
 let db = Db::open("/tmp/my_db", opts)?;
+Ok::<(), roughdb::Error>(())
 ```
 
 Use `Db::default()` for a lightweight in-memory database (no WAL, no flush):
 
 ```rust
-let db = Db::default();
+let db = roughdb::Db::default();
 ```
 
 ### Basic reads and writes
 
 ```rust
-use roughdb::{ReadOptions, WriteOptions};
+let db = roughdb::Db::default();
 
 // Write
 db.put(b"hello", b"world")?;
@@ -54,6 +55,7 @@ match db.get(b"hello")? {
     Some(value) => println!("got: {}", String::from_utf8_lossy(&value)),
     None => println!("not found"),
 }
+Ok::<(), roughdb::Error>(())
 ```
 
 ### Atomic batch writes
@@ -61,12 +63,14 @@ match db.get(b"hello")? {
 ```rust
 use roughdb::{WriteBatch, WriteOptions};
 
+let db = roughdb::Db::default();
 let mut batch = WriteBatch::new();
 batch.put(b"key1", b"val1");
 batch.put(b"key2", b"val2");
 batch.delete(b"old_key");
 
-db.write(&WriteOptions::default(), &batch)?;
+db.write(&WriteOptions::default(), batch)?;
+Ok::<(), roughdb::Error>(())
 ```
 
 ### Iterating over keys
@@ -77,6 +81,7 @@ Iterators start unpositioned — call `seek_to_first`, `seek_to_last`, or
 ```rust
 use roughdb::ReadOptions;
 
+let db = roughdb::Db::default();
 let mut it = db.new_iterator(&ReadOptions::default())?;
 
 // Forward
@@ -99,6 +104,7 @@ while it.valid() {
     println!("{:?}", it.key());
     it.next();
 }
+Ok::<(), roughdb::Error>(())
 ```
 
 ### Snapshots
@@ -109,6 +115,7 @@ only writes that preceded the snapshot.
 ```rust
 use roughdb::ReadOptions;
 
+let db = roughdb::Db::default();
 let snap = db.snapshot();
 
 // Reads with this snapshot see the state at the moment it was taken.
@@ -117,17 +124,21 @@ let value = db.get_with_options(&opts, b"key")?;
 let mut it = db.new_iterator(&opts)?;
 
 // snap releases automatically when it goes out of scope.
+Ok::<(), roughdb::Error>(())
 ```
 
 
 ### Manual compaction
 
 ```rust
+let db = roughdb::Db::default();
+
 // Compact everything
 db.compact_range(..)?;
 
 // Compact a specific key range
 db.compact_range(b"aaa".as_slice()..=b"zzz".as_slice())?;
+Ok::<(), roughdb::Error>(())
 ```
 
 ## Building and testing

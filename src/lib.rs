@@ -148,6 +148,12 @@ pub(crate) mod table;
 pub mod write_batch;
 pub use write_batch::{BatchOp, WriteBatch};
 
+/// The README's examples, compiled as doctests so that they cannot drift from
+/// the API.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+pub struct ReadmeDoctests;
+
 /// Internal hooks for `benches/skiplist.rs`.  Only built with `--features bench`; not a public API.
 #[cfg(feature = "bench")]
 #[doc(hidden)]
