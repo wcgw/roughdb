@@ -97,7 +97,9 @@ change no public API.  Items 6–10 do, and are acceptable as a 0.x minor bump.
 
 ## Small items
 
-- [ ] `Db`, `DbIter` and `WriteBatch` implement `Debug`.
+- [x] `Db`, `DbIter` and `WriteBatch` implement `Debug`.  *Done:* so do `ForwardIter`, `BlockCache` and
+  `BloomFilterPolicy`, which also lacked it; `#![warn(missing_debug_implementations)]` keeps it that way.  `Db` gained
+  the doc comment it was missing.
 - [ ] A test pins `Db: Send + Sync`.
 - [ ] `Snapshot` is `#[must_use]` (`let _ = db.get_snapshot()` releases it immediately).
 - [ ] `Drop for Db` reports a background-thread panic instead of discarding it (`t.join().ok()`).

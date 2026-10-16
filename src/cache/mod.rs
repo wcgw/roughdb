@@ -45,6 +45,12 @@ pub struct BlockCache {
   blocks: Arc<Mutex<Lru<(u64, u64), Block>>>,
 }
 
+impl std::fmt::Debug for BlockCache {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("BlockCache").finish_non_exhaustive()
+  }
+}
+
 impl BlockCache {
   /// Create a new block cache with the given byte capacity.
   pub fn new(capacity: usize) -> Self {

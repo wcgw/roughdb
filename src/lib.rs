@@ -108,6 +108,8 @@
 //! # Ok::<(), roughdb::Error>(())
 //! ```
 
+#![warn(missing_debug_implementations)]
+
 use crate::db::table_cache::TableCache;
 use crate::db::version_edit::{FileMetaData, VersionEdit};
 use crate::db::version_set::VersionSet;
@@ -501,6 +503,14 @@ pub struct DbIter {
   inner: db::db_iter::DbIterator,
 }
 
+impl std::fmt::Debug for DbIter {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("DbIter")
+      .field("valid", &self.valid())
+      .finish_non_exhaustive()
+  }
+}
+
 impl DbIter {
   /// Returns `true` if the iterator is positioned at a valid entry.
   pub fn valid(&self) -> bool {
@@ -595,6 +605,7 @@ impl DbIter {
 ///
 /// Yields `Ok((key, value))` pairs as owned `Vec<u8>`s, advancing forward from
 /// wherever the parent `DbIter` was positioned when `forward()` was called.
+#[derive(Debug)]
 pub struct ForwardIter<'a> {
   inner: &'a mut DbIter,
   done: bool,
@@ -642,9 +653,24 @@ pub(crate) struct DbInner {
   shutting_down: AtomicBool,
 }
 
+/// An open database: a persistent one from [`Db::open`], or an in-memory one
+/// from [`Db::default`].
+///
+/// All methods take `&self`; share a `Db` between threads with an `Arc`.
+/// Dropping it waits for the background thread to flush any memtable it was
+/// already handed, then releases the `LOCK` file.
 pub struct Db {
   pub(crate) inner: Arc<DbInner>,
   bg_thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl std::fmt::Debug for Db {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    let path = self.inner.persistence.as_ref().map(|p| &p.dir);
+    f.debug_struct("Db")
+      .field("path", &path)
+      .finish_non_exhaustive()
+  }
 }
 
 impl Default for Db {
@@ -5297,9 +5323,8 @@ mod tests {
       db.put(b"k", b"v").unwrap();
     }
     // Reopen with default (bytewise) comparator — should fail.
-    let err = Db::open(dir.path(), Options::default())
-      .err()
-      .expect("expected comparator mismatch error");
+    let err =
+      Db::open(dir.path(), Options::default()).expect_err("expected comparator mismatch error");
     assert!(
       matches!(err, Error::InvalidArgument(_)),
       "expected InvalidArgument for comparator mismatch, got {err:?}"

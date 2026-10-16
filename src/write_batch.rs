@@ -138,6 +138,21 @@ impl Default for WriteBatch {
   }
 }
 
+impl std::fmt::Debug for WriteBatch {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    struct Ops<'a>(&'a WriteBatch);
+    impl std::fmt::Debug for Ops<'_> {
+      fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.0.iter()).finish()
+      }
+    }
+    f.debug_struct("WriteBatch")
+      .field("sequence", &self.sequence())
+      .field("ops", &Ops(self))
+      .finish()
+  }
+}
+
 impl<'a> IntoIterator for &'a WriteBatch {
   type Item = Result<BatchOp<'a>, Error>;
   type IntoIter = Iter<'a>;
@@ -272,6 +287,17 @@ mod tests {
     assert_eq!(
       ops(&b).unwrap(),
       vec![put(b"a", b"1"), delete(b"b"), put(b"c", b"3"),]
+    );
+  }
+
+  #[test]
+  fn debug_lists_the_operations() {
+    let mut b = WriteBatch::new();
+    b.put(b"a", b"1");
+    b.delete(b"b");
+    assert_eq!(
+      format!("{b:?}"),
+      "WriteBatch { sequence: 0, ops: [Ok(Put { key: [97], value: [49] }), Ok(Delete { key: [98] })] }"
     );
   }
 

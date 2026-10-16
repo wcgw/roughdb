@@ -85,6 +85,7 @@ fn bloom_hash(key: &[u8]) -> u32 {
 /// ```
 ///
 /// See `util/bloom.cc` and `include/leveldb/filter_policy.h`.
+#[derive(Debug, Clone)]
 pub struct BloomFilterPolicy {
   bits_per_key: usize,
   /// Number of hash functions: `round(bits_per_key * ln(2))`, clamped to `[1, 30]`.
