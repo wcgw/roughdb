@@ -128,7 +128,11 @@ impl Version {
     let mut last_file_read_level: usize = 0;
 
     // Build the lookup internal key once; every table probe reuses it.
-    let lookup_key = crate::table::format::make_internal_key(user_key, sequence, 1);
+    let lookup_key = crate::table::format::make_internal_key(
+      user_key,
+      sequence,
+      crate::table::format::VALUE_TYPE_FOR_SEEK,
+    );
 
     // Helper: record blame on the previous file before moving to a new one.
     macro_rules! charge_prev {
@@ -392,9 +396,7 @@ pub(crate) fn finalize(version: &mut Version) {
 
 /// Render an internal key as an escaped user-key string.
 fn format_user_key(ikey: &[u8]) -> String {
-  let user_key = parse_internal_key(ikey)
-    .map(|(uk, _, _)| uk)
-    .unwrap_or(ikey);
+  let user_key = parse_internal_key(ikey).map_or(ikey, |k| k.user_key);
   let mut s = String::new();
   for &b in user_key {
     if b.is_ascii_graphic() || b == b' ' {
@@ -410,7 +412,7 @@ fn format_user_key(ikey: &[u8]) -> String {
 mod tests {
   use super::*;
   use crate::comparator::BytewiseComparator;
-  use crate::table::format::make_internal_key;
+  use crate::table::format::{make_internal_key, ValueType};
 
   /// Build a file covering user-key range `[lo, hi]`.  These overlap/range
   /// queries can now be tested against a hand-built `Version` — no `Db`, no
@@ -419,8 +421,8 @@ mod tests {
     FileMetaData::new(
       number,
       1000,
-      make_internal_key(lo, 1, 1),
-      make_internal_key(hi, 1, 1),
+      make_internal_key(lo, 1, ValueType::Value),
+      make_internal_key(hi, 1, ValueType::Value),
     )
   }
 
@@ -437,7 +439,7 @@ mod tests {
   /// Lookup internal key for `uk` (seq = MAX sorts before any stored entry of
   /// the same user key, matching how `Version::get` builds it).
   fn lookup(uk: &[u8]) -> Vec<u8> {
-    make_internal_key(uk, u64::MAX, 1)
+    make_internal_key(uk, u64::MAX, ValueType::Value)
   }
 
   #[test]

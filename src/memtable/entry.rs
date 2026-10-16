@@ -22,27 +22,10 @@
 //! did not come from these writers).
 
 use crate::coding::{read_varu64, write_varu64};
+use crate::table::format::ValueType;
 use std::fmt::Debug;
 use std::fmt::Formatter;
 use std::slice;
-
-#[derive(Debug, PartialEq)]
-enum ValueType {
-  Deletion,
-  Value,
-}
-
-impl TryFrom<u8> for ValueType {
-  type Error = ();
-
-  fn try_from(value: u8) -> Result<Self, Self::Error> {
-    match value {
-      0 => Ok(ValueType::Deletion),
-      1 => Ok(ValueType::Value),
-      _ => Err(()),
-    }
-  }
-}
 
 /// A decoded entry: borrowed views into the arena bytes it was read from.
 #[derive(Clone, Copy, Debug)]
@@ -229,7 +212,7 @@ impl<'a> Entry<'a> {
     let mut pos = ksize + klen as usize;
     let (_seq, seq_size) = read_varu64(&self.data[pos..]);
     pos += seq_size;
-    let vtype = ValueType::try_from(self.data[pos]).expect("corrupt entry");
+    let vtype = ValueType::from_byte(self.data[pos]).expect("corrupt entry");
     pos += 1;
     match vtype {
       ValueType::Deletion => None,

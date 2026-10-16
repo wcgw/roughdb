@@ -594,9 +594,13 @@ pub(crate) fn do_compaction(
     'entry: {
       let ikey = merger.key();
 
-      let (uk, seq, vtype) = match crate::table::format::parse_internal_key(ikey) {
-        Some(parts) => parts,
-        None => break 'entry, // corrupt key — skip silently
+      let Some(crate::table::format::ParsedInternalKey {
+        user_key: uk,
+        sequence: seq,
+        value_type: vtype,
+      }) = crate::table::format::parse_internal_key(ikey)
+      else {
+        break 'entry; // corrupt key — skip silently
       };
 
       // Track first occurrence of this user key.
@@ -617,7 +621,7 @@ pub(crate) fn do_compaction(
         // A newer version for this user key was already emitted and is visible
         // to even the oldest active snapshot — this older version is invisible.
         true
-      } else if vtype == 0
+      } else if vtype == crate::table::format::ValueType::Deletion
         && seq <= oldest_snapshot
         && is_base_level_for_key(spec, uk, &*opts.comparator)
       {
@@ -640,7 +644,7 @@ pub(crate) fn do_compaction(
       // Entries still visible to a live snapshot are never filtered (seq > oldest_snapshot).
       if let Some(ref mut filter) = compaction_filter {
         if first_occurrence && seq <= oldest_snapshot {
-          match filter.filter(output_level, uk, &value, vtype) {
+          match filter.filter(output_level, uk, &value, vtype as u8) {
             crate::compaction_filter::CompactionDecision::Keep => {}
             crate::compaction_filter::CompactionDecision::Remove => break 'entry,
             crate::compaction_filter::CompactionDecision::ChangeValue(new_val) => {
@@ -833,15 +837,15 @@ mod tests {
   fn add_boundary_inputs_includes_same_user_key() {
     use crate::db::version::Version;
     use crate::db::version_edit::FileMetaData;
-    use crate::table::format::make_internal_key;
+    use crate::table::format::{make_internal_key, ValueType};
     use std::sync::Arc;
 
     // Two files at L1 with the same user key "k" but different sequence numbers.
     // File A: smallest=("k", seq=5), largest=("k", seq=5)
     // File B: smallest=("k", seq=2), largest=("k", seq=2)
     // (higher seq sorts before lower seq in internal key order)
-    let ikey_high = make_internal_key(b"k", 5, 1);
-    let ikey_low = make_internal_key(b"k", 2, 1);
+    let ikey_high = make_internal_key(b"k", 5, ValueType::Value);
+    let ikey_low = make_internal_key(b"k", 2, ValueType::Value);
 
     let file_a = FileMetaData::new(10, 100, ikey_high.clone(), ikey_high.clone());
     let file_b = FileMetaData::new(11, 100, ikey_low.clone(), ikey_low.clone());
@@ -870,15 +874,15 @@ mod tests {
     // then verify is_trivial_move returns true.
     use crate::db::version::Version;
     use crate::db::version_edit::FileMetaData;
-    use crate::table::format::make_internal_key;
+    use crate::table::format::{make_internal_key, ValueType};
     use std::sync::Arc;
 
     let make_meta = |number: u64, small: &[u8], large: &[u8]| -> Arc<FileMetaData> {
       FileMetaData::new(
         number,
         4096,
-        make_internal_key(small, 10, 1u8), // 1 = Value
-        make_internal_key(large, 1, 1u8),
+        make_internal_key(small, 10, ValueType::Value), // 1 = Value
+        make_internal_key(large, 1, ValueType::Value),
       )
     };
 
@@ -926,15 +930,15 @@ mod tests {
   fn trivial_move_not_trivial_when_next_level_has_files() {
     use crate::db::version::Version;
     use crate::db::version_edit::FileMetaData;
-    use crate::table::format::make_internal_key;
+    use crate::table::format::{make_internal_key, ValueType};
     use std::sync::Arc;
 
     let make_meta = |number: u64, small: &[u8], large: &[u8]| -> Arc<FileMetaData> {
       FileMetaData::new(
         number,
         4096,
-        make_internal_key(small, 10, 1u8),
-        make_internal_key(large, 1, 1u8),
+        make_internal_key(small, 10, ValueType::Value),
+        make_internal_key(large, 1, ValueType::Value),
       )
     };
 
@@ -965,15 +969,15 @@ mod tests {
     // outside, and that the cursor only ever moves forward.
     use crate::db::version::Version;
     use crate::db::version_edit::FileMetaData;
-    use crate::table::format::make_internal_key;
+    use crate::table::format::{make_internal_key, ValueType};
     use std::sync::Arc;
 
     let make_meta = |number: u64, small: &[u8], large: &[u8]| -> Arc<FileMetaData> {
       FileMetaData::new(
         number,
         4096,
-        make_internal_key(small, 10, 1u8),
-        make_internal_key(large, 1, 1u8),
+        make_internal_key(small, 10, ValueType::Value),
+        make_internal_key(large, 1, ValueType::Value),
       )
     };
 
@@ -1008,15 +1012,15 @@ mod tests {
   fn should_stop_before_triggers_on_excess_grandparent_overlap() {
     use crate::db::version::Version;
     use crate::db::version_edit::FileMetaData;
-    use crate::table::format::make_internal_key;
+    use crate::table::format::{make_internal_key, ValueType};
     use std::sync::Arc;
 
     let make_meta = |number: u64, small: &[u8], large: &[u8], size: u64| -> Arc<FileMetaData> {
       FileMetaData::new(
         number,
         size,
-        make_internal_key(small, 10, 1u8),
-        make_internal_key(large, 1, 1u8),
+        make_internal_key(small, 10, ValueType::Value),
+        make_internal_key(large, 1, ValueType::Value),
       )
     };
 
@@ -1039,9 +1043,9 @@ mod tests {
 
     // Feed keys that advance past each grandparent file.
     // Keys are internal keys; construct them to be > each file's largest.
-    let after_d = make_internal_key(b"e", 0, 0u8); // > "d" in ikey order
-    let after_g = make_internal_key(b"h", 0, 0u8);
-    let after_k = make_internal_key(b"l", 0, 0u8);
+    let after_d = make_internal_key(b"e", 0, ValueType::Deletion); // > "d" in ikey order
+    let after_g = make_internal_key(b"h", 0, ValueType::Deletion);
+    let after_k = make_internal_key(b"l", 0, ValueType::Deletion);
 
     // First key — seen_key becomes true, no bytes accumulated yet.
     assert!(!should_stop_before(&mut spec, &after_d, &opts));

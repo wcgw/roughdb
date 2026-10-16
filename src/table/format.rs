@@ -58,12 +58,48 @@ pub(crate) const FOOTER_ENCODED_LENGTH: usize = 2 * MAX_ENCODED_HANDLE_LENGTH + 
 
 // ── Internal key helpers ─────────────────────────────────────────────────────
 
+/// What an entry for a user key records: a value, or its deletion.
+///
+/// The discriminants are the on-disk encoding, shared by internal-key tags,
+/// memtable entries and WAL batch records.  Matches LevelDB's `ValueType`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum ValueType {
+  Deletion = 0,
+  Value = 1,
+}
+
+impl ValueType {
+  /// Decode an encoded value type; `None` for a byte no type uses, which can
+  /// only come from corrupt data.
+  pub(crate) fn from_byte(byte: u8) -> Option<Self> {
+    match byte {
+      0 => Some(ValueType::Deletion),
+      1 => Some(ValueType::Value),
+      _ => None,
+    }
+  }
+}
+
+/// An internal key split into its parts.  Port of LevelDB's `ParsedInternalKey`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ParsedInternalKey<'a> {
+  pub(crate) user_key: &'a [u8],
+  pub(crate) sequence: u64,
+  pub(crate) value_type: ValueType,
+}
+
 /// Encode an SSTable internal key (`user_key || tag`) into `buf`, replacing any
 /// previous contents.  Reusing a caller-owned buffer avoids a per-key
 /// allocation on hot paths (e.g. iterating a memtable).
 ///
 /// `tag = (seq << 8 | vtype as u64) as u64 LE`.
-pub(crate) fn encode_internal_key_into(buf: &mut Vec<u8>, user_key: &[u8], seq: u64, vtype: u8) {
+pub(crate) fn encode_internal_key_into(
+  buf: &mut Vec<u8>,
+  user_key: &[u8],
+  seq: u64,
+  vtype: ValueType,
+) {
   buf.clear();
   buf.reserve(user_key.len() + 8);
   buf.extend_from_slice(user_key);
@@ -73,9 +109,7 @@ pub(crate) fn encode_internal_key_into(buf: &mut Vec<u8>, user_key: &[u8], seq: 
 
 /// Construct an SSTable internal key: `user_key || tag` where
 /// `tag = (seq << 8 | vtype as u64) as u64 LE`.
-///
-/// `vtype`: `1` = Value, `0` = Deletion — matches `memtable/entry.rs: ValueType`.
-pub(crate) fn make_internal_key(user_key: &[u8], seq: u64, vtype: u8) -> Vec<u8> {
+pub(crate) fn make_internal_key(user_key: &[u8], seq: u64, vtype: ValueType) -> Vec<u8> {
   let mut out = Vec::new();
   encode_internal_key_into(&mut out, user_key, seq, vtype);
   out
@@ -86,9 +120,9 @@ pub(crate) fn make_internal_key(user_key: &[u8], seq: u64, vtype: u8) -> Vec<u8>
 pub(crate) const MAX_SEQUENCE_NUMBER: u64 = (1 << 56) - 1;
 
 /// Value type used in synthetic seek keys: with sequence descending inside a
-/// user key, `(MAX_SEQUENCE_NUMBER, 1)` sorts before every real entry for
-/// that key.  Matches LevelDB's `kValueTypeForSeek`.
-pub(crate) const VALUE_TYPE_FOR_SEEK: u8 = 1;
+/// user key, `(MAX_SEQUENCE_NUMBER, VALUE_TYPE_FOR_SEEK)` sorts before every
+/// real entry for that key.  Matches LevelDB's `kValueTypeForSeek`.
+pub(crate) const VALUE_TYPE_FOR_SEEK: ValueType = ValueType::Value;
 
 /// Shorten the internal key `start` to a short internal key in `[start, limit)`,
 /// for index-block separators.
@@ -149,18 +183,18 @@ pub(crate) fn user_key(ikey: &[u8]) -> &[u8] {
   }
 }
 
-/// Extract `(user_key, seq, vtype)` from an SSTable internal key.
+/// Split an SSTable internal key into its parts.
 ///
-/// Returns `None` if `ikey` is shorter than 8 bytes.
-pub(crate) fn parse_internal_key(ikey: &[u8]) -> Option<(&[u8], u64, u8)> {
-  if ikey.len() < 8 {
-    return None;
-  }
-  let (user_key, tag_bytes) = ikey.split_at(ikey.len() - 8);
-  let tag = u64::from_le_bytes(tag_bytes.try_into().unwrap());
-  let seq = tag >> 8;
-  let vtype = (tag & 0xff) as u8;
-  Some((user_key, seq, vtype))
+/// Returns `None` for a corrupt key: shorter than the 8-byte tag, or with a
+/// value type no entry uses.  Port of LevelDB's `ParseInternalKey`.
+pub(crate) fn parse_internal_key(ikey: &[u8]) -> Option<ParsedInternalKey<'_>> {
+  let (user_key, tag_bytes) = ikey.split_at(ikey.len().checked_sub(8)?);
+  let tag = u64::from_le_bytes(tag_bytes.try_into().expect("an 8-byte tag"));
+  Some(ParsedInternalKey {
+    user_key,
+    sequence: tag >> 8,
+    value_type: ValueType::from_byte((tag & 0xff) as u8)?,
+  })
 }
 
 /// Compare two SSTable internal keys: user_key ASC, then sequence DESC
@@ -399,33 +433,45 @@ mod tests {
 
   #[test]
   fn internal_key_round_trip() {
-    let key = b"hello";
-    let seq = 42u64;
-    let vtype = 1u8;
-    let ikey = make_internal_key(key, seq, vtype);
-    let (uk, s, vt) = parse_internal_key(&ikey).unwrap();
-    assert_eq!(uk, key);
-    assert_eq!(s, seq);
-    assert_eq!(vt, vtype);
+    for value_type in [ValueType::Value, ValueType::Deletion] {
+      let ikey = make_internal_key(b"hello", 42, value_type);
+      assert_eq!(
+        parse_internal_key(&ikey),
+        Some(ParsedInternalKey {
+          user_key: b"hello",
+          sequence: 42,
+          value_type
+        })
+      );
+    }
+  }
+
+  #[test]
+  fn parse_internal_key_rejects_corrupt_keys() {
+    assert_eq!(parse_internal_key(b"short"), None);
+    let mut ikey = make_internal_key(b"hello", 42, ValueType::Value);
+    let tag_low_byte = ikey.len() - 8;
+    ikey[tag_low_byte] = 2;
+    assert_eq!(parse_internal_key(&ikey), None);
   }
 
   #[test]
   fn encode_internal_key_into_reuses_buffer_and_matches_make() {
     let mut buf = Vec::new();
-    encode_internal_key_into(&mut buf, b"hello", 42, 1);
-    assert_eq!(buf, make_internal_key(b"hello", 42, 1));
+    encode_internal_key_into(&mut buf, b"hello", 42, ValueType::Value);
+    assert_eq!(buf, make_internal_key(b"hello", 42, ValueType::Value));
 
     // Re-encoding a shorter key into the same buffer replaces the contents and
     // keeps the (already-grown) capacity — no fresh allocation.
     let cap_before = buf.capacity();
-    encode_internal_key_into(&mut buf, b"hi", 7, 0);
-    assert_eq!(buf, make_internal_key(b"hi", 7, 0));
+    encode_internal_key_into(&mut buf, b"hi", 7, ValueType::Deletion);
+    assert_eq!(buf, make_internal_key(b"hi", 7, ValueType::Deletion));
     assert!(buf.capacity() >= cap_before);
   }
 
   #[test]
   fn user_key_strips_tag() {
-    let ikey = make_internal_key(b"apple", 5, 1);
+    let ikey = make_internal_key(b"apple", 5, ValueType::Value);
     assert_eq!(user_key(&ikey), b"apple");
     // Defensive: a too-short slice is returned unchanged.
     assert_eq!(user_key(b"abc"), b"abc");
@@ -434,8 +480,8 @@ mod tests {
   #[test]
   fn cmp_internal_keys_user_key_order() {
     let cmp = crate::comparator::BytewiseComparator;
-    let a = make_internal_key(b"apple", 1, 1);
-    let b = make_internal_key(b"banana", 1, 1);
+    let a = make_internal_key(b"apple", 1, ValueType::Value);
+    let b = make_internal_key(b"banana", 1, ValueType::Value);
     assert_eq!(cmp_internal_keys(&a, &b, &cmp), std::cmp::Ordering::Less);
   }
 
@@ -443,8 +489,8 @@ mod tests {
   fn cmp_internal_keys_seq_desc() {
     let cmp = crate::comparator::BytewiseComparator;
     // Same user key: higher sequence sorts first (Less).
-    let newer = make_internal_key(b"key", 10, 1);
-    let older = make_internal_key(b"key", 5, 1);
+    let newer = make_internal_key(b"key", 10, ValueType::Value);
+    let older = make_internal_key(b"key", 5, ValueType::Value);
     assert_eq!(
       cmp_internal_keys(&newer, &older, &cmp),
       std::cmp::Ordering::Less
@@ -570,13 +616,17 @@ mod tests {
     let cmp = BytewiseComparator;
     // Two versions of the same user key on either side of a block boundary:
     // the user key cannot be shortened, so the separator stays the full key.
-    let mut sep = make_internal_key(b"k", 9, 1);
-    find_shortest_internal_separator(&cmp, &mut sep, &make_internal_key(b"k", 7, 1));
-    assert_eq!(sep, make_internal_key(b"k", 9, 1));
+    let mut sep = make_internal_key(b"k", 9, ValueType::Value);
+    find_shortest_internal_separator(
+      &cmp,
+      &mut sep,
+      &make_internal_key(b"k", 7, ValueType::Value),
+    );
+    assert_eq!(sep, make_internal_key(b"k", 9, ValueType::Value));
     // Distinct user keys: shortened user key plus the maximal tag, sorting
     // strictly between the two.
-    let start = make_internal_key(b"abc1", 5, 1);
-    let limit = make_internal_key(b"abz", 3, 1);
+    let start = make_internal_key(b"abc1", 5, ValueType::Value);
+    let limit = make_internal_key(b"abz", 3, ValueType::Value);
     let mut sep = start.clone();
     find_shortest_internal_separator(&cmp, &mut sep, &limit);
     assert_eq!(user_key(&sep), b"abd");
@@ -589,7 +639,7 @@ mod tests {
       std::cmp::Ordering::Less
     );
     // Successor of the last key: shortened and tagged, still >= the key.
-    let last = make_internal_key(b"abc", 2, 1);
+    let last = make_internal_key(b"abc", 2, ValueType::Value);
     let mut succ = last.clone();
     find_short_internal_successor(&cmp, &mut succ);
     assert_eq!(user_key(&succ), b"b");

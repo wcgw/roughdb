@@ -15,10 +15,13 @@ change no public API.  Items 6–10 do, and are acceptable as a 0.x minor bump.
   `oldest_snapshot` replacing two copies) are `DbState` methods; flush phase 2 is `FlushPrep::write_table`.
   `begin_flush` also hands the sealed memtable to the background thread, which its three callers each did by hand.
 
-- [ ] **2. Typed internal keys.**  `parse_internal_key` returns `Option<(&[u8], u64, u8)>`, and `ValueType` is
+- [x] **2. Typed internal keys.**  `parse_internal_key` returns `Option<(&[u8], u64, u8)>`, and `ValueType` is
   private to `memtable/entry.rs`, so other modules compare against bare literals (`vtype == 0` in
   `db/compaction.rs` and `db/db_iter.rs`, seek keys built with a literal `1`).  One crate-wide `ValueType` and a
   `ParsedInternalKey { user_key, sequence, value_type }` (as in LevelDB) make every match exhaustive.
+  *Done:* `ValueType` and `ParsedInternalKey` live in `table/format.rs`; memtable entries and `WriteBatch` records use
+  the same `ValueType` instead of their own copies.  `parse_internal_key` rejects unknown type bytes, as LevelDB's
+  `ParseInternalKey` does.  The public `CompactionFilter::filter` still takes a raw `u8`: see item 11.
 
 - [ ] **3. Impossible `DbState` combinations become unrepresentable.**  `imm` and `pending_flush` always change
   together (seven sites test `imm.is_some() || pending_flush.is_some()`): one flush-state enum.  `Option<VersionSet>`
@@ -56,6 +59,10 @@ change no public API.  Items 6–10 do, and are acceptable as a 0.x minor bump.
 - [ ] **10. `WriteBatch` iteration as an iterator.**  `iterate(&mut dyn Handler)` is a visitor callback; an
   iterator of `BatchOp`s is the idiomatic shape.  `Inserter` becomes a plain loop and the public `Handler` trait
   goes.
+
+- [ ] **11. `CompactionFilter::filter` takes a value-type enum.**  Its `value_type: u8` argument is documented as
+  "`1` = Value, `0` = Deletion"; a public enum (the crate's `ValueType`, or one of its own) says that in the type.
+  Found while doing item 2.
 
 ## Small items
 

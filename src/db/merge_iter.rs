@@ -155,7 +155,7 @@ impl InternalIterator for MergingIterator {
 mod tests {
   use super::*;
   use crate::table::builder::TableBuilder;
-  use crate::table::format::{make_internal_key, parse_internal_key};
+  use crate::table::format::{make_internal_key, parse_internal_key, ValueType};
   use crate::table::reader::Table;
 
   fn bytewise_cmp() -> Arc<dyn Comparator> {
@@ -166,8 +166,8 @@ mod tests {
 
   fn user_key(ikey: &[u8]) -> &[u8] {
     parse_internal_key(ikey)
-      .map(|(uk, _, _)| uk)
       .expect("valid internal key")
+      .user_key
   }
 
   /// Build an in-memory SSTable from `pairs` and return a `TwoLevelIterator`
@@ -184,7 +184,7 @@ mod tests {
       Arc::new(crate::comparator::BytewiseComparator),
     );
     for (seq, &(k, v)) in pairs.iter().enumerate() {
-      let ikey = make_internal_key(k, seq as u64 + 1, 1);
+      let ikey = make_internal_key(k, seq as u64 + 1, ValueType::Value);
       builder.add(&ikey, v).unwrap();
     }
     let size = builder.finish().unwrap();
@@ -275,7 +275,7 @@ mod tests {
   }
 
   fn make_ikey(key: &[u8], seq: u64) -> Vec<u8> {
-    make_internal_key(key, seq, 1)
+    make_internal_key(key, seq, ValueType::Value)
   }
 
   fn vec_iter(pairs: &[(&[u8], u64, &[u8])]) -> Box<dyn InternalIterator> {

@@ -432,7 +432,7 @@ mod tests {
   use crate::db::table_cache::{TableCache, NUM_NON_TABLE_CACHE_FILES};
   use crate::options::Options;
   use crate::table::builder::TableBuilder;
-  use crate::table::format::make_internal_key;
+  use crate::table::format::{make_internal_key, ValueType};
 
   fn make_tc(dir: &Path) -> TableCache {
     let opts = Options::default();
@@ -447,7 +447,11 @@ mod tests {
   }
 
   /// Write a minimal SSTable at `path/NNNNNN.ldb` and return (file_number, file_size).
-  fn write_sst(dir: &Path, file_number: u64, entries: &[(&[u8], u64, u8, &[u8])]) -> (u64, u64) {
+  fn write_sst(
+    dir: &Path,
+    file_number: u64,
+    entries: &[(&[u8], u64, ValueType, &[u8])],
+  ) -> (u64, u64) {
     let sst_path = dir.join(format!("{file_number:06}.ldb"));
     let file = std::fs::OpenOptions::new()
       .write(true)
@@ -497,7 +501,7 @@ mod tests {
     let tc = make_tc(dir.path());
 
     // Simulate flushing file 3.
-    let (fnum, fsize) = write_sst(dir.path(), 3, &[(b"hello", 1, 1, b"world")]);
+    let (fnum, fsize) = write_sst(dir.path(), 3, &[(b"hello", 1, ValueType::Value, b"world")]);
     let meta = FileMetaData::new(fnum, fsize, b"hello".to_vec(), b"hello".to_vec());
     let mut edit = VersionEdit::new();
     edit.new_files.push((0, meta));
@@ -533,7 +537,7 @@ mod tests {
     .unwrap();
     let tc = make_tc(dir.path());
 
-    let (fnum, fsize) = write_sst(dir.path(), 3, &[(b"key", 1, 1, b"val")]);
+    let (fnum, fsize) = write_sst(dir.path(), 3, &[(b"key", 1, ValueType::Value, b"val")]);
     let meta = FileMetaData::new(fnum, fsize, b"key".to_vec(), b"key".to_vec());
     let mut edit = VersionEdit::new();
     edit.new_files.push((0, meta));

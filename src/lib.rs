@@ -1049,7 +1049,7 @@ impl Db {
   /// See `include/leveldb/db.h: DB::GetApproximateSizes` and
   /// `db/db_impl.cc: DBImpl::GetApproximateSizes`.
   pub fn get_approximate_sizes(&self, ranges: &[(&[u8], &[u8])]) -> Vec<u64> {
-    use crate::table::format::make_internal_key;
+    use crate::table::format::{make_internal_key, MAX_SEQUENCE_NUMBER, VALUE_TYPE_FOR_SEEK};
 
     // Snapshot the current version under the lock, then release.
     let version = {
@@ -1063,11 +1063,10 @@ impl Db {
         let (Some(ref v), Some(ref tc)) = (&version, &self.inner.persistence) else {
           return 0;
         };
-        // Convert user keys to lookup internal keys (seq=u64::MAX>>8, vtype=1)
-        // so they sort before all real entries for the same user key — the same
-        // sentinel used in Table::get.
-        let istart = make_internal_key(start, u64::MAX >> 8, 1);
-        let ilimit = make_internal_key(limit, u64::MAX >> 8, 1);
+        // Convert user keys to seek keys so they sort before all real entries
+        // for the same user key.
+        let istart = make_internal_key(start, MAX_SEQUENCE_NUMBER, VALUE_TYPE_FOR_SEEK);
+        let ilimit = make_internal_key(limit, MAX_SEQUENCE_NUMBER, VALUE_TYPE_FOR_SEEK);
         let start_off = v.approximate_offset_of(&istart, &tc.table_cache);
         let limit_off = v.approximate_offset_of(&ilimit, &tc.table_cache);
         limit_off.saturating_sub(start_off)
@@ -1725,10 +1724,8 @@ impl Db {
           smallest = ikey.to_vec();
         }
         largest = ikey.to_vec();
-        if let Some((_user_key, seq, _vtype)) = parse_internal_key(ikey) {
-          if seq > max_seq {
-            max_seq = seq;
-          }
+        if let Some(k) = parse_internal_key(ikey) {
+          max_seq = max_seq.max(k.sequence);
         }
         iter.next();
       }
@@ -4478,12 +4475,16 @@ mod tests {
   /// Build a bare `Version` (no Arc) with controlled file sizes at each level.
   fn version_with_files(level_sizes: &[(usize, u64)]) -> crate::db::version::Version {
     use crate::db::version_edit::FileMetaData;
-    use crate::table::format::make_internal_key;
+    use crate::table::format::{make_internal_key, ValueType};
 
     let mut v =
       crate::db::version::Version::new(std::sync::Arc::new(crate::comparator::BytewiseComparator));
     for (file_number, &(level, size)) in (10u64..).zip(level_sizes.iter()) {
-      let ikey = make_internal_key(format!("a{file_number}").as_bytes(), file_number, 1);
+      let ikey = make_internal_key(
+        format!("a{file_number}").as_bytes(),
+        file_number,
+        ValueType::Value,
+      );
       let meta = FileMetaData::new(file_number, size, ikey.clone(), ikey);
       v.push_file_for_test(level, meta);
     }
@@ -4815,7 +4816,7 @@ mod tests {
     // its allowed_seeks decremented when more than one file is consulted.
     use crate::db::version::Version;
     use crate::db::version_edit::FileMetaData;
-    use crate::table::format::make_internal_key;
+    use crate::table::format::{make_internal_key, ValueType};
     use std::sync::atomic::Ordering;
     use std::sync::Arc;
 
@@ -4825,8 +4826,8 @@ mod tests {
       FileMetaData::new(
         num,
         4096,
-        make_internal_key(small, 10, 1u8),
-        make_internal_key(large, 1, 1u8),
+        make_internal_key(small, 10, ValueType::Value),
+        make_internal_key(large, 1, ValueType::Value),
       )
     };
 
@@ -4886,7 +4887,7 @@ mod tests {
     use crate::db::version::GetStats;
     use crate::db::version::Version;
     use crate::db::version_edit::FileMetaData;
-    use crate::table::format::make_internal_key;
+    use crate::table::format::{make_internal_key, ValueType};
     use std::sync::atomic::Ordering;
     use std::sync::Arc;
 
@@ -4895,8 +4896,8 @@ mod tests {
       FileMetaData::new(
         num,
         1024,
-        make_internal_key(b"a", 10, 1u8),
-        make_internal_key(b"z", 1, 1u8),
+        make_internal_key(b"a", 10, ValueType::Value),
+        make_internal_key(b"z", 1, ValueType::Value),
       )
     };
 

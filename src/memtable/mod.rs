@@ -20,6 +20,7 @@ use skiplist::SkipList;
 use std::sync::Arc;
 
 use crate::comparator::{BytewiseComparator, Comparator};
+use crate::table::format::ValueType;
 
 #[derive(Debug, PartialEq)]
 pub enum MemtableResult<T> {
@@ -165,7 +166,11 @@ impl<'a> MemTableIterator<'a> {
   fn update_cached(&mut self) {
     if self.inner.valid() {
       let e = self.inner.entry();
-      let vtype: u8 = if e.value.is_some() { 1 } else { 0 };
+      let vtype = if e.value.is_some() {
+        ValueType::Value
+      } else {
+        ValueType::Deletion
+      };
       // Encode in place so `cached_key`'s allocation is reused across steps
       // instead of allocating a fresh `Vec` per entry.
       crate::table::format::encode_internal_key_into(&mut self.cached_key, e.key, e.seq, vtype);
@@ -198,7 +203,7 @@ impl<'a> MemTableIterator<'a> {
   /// invalid.
   pub fn seek(&mut self, target: &[u8]) {
     match crate::table::format::parse_internal_key(target) {
-      Some((user_key, seq, _)) => self.inner.seek(user_key, seq),
+      Some(k) => self.inner.seek(k.user_key, k.sequence),
       None => self.inner.seek(&[], 0),
     }
     self.update_cached();
@@ -433,7 +438,7 @@ mod tests {
 
   // ── MemTableIterator tests ────────────────────────────────────────────────
 
-  use crate::table::format::parse_internal_key;
+  use crate::table::format::{parse_internal_key, ParsedInternalKey};
 
   #[test]
   fn iter_empty_memtable() {
@@ -450,10 +455,14 @@ mod tests {
     it.seek_to_first();
     assert!(it.valid());
     let ikey = it.ikey();
-    let (uk, seq, vtype) = parse_internal_key(&ikey).unwrap();
+    let ParsedInternalKey {
+      user_key: uk,
+      sequence: seq,
+      value_type: vtype,
+    } = parse_internal_key(&ikey).unwrap();
     assert_eq!(uk, b"key");
     assert_eq!(seq, 7);
-    assert_eq!(vtype, 1); // Value
+    assert_eq!(vtype, ValueType::Value);
     assert_eq!(it.value(), b"val");
     it.advance();
     assert!(!it.valid());
@@ -467,10 +476,14 @@ mod tests {
     it.seek_to_first();
     assert!(it.valid());
     let ikey = it.ikey();
-    let (uk, seq, vtype) = parse_internal_key(&ikey).unwrap();
+    let ParsedInternalKey {
+      user_key: uk,
+      sequence: seq,
+      value_type: vtype,
+    } = parse_internal_key(&ikey).unwrap();
     assert_eq!(uk, b"gone");
     assert_eq!(seq, 3);
-    assert_eq!(vtype, 0); // Deletion
+    assert_eq!(vtype, ValueType::Deletion);
     assert_eq!(it.value(), b"");
     it.advance();
     assert!(!it.valid());
@@ -490,8 +503,8 @@ mod tests {
     let mut keys: Vec<(Vec<u8>, u64)> = Vec::new();
     while it.valid() {
       let ikey = it.ikey();
-      let (uk, seq, _vtype) = parse_internal_key(&ikey).unwrap();
-      keys.push((uk.to_vec(), seq));
+      let k = parse_internal_key(&ikey).unwrap();
+      keys.push((k.user_key.to_vec(), k.sequence));
       it.advance();
     }
     // Expected: a@3, a@2, b@1, c@4 (user key ASC, seq DESC within same key)
@@ -529,7 +542,7 @@ mod tests {
     let mut keys: Vec<Vec<u8>> = Vec::new();
     while it.valid() {
       let ikey = it.ikey();
-      let (uk, _, _) = parse_internal_key(&ikey).unwrap();
+      let uk = parse_internal_key(&ikey).unwrap().user_key;
       keys.push(uk.to_vec());
       it.advance();
     }

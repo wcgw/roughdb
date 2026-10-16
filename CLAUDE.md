@@ -65,8 +65,9 @@ The read path checks `mem` → `imm` → each level of SSTables (newest to oldes
   `overlaps_level`, `files_at`, `num_files`. It owns an `Arc<dyn Comparator>` (as does `VersionSet`), so overlap/range
   queries never take a comparator parameter. `L0_COMPACTION_TRIGGER` lives here, next to `finalize`.
 - **`src/table/format.rs`** — canonical internal-key helpers: `user_key` (strip the 8-byte tag; never open-code
-  `&ikey[..len-8]`), `make_internal_key`, `encode_internal_key_into` (in-place, for hot paths), `parse_internal_key`,
-  `cmp_internal_keys`. Also `MAX_BLOCK_SIZE` (16 MiB), the allocation cap for block reads and decompression.
+  `&ikey[..len-8]`), `make_internal_key`, `encode_internal_key_into` (in-place, for hot paths), `parse_internal_key`
+  (→ `ParsedInternalKey`; `None` for a short key or unknown type), `cmp_internal_keys`.  `ValueType` is the one
+  value-type encoding, shared with memtable entries and `WriteBatch` records — never compare against `0`/`1`. Also `MAX_BLOCK_SIZE` (16 MiB), the allocation cap for block reads and decompression.
 - **`src/env.rs`** — `FileSystem` trait with two adapters: `PosixFileSystem` (production) and `MemFileSystem`
   (`#[cfg(test)]`, in-memory). Prefer `MemFileSystem` over tempdirs for new DB-lifecycle tests — it is deterministic
   and disk-free (see `full_db_lifecycle_on_mem_filesystem` in `lib.rs`).

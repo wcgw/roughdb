@@ -13,11 +13,10 @@
 use crate::coding::{
   read_u32_le, read_u64_le, read_varu64, write_u32_le, write_u64_le, write_varu64,
 };
+use crate::table::format::ValueType;
 use crate::Error;
 
 const HEADER_SIZE: usize = 12;
-const TAG_VALUE: u8 = 0x01;
-const TAG_DELETE: u8 = 0x00;
 
 pub trait Handler {
   fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), Error>;
@@ -43,7 +42,7 @@ impl WriteBatch {
   {
     let (key, value) = (key.as_ref(), value.as_ref());
     self.rep.reserve(key.len() + value.len() + 21);
-    self.rep.push(TAG_VALUE);
+    self.rep.push(ValueType::Value as u8);
     let mut tmp = [0u8; 10];
     let n = write_varu64(&mut tmp, key.len() as u64);
     self.rep.extend_from_slice(&tmp[..n]);
@@ -60,7 +59,7 @@ impl WriteBatch {
   {
     let key = key.as_ref();
     self.rep.reserve(key.len() + 11);
-    self.rep.push(TAG_DELETE);
+    self.rep.push(ValueType::Deletion as u8);
     let mut tmp = [0u8; 10];
     let n = write_varu64(&mut tmp, key.len() as u64);
     self.rep.extend_from_slice(&tmp[..n]);
@@ -87,8 +86,8 @@ impl WriteBatch {
     while pos < self.rep.len() {
       let tag = self.rep[pos];
       pos += 1;
-      match tag {
-        TAG_VALUE => {
+      match ValueType::from_byte(tag) {
+        Some(ValueType::Value) => {
           let (klen, ksize) = read_varu64(&self.rep[pos..]);
           if ksize == 0 {
             return Err(Error::Corruption(
@@ -117,7 +116,7 @@ impl WriteBatch {
           pos = vend;
           handler.put(key, value)?;
         }
-        TAG_DELETE => {
+        Some(ValueType::Deletion) => {
           let (klen, ksize) = read_varu64(&self.rep[pos..]);
           if ksize == 0 {
             return Err(Error::Corruption(
@@ -133,7 +132,7 @@ impl WriteBatch {
           pos = kend;
           handler.delete(key)?;
         }
-        _ => {
+        None => {
           return Err(Error::Corruption(format!("unknown WriteBatch tag: {tag}")));
         }
       }

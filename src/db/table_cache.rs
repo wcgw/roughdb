@@ -174,7 +174,7 @@ mod tests {
   use crate::env::PosixFileSystem;
   use crate::options::CompressionType;
   use crate::table::builder::TableBuilder;
-  use crate::table::format::make_internal_key;
+  use crate::table::format::{make_internal_key, ValueType};
 
   fn write_sst(dir: &Path, number: u64, entries: &[(&[u8], &[u8])]) -> u64 {
     let path = dir.join(format!("{number:06}.ldb"));
@@ -188,7 +188,8 @@ mod tests {
       Arc::new(crate::comparator::BytewiseComparator),
     );
     for &(k, v) in entries {
-      b.add(&make_internal_key(k, 1, 1), v).unwrap();
+      b.add(&make_internal_key(k, 1, ValueType::Value), v)
+        .unwrap();
     }
     b.finish().unwrap()
   }
@@ -208,7 +209,7 @@ mod tests {
     let table = tc.get_or_open(3, size).unwrap();
     use crate::table::reader::LookupResult;
     assert!(
-      matches!(table.get(&make_internal_key(b"hello", u64::MAX, 1), false, true).unwrap(), LookupResult::Value(v) if v == b"world")
+      matches!(table.get(&make_internal_key(b"hello", u64::MAX, ValueType::Value), false, true).unwrap(), LookupResult::Value(v) if v == b"world")
     );
   }
 
