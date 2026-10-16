@@ -23,10 +23,15 @@ change no public API.  Items 6–10 do, and are acceptable as a 0.x minor bump.
   the same `ValueType` instead of their own copies.  `parse_internal_key` rejects unknown type bytes, as LevelDB's
   `ParseInternalKey` does.  The public `CompactionFilter::filter` still takes a raw `u8`: see item 11.
 
-- [ ] **3. Impossible `DbState` combinations become unrepresentable.**  `imm` and `pending_flush` always change
+- [x] **3. Impossible `DbState` combinations become unrepresentable.**  `imm` and `pending_flush` always change
   together (seven sites test `imm.is_some() || pending_flush.is_some()`): one flush-state enum.  `Option<VersionSet>`
   and `Option<Persistence>` both encode "is this database persistent?" (21 unwraps, 4 `expect`s): an in-memory
   database gets an empty `VersionSet` instead, leaving `Option<Persistence>` the one place that fact lives.
+  *Done:* `FlushState::{Idle, Pending(FlushPrep), Writing(imm)}` replaces the pair; `begin_flush` asserts it starts
+  from `Idle`.  `VersionSet::in_memory` backs `Db::default()` with an empty `Version` and a MANIFEST that panics if
+  written; `DbState::version_set` is no longer an `Option`, and `DbState::new` replaces five struct literals.  One
+  visible effect: `get_property("leveldb.sstables")` on an in-memory database lists the seven empty levels, as on an
+  empty persistent one, instead of returning `""`.
 
 - [ ] **4. One LRU, O(1).**  `TableCache` and `BlockCache` each carry a copy of a `VecDeque` + `HashMap` LRU whose
   every hit runs `order.iter().position(..)`: a linear scan under a global mutex on the read path (the 8 MiB

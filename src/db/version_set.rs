@@ -83,7 +83,38 @@ pub(crate) struct VersionSet {
   comparator: Arc<dyn crate::comparator::Comparator>,
 }
 
+/// The MANIFEST of an in-memory database, which never records an edit: such a
+/// database never flushes or compacts, so a write here is a bug.
+struct NoManifest;
+
+impl crate::env::WritableFile for NoManifest {
+  fn write(&mut self, _data: &[u8]) -> Result<(), Error> {
+    unreachable!("an in-memory database applied a VersionEdit")
+  }
+  fn flush(&mut self) -> Result<(), Error> {
+    unreachable!("an in-memory database applied a VersionEdit")
+  }
+  fn sync(&mut self) -> Result<(), Error> {
+    unreachable!("an in-memory database applied a VersionEdit")
+  }
+}
+
 impl VersionSet {
+  /// The `VersionSet` of an in-memory database: an empty `Version` that never
+  /// changes, and no MANIFEST.  `log_and_apply` on it panics.
+  pub(crate) fn in_memory(comparator: Arc<dyn crate::comparator::Comparator>) -> Self {
+    VersionSet {
+      current: Arc::new(Version::new(Arc::clone(&comparator))),
+      next_file_number: 1,
+      last_sequence: 0,
+      log_number: 0,
+      manifest_log: LogWriter::new(Box::new(NoManifest), 0),
+      manifest_number: 0,
+      compact_pointer: std::array::from_fn(|_| Vec::new()),
+      comparator,
+    }
+  }
+
   /// Create a brand-new `VersionSet` for a database that has never been opened.
   ///
   /// - Creates `MANIFEST-000002` and writes the initial `VersionEdit`.
