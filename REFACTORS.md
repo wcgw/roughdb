@@ -79,9 +79,13 @@ change no public API.  Items 6–10 do, and are acceptable as a 0.x minor bump.
   *Done:* `Options::open_mode: OpenMode::{Existing (default), CreateIfMissing, CreateNew}`, `#[non_exhaustive]` and
   re-exported at the crate root; `struct_excessive_bools` no longer fires.
 
-- [ ] **10. `WriteBatch` iteration as an iterator.**  `iterate(&mut dyn Handler)` is a visitor callback; an
+- [x] **10. `WriteBatch` iteration as an iterator.**  `iterate(&mut dyn Handler)` is a visitor callback; an
   iterator of `BatchOp`s is the idiomatic shape.  `Inserter` becomes a plain loop and the public `Handler` trait
   goes.
+  *Done:* `WriteBatch::iter()` (and `&WriteBatch: IntoIterator`) yields `Result<BatchOp, Error>`; `Handler` is gone.
+  `Inserter`, a safe type whose soundness rested on its callers, is now `unsafe fn insert_batch` with a `# Safety`
+  section.  Found on the way: a record length near `u64::MAX` overflowed the end offset and panicked (in release
+  too, as a bad slice) while replaying a damaged WAL; such a length is now `Corruption`.
 
 - [ ] **11. `CompactionFilter::filter` takes a value-type enum.**  Its `value_type: u8` argument is documented as
   "`1` = Value, `0` = Deletion"; a public enum (the crate's `ValueType`, or one of its own) says that in the type.

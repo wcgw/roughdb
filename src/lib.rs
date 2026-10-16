@@ -142,7 +142,7 @@ pub(crate) mod logfile;
 pub(crate) mod memtable;
 pub(crate) mod table;
 pub mod write_batch;
-pub use write_batch::{Handler, WriteBatch};
+pub use write_batch::{BatchOp, WriteBatch};
 
 /// Internal hooks for `benches/skiplist.rs`.  Only built with `--features bench`; not a public API.
 #[cfg(feature = "bench")]
@@ -224,33 +224,32 @@ impl Default for ReadOptions<'_> {
 
 // ── Shared inserter used by Db::write, Db::recover_wal and Db::repair ─────────
 
-/// Applies a `WriteBatch` to a memtable, one sequence number per record.
+/// Insert the operations of `batch` into `mem`, the first at sequence `seq`
+/// and each following one at the next sequence.
 ///
-/// Contract: an `Inserter` is only constructed where the caller has exclusive
-/// write access to `mem` — the write leader while its group is in flight (no
-/// other leader can start until it retires the group, and `write_in_progress`
-/// keeps `Db::flush` from rotating the memtable), or WAL recovery / repair
-/// filling a memtable no other thread can write to yet.  That exclusivity is
-/// what makes the `unsafe` calls below sound.
-struct Inserter<'a> {
-  mem: &'a Memtable,
-  seq: u64,
-}
-
-impl Handler for Inserter<'_> {
-  fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), Error> {
-    // SAFETY: see the `Inserter` contract — no concurrent writer exists.
-    unsafe { self.mem.add(self.seq, key, value) };
-    self.seq += 1;
-    Ok(())
+/// # Errors
+///
+/// [`Error::Corruption`] if `batch` is malformed (only a batch read back from
+/// a damaged WAL can be); the operations before the damage are inserted.
+///
+/// # Safety
+///
+/// No other thread may write to `mem` during the call (the contract of
+/// [`Memtable::add`]).  Callers hold that exclusivity as the write leader
+/// while its group is in flight (no other leader can start until it retires
+/// the group, and `write_in_progress` keeps `Db::flush` from rotating the
+/// memtable), or as WAL recovery / repair filling a memtable no other thread
+/// can reach yet.
+unsafe fn insert_batch(mem: &Memtable, batch: &WriteBatch, seq: u64) -> Result<(), Error> {
+  for (seq, op) in (seq..).zip(batch) {
+    match op? {
+      // SAFETY: the caller guarantees there is no concurrent writer.
+      BatchOp::Put { key, value } => unsafe { mem.add(seq, key, value) },
+      // SAFETY: as above.
+      BatchOp::Delete { key } => unsafe { mem.delete(seq, key) },
+    }
   }
-
-  fn delete(&mut self, key: &[u8]) -> Result<(), Error> {
-    // SAFETY: see the `Inserter` contract — no concurrent writer exists.
-    unsafe { self.mem.delete(self.seq, key) };
-    self.seq += 1;
-    Ok(())
-  }
+  Ok(())
 }
 
 // ── DbState: lives inside a Mutex ────────────────────────────────────────────
@@ -890,10 +889,8 @@ impl Db {
           continue;
         }
       }
-      batch.iterate(&mut Inserter {
-        mem,
-        seq: start_seq,
-      })?;
+      // SAFETY: recovery fills a memtable no other thread can reach yet.
+      unsafe { insert_batch(mem, &batch, start_seq)? };
       if batch.count() > 0 {
         let end_seq = start_seq + batch.count() as u64 - 1;
         if end_seq > max_sequence {
@@ -1500,12 +1497,10 @@ impl Db {
       None => Ok(()),
     };
     if wal_status.is_ok() {
-      batch
-        .iterate(&mut Inserter {
-          mem: &mem,
-          seq: start_seq,
-        })
-        .expect("memtable insert cannot fail");
+      // SAFETY: this leader's group is in flight, so it is the memtable's
+      // sole writer (see `insert_batch`).
+      unsafe { insert_batch(&mem, &batch, start_seq) }
+        .expect("a batch built with put and delete is well-formed");
     }
 
     let mut state = self.inner.state.lock().unwrap();
@@ -1658,11 +1653,8 @@ impl Db {
             continue;
           }
         };
-        let mut inserter = Inserter {
-          mem: &mem,
-          seq: batch.sequence(),
-        };
-        if let Err(e) = batch.iterate(&mut inserter) {
+        // SAFETY: repair fills a memtable no other thread can reach.
+        if let Err(e) = unsafe { insert_batch(&mem, &batch, batch.sequence()) } {
           log::warn!(
             "repair: skipping WAL record in {} (iterate failed): {e}",
             log_path.display()

@@ -18,9 +18,11 @@ use crate::Error;
 
 const HEADER_SIZE: usize = 12;
 
-pub trait Handler {
-  fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), Error>;
-  fn delete(&mut self, key: &[u8]) -> Result<(), Error>;
+/// One operation of a [`WriteBatch`], borrowed from the batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchOp<'a> {
+  Put { key: &'a [u8], value: &'a [u8] },
+  Delete { key: &'a [u8] },
 }
 
 #[derive(Clone)]
@@ -76,74 +78,21 @@ impl WriteBatch {
     self.rep.len()
   }
 
-  pub fn iterate(&self, handler: &mut dyn Handler) -> Result<(), Error> {
-    if self.rep.len() < HEADER_SIZE {
-      return Err(Error::Corruption("WriteBatch too small".to_string()));
+  /// The batch's operations, in the order they were added.
+  ///
+  /// A batch built with [`put`](Self::put) and [`delete`](Self::delete) is
+  /// always well-formed.  One read back from a damaged WAL may not be: the
+  /// iterator then yields a single [`Error::Corruption`] (a truncated or
+  /// unknown record, or a record count that disagrees with the header) and
+  /// ends, after the operations before the damage.
+  pub fn iter(&self) -> Iter<'_> {
+    Iter {
+      rep: &self.rep,
+      pos: HEADER_SIZE,
+      seen: 0,
+      expected: self.count(),
+      done: false,
     }
-    let expected = self.count();
-    let mut pos = HEADER_SIZE;
-    let mut seen: u32 = 0;
-    while pos < self.rep.len() {
-      let tag = self.rep[pos];
-      pos += 1;
-      match ValueType::from_byte(tag) {
-        Some(ValueType::Value) => {
-          let (klen, ksize) = read_varu64(&self.rep[pos..]);
-          if ksize == 0 {
-            return Err(Error::Corruption(
-              "bad varint in WriteBatch key length".to_string(),
-            ));
-          }
-          pos += ksize;
-          let kend = pos + klen as usize;
-          if kend > self.rep.len() {
-            return Err(Error::Corruption("WriteBatch key truncated".to_string()));
-          }
-          let key = &self.rep[pos..kend];
-          pos = kend;
-          let (vlen, vsize) = read_varu64(&self.rep[pos..]);
-          if vsize == 0 {
-            return Err(Error::Corruption(
-              "bad varint in WriteBatch value length".to_string(),
-            ));
-          }
-          pos += vsize;
-          let vend = pos + vlen as usize;
-          if vend > self.rep.len() {
-            return Err(Error::Corruption("WriteBatch value truncated".to_string()));
-          }
-          let value = &self.rep[pos..vend];
-          pos = vend;
-          handler.put(key, value)?;
-        }
-        Some(ValueType::Deletion) => {
-          let (klen, ksize) = read_varu64(&self.rep[pos..]);
-          if ksize == 0 {
-            return Err(Error::Corruption(
-              "bad varint in WriteBatch key length".to_string(),
-            ));
-          }
-          pos += ksize;
-          let kend = pos + klen as usize;
-          if kend > self.rep.len() {
-            return Err(Error::Corruption("WriteBatch key truncated".to_string()));
-          }
-          let key = &self.rep[pos..kend];
-          pos = kend;
-          handler.delete(key)?;
-        }
-        None => {
-          return Err(Error::Corruption(format!("unknown WriteBatch tag: {tag}")));
-        }
-      }
-      seen += 1;
-    }
-    if seen != expected {
-      return Err(Error::Corruption(format!(
-        "WriteBatch count mismatch: header says {expected}, found {seen}"
-      )));
-    }
-    Ok(())
   }
 
   pub fn append(&mut self, src: &WriteBatch) {
@@ -189,30 +138,107 @@ impl Default for WriteBatch {
   }
 }
 
+impl<'a> IntoIterator for &'a WriteBatch {
+  type Item = Result<BatchOp<'a>, Error>;
+  type IntoIter = Iter<'a>;
+
+  fn into_iter(self) -> Iter<'a> {
+    self.iter()
+  }
+}
+
+/// Iterator over the operations of a [`WriteBatch`]; see [`WriteBatch::iter`].
+#[derive(Debug, Clone)]
+pub struct Iter<'a> {
+  rep: &'a [u8],
+  pos: usize,
+  /// Records decoded so far, checked against the header's count at the end.
+  seen: u32,
+  expected: u32,
+  /// Set once the iterator has ended, after the last record or an error.
+  done: bool,
+}
+
+impl<'a> Iterator for Iter<'a> {
+  type Item = Result<BatchOp<'a>, Error>;
+
+  fn next(&mut self) -> Option<Self::Item> {
+    if self.done {
+      return None;
+    }
+    if self.pos >= self.rep.len() {
+      self.done = true;
+      return (self.seen != self.expected).then(|| {
+        Err(Error::Corruption(format!(
+          "WriteBatch count mismatch: header says {}, found {}",
+          self.expected, self.seen
+        )))
+      });
+    }
+    let op = self.decode_record();
+    match op {
+      Ok(_) => self.seen += 1,
+      Err(_) => self.done = true,
+    }
+    Some(op)
+  }
+}
+
+impl std::iter::FusedIterator for Iter<'_> {}
+
+impl<'a> Iter<'a> {
+  fn decode_record(&mut self) -> Result<BatchOp<'a>, Error> {
+    let tag = self.rep[self.pos];
+    self.pos += 1;
+    match ValueType::from_byte(tag) {
+      Some(ValueType::Value) => {
+        let key = self.decode_slice("key")?;
+        let value = self.decode_slice("value")?;
+        Ok(BatchOp::Put { key, value })
+      }
+      Some(ValueType::Deletion) => Ok(BatchOp::Delete {
+        key: self.decode_slice("key")?,
+      }),
+      None => Err(Error::Corruption(format!("unknown WriteBatch tag: {tag}"))),
+    }
+  }
+
+  /// Decode a length-prefixed slice (the record's `what`).
+  fn decode_slice(&mut self, what: &str) -> Result<&'a [u8], Error> {
+    let (len, n) = read_varu64(&self.rep[self.pos..]);
+    if n == 0 {
+      return Err(Error::Corruption(format!(
+        "bad varint in WriteBatch {what} length"
+      )));
+    }
+    self.pos += n;
+    let remaining = &self.rep[self.pos..];
+    // `len` comes from the record: compare before converting, so a huge one
+    // cannot overflow the end offset.
+    if len > remaining.len() as u64 {
+      return Err(Error::Corruption(format!("WriteBatch {what} truncated")));
+    }
+    let slice = &remaining[..len as usize];
+    self.pos += slice.len();
+    Ok(slice)
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
   use crate::{Db, ReadOptions, WriteOptions};
 
-  struct Recording {
-    ops: Vec<Op>,
+  fn ops(b: &WriteBatch) -> Result<Vec<BatchOp<'_>>, Error> {
+    b.iter().collect()
   }
 
-  #[derive(Debug, PartialEq)]
-  enum Op {
-    Put(Vec<u8>, Vec<u8>),
-    Delete(Vec<u8>),
+  fn put<'a>(key: &'a [u8], value: &'a [u8]) -> BatchOp<'a> {
+    BatchOp::Put { key, value }
   }
 
-  impl Handler for Recording {
-    fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), Error> {
-      self.ops.push(Op::Put(key.to_vec(), value.to_vec()));
-      Ok(())
-    }
-    fn delete(&mut self, key: &[u8]) -> Result<(), Error> {
-      self.ops.push(Op::Delete(key.to_vec()));
-      Ok(())
-    }
+  fn delete(key: &[u8]) -> BatchOp<'_> {
+    BatchOp::Delete { key }
   }
 
   #[test]
@@ -220,27 +246,21 @@ mod tests {
     let b = WriteBatch::new();
     assert_eq!(b.approximate_size(), 12);
     assert_eq!(b.count(), 0);
-    let mut r = Recording { ops: vec![] };
-    assert!(b.iterate(&mut r).is_ok());
-    assert!(r.ops.is_empty());
+    assert!(ops(&b).unwrap().is_empty());
   }
 
   #[test]
   fn put_and_iterate() {
     let mut b = WriteBatch::new();
     b.put("hello", "world");
-    let mut r = Recording { ops: vec![] };
-    b.iterate(&mut r).unwrap();
-    assert_eq!(r.ops, vec![Op::Put(b"hello".to_vec(), b"world".to_vec())]);
+    assert_eq!(ops(&b).unwrap(), vec![put(b"hello", b"world")]);
   }
 
   #[test]
   fn delete_and_iterate() {
     let mut b = WriteBatch::new();
     b.delete(b"gone");
-    let mut r = Recording { ops: vec![] };
-    b.iterate(&mut r).unwrap();
-    assert_eq!(r.ops, vec![Op::Delete(b"gone".to_vec())]);
+    assert_eq!(ops(&b).unwrap(), vec![delete(b"gone")]);
   }
 
   #[test]
@@ -249,15 +269,9 @@ mod tests {
     b.put(b"a", b"1");
     b.delete(b"b");
     b.put(b"c", b"3");
-    let mut r = Recording { ops: vec![] };
-    b.iterate(&mut r).unwrap();
     assert_eq!(
-      r.ops,
-      vec![
-        Op::Put(b"a".to_vec(), b"1".to_vec()),
-        Op::Delete(b"b".to_vec()),
-        Op::Put(b"c".to_vec(), b"3".to_vec()),
-      ]
+      ops(&b).unwrap(),
+      vec![put(b"a", b"1"), delete(b"b"), put(b"c", b"3"),]
     );
   }
 
@@ -280,9 +294,7 @@ mod tests {
     b.clear();
     assert_eq!(b.approximate_size(), 12);
     assert_eq!(b.count(), 0);
-    let mut r = Recording { ops: vec![] };
-    b.iterate(&mut r).unwrap();
-    assert!(r.ops.is_empty());
+    assert!(ops(&b).unwrap().is_empty());
   }
 
   #[test]
@@ -294,15 +306,9 @@ mod tests {
     b.delete(b"c");
     a.append(&b);
     assert_eq!(a.count(), 3);
-    let mut r = Recording { ops: vec![] };
-    a.iterate(&mut r).unwrap();
     assert_eq!(
-      r.ops,
-      vec![
-        Op::Put(b"a".to_vec(), b"1".to_vec()),
-        Op::Put(b"b".to_vec(), b"2".to_vec()),
-        Op::Delete(b"c".to_vec()),
-      ]
+      ops(&a).unwrap(),
+      vec![put(b"a", b"1"), put(b"b", b"2"), delete(b"c"),]
     );
   }
 
@@ -312,8 +318,7 @@ mod tests {
     b.put(b"key", b"value");
     // truncate mid-record
     b.rep.truncate(b.rep.len() - 2);
-    let mut r = Recording { ops: vec![] };
-    assert!(matches!(b.iterate(&mut r), Err(Error::Corruption(_))));
+    assert!(matches!(ops(&b), Err(Error::Corruption(_))));
   }
 
   #[test]
@@ -322,8 +327,21 @@ mod tests {
     b.put(b"k", b"v");
     // overwrite the tag byte with an invalid value
     b.rep[HEADER_SIZE] = 0xFF;
-    let mut r = Recording { ops: vec![] };
-    assert!(matches!(b.iterate(&mut r), Err(Error::Corruption(_))));
+    assert!(matches!(ops(&b), Err(Error::Corruption(_))));
+  }
+
+  /// A length read from a WAL record is untrusted: one that runs past the end
+  /// of the record must be reported as corruption, however large.
+  #[test]
+  fn corrupt_length_past_the_end() {
+    let mut rep = vec![0u8; HEADER_SIZE];
+    write_u32_le((&mut rep[8..12]).try_into().unwrap(), 1);
+    rep.push(ValueType::Value as u8);
+    let mut tmp = [0u8; 10];
+    let n = write_varu64(&mut tmp, u64::MAX);
+    rep.extend_from_slice(&tmp[..n]);
+    let b = WriteBatch::from_contents(rep).unwrap();
+    assert!(matches!(ops(&b), Err(Error::Corruption(_))));
   }
 
   // Port of LevelDB write_batch_test.cc: Append
@@ -340,17 +358,13 @@ mod tests {
     // Append empty b2 to empty b1 → count stays 0.
     b1.append(&b2);
     assert_eq!(b1.count(), 0);
-    let mut r = Recording { ops: vec![] };
-    b1.iterate(&mut r).unwrap();
-    assert!(r.ops.is_empty());
+    assert!(ops(&b1).unwrap().is_empty());
 
     // b2 gets one entry; appending to b1 brings count to 1.
     b2.put(b"a", b"va");
     b1.append(&b2);
     assert_eq!(b1.count(), 1);
-    let mut r = Recording { ops: vec![] };
-    b1.iterate(&mut r).unwrap();
-    assert_eq!(r.ops, vec![Op::Put(b"a".to_vec(), b"va".to_vec())]);
+    assert_eq!(ops(&b1).unwrap(), vec![put(b"a", b"va")]);
 
     // b2 cleared, gets one new entry; b1 count reaches 2.
     b2.clear();
@@ -362,15 +376,13 @@ mod tests {
     b2.delete(b"foo");
     b1.append(&b2);
     assert_eq!(b1.count(), 4);
-    let mut r = Recording { ops: vec![] };
-    b1.iterate(&mut r).unwrap();
     assert_eq!(
-      r.ops,
+      ops(&b1).unwrap(),
       vec![
-        Op::Put(b"a".to_vec(), b"va".to_vec()),
-        Op::Put(b"b".to_vec(), b"vb".to_vec()),
-        Op::Put(b"b".to_vec(), b"vb".to_vec()),
-        Op::Delete(b"foo".to_vec()),
+        put(b"a", b"va"),
+        put(b"b", b"vb"),
+        put(b"b", b"vb"),
+        delete(b"foo"),
       ]
     );
   }

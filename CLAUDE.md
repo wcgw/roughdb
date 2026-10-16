@@ -88,9 +88,9 @@ The read path checks `mem` → `imm` → each level of SSTables (newest to oldes
 - `Splice` caches `prev`/`next` from the last insert for O(1) amortised sequential inserts.
 - Lock-free reads (Acquire/Release atomics). Writes must be serialised externally: `SkipList::alloc_and_insert`
   and `Memtable::add`/`delete` are `unsafe fn` whose contract is "no concurrent writer"; `Db` satisfies it by
-  inserting only while holding the `DbState` mutex (see `Inserter` in `lib.rs`). Writer-only state (`Splice`,
-  RNG) lives in an `UnsafeCell<WriterState>` so inserts go through `&SkipList` like reads and never create a
-  `&mut SkipList` that would alias readers' shared borrows.
+  inserting only through `unsafe fn insert_batch` in `lib.rs`, from the write leader, recovery or repair (see its
+  `# Safety`). Writer-only state (`Splice`, RNG) lives in an `UnsafeCell<WriterState>` so inserts go through
+  `&SkipList` like reads and never create a `&mut SkipList` that would alias readers' shared borrows.
 - The `bench` Cargo feature exposes `roughdb::bench::{Memtable, MemTableIterator}` (doc-hidden) for
   `benches/skiplist.rs`; it is not a public API.
 
@@ -128,7 +128,8 @@ Features are listed in dependency order. Each phase must be complete before the 
   absent key (LevelDB's `NotFound` status is not an error variant). See `include/leveldb/status.h`.
 - [x] **`WriteBatch`**: Serialises a sequence of Put/Delete operations into a byte buffer. Batch format: `[seq:
   u64][count: u32][records…]` where each record is `[vtype: u8][klen: varint][key][vlen: varint][value]`. Exposes `put`,
-  `delete`, `iterate(Handler)`, `approximate_size`. `Clone`-able. `Db::put`/`delete` are thin wrappers over `Db::write`.
+  `delete`, `iter()` (→ `Result<BatchOp>`), `approximate_size`. `Clone`-able. `Db::put`/`delete` are thin wrappers
+  over `Db::write`.
   See `include/leveldb/write_batch.h` and `db/write_batch.cc`.
 - [x] **`Options` / `ReadOptions` / `WriteOptions`**: Configuration structs. `Options` carries the write-buffer size,
   block size, compression type, filter policy, block cache handle. `WriteOptions` adds a sync flag. `ReadOptions` adds a
@@ -173,7 +174,7 @@ Features are listed in dependency order. Each phase must be complete before the 
   The stamp must precede the log write so WAL records carry the correct embedded sequence for recovery replay.
   `Db::put`/`delete` updated to forward a default `WriteOptions`.
 - [x] **Recovery** (`Db::open` calls this when WAL exists): Construct a `logfile::Reader` from offset 0; for each record
-  decode it as a `WriteBatch` and replay via `batch.iterate(&mut inserter)` using the batch's embedded sequence; after
+  decode it as a `WriteBatch` and replay via `insert_batch` using the batch's embedded sequence; after
   all records restore `last_sequence` to the highest sequence seen. Incomplete trailing records (torn write on crash)
   are silently ignored.
 
@@ -469,7 +470,7 @@ what remains is compaction, the full Iterator/Snapshot API, and operational hygi
 - `unsafe` blocks must carry a `// SAFETY:` comment; `unsafe fn` must carry a `# Safety` doc section. A safe function
   must have no soundness preconditions: if correctness depends on something only the caller can guarantee (writer
   serialisation, a pointer's provenance, a level being below a node's height), make it an `unsafe fn` and state the
-  requirement in `# Safety` — see `Memtable::add`, `Node::load_next`, and the `Inserter` contract in `lib.rs`.
+  requirement in `# Safety` — see `Memtable::add`, `Node::load_next`, and `insert_batch` in `lib.rs`.
 - `find_splice_for_level` and `recompute_splice_levels` are free functions (not `SkipList` methods) that take the
   comparator explicitly; this keeps the insert hot path free of `&self` entanglement and is the pattern to follow
   whenever a method would otherwise need both `&self` and `&mut self.field`.
