@@ -33,10 +33,13 @@ change no public API.  Items 6–10 do, and are acceptable as a 0.x minor bump.
   visible effect: `get_property("leveldb.sstables")` on an in-memory database lists the seven empty levels, as on an
   empty persistent one, instead of returning `""`.
 
-- [ ] **4. One LRU, O(1).**  `TableCache` and `BlockCache` each carry a copy of a `VecDeque` + `HashMap` LRU whose
+- [x] **4. One LRU, O(1).**  `TableCache` and `BlockCache` each carry a copy of a `VecDeque` + `HashMap` LRU whose
   every hit runs `order.iter().position(..)`: a linear scan under a global mutex on the read path (the 8 MiB
   default block cache holds ~2,000 4 KiB blocks).  One internal generic LRU with O(1) operations, measured with
   `benches/db.rs` before and after.
+  *Done:* `cache::lru::Lru` (a slab threaded with an index-linked recency list, bounded by total charge) backs both
+  caches.  `disk_read/random` went from 8.29 ms to 6.37 ms (−23%) per 10,000 gets; `disk_read/missing`, which takes
+  no block-cache hits, is unchanged.
 
 - [ ] **5. Named types instead of tuples and mixed level integers.**  `VersionEdit` carries
   `Vec<(i32, Arc<FileMetaData>)>`, `Vec<(i32, u64)>` and `Vec<(i32, Vec<u8>)>`; `seek_compact_file` is an
