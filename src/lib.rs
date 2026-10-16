@@ -645,8 +645,9 @@ impl Db {
   /// ## Existing database (`CURRENT` file present)
   /// - Returns [`Error::InvalidArgument`] if `options.error_if_exists` is `true`.
   /// - Recovers the `VersionSet` from the MANIFEST (loads live SSTable files).
-  /// - Replays WAL records whose sequence number exceeds the last sequence
-  ///   already reflected in the MANIFEST (avoids double-inserting flushed data).
+  /// - Replays every WAL numbered at or after the MANIFEST's log number, oldest
+  ///   first, skipping records whose sequence number is already reflected in
+  ///   the MANIFEST (avoids double-inserting flushed data).
   ///
   /// In both cases an exclusive POSIX `flock` is acquired on `<path>/LOCK`.
   /// If another process already holds the lock, an [`Error::IoError`] is returned
@@ -707,27 +708,35 @@ impl Db {
       let manifest_last_seq = vs.last_sequence();
       let mem = Arc::new(Memtable::new(Arc::clone(&options.comparator)));
 
-      // Replay WAL records newer than what is already in the SSTables.
-      // Use the log number recorded in the MANIFEST (set by WAL rotation).
-      let log_path = path.join(format!("{:06}.log", vs.log_number()));
-      let actual_last_seq = if fs.file_exists(&log_path) {
-        let file_len = fs.file_size(&log_path)?;
-        if file_len > 0 {
-          log::info!(
-            "replaying WAL {:06}.log (manifest_last_seq={})",
-            vs.log_number(),
-            manifest_last_seq
-          );
-          let file = options.file_system.open_sequential(&log_path)?;
-          let seq = Self::recover_wal(file, &mem, manifest_last_seq, options.paranoid_checks)?;
-          log::info!("WAL replay complete: max_sequence={seq}");
-          seq
-        } else {
-          manifest_last_seq
+      // Replay WAL records newer than what is already in the SSTables, from
+      // every WAL at or after the MANIFEST's log number, oldest first.  A
+      // flush switches writers to a new WAL before its edit names it, so a
+      // crash in between leaves acknowledged writes in a WAL newer than
+      // `log_number`.  Matches LevelDB's `DBImpl::Recover`.
+      let mut logs: Vec<u64> = fs
+        .children(path)?
+        .iter()
+        .filter_map(|name| match parse_db_filename(name) {
+          Some((number, FileKind::Log)) if number >= vs.log_number() => Some(number),
+          _ => None,
+        })
+        .collect();
+      logs.sort_unstable();
+      let mut actual_last_seq = manifest_last_seq;
+      for number in logs {
+        // The previous incarnation may have created this WAL without any
+        // MANIFEST edit recording the allocation.
+        vs.mark_file_number_used(number);
+        let log_path = path.join(format!("{number:06}.log"));
+        if fs.file_size(&log_path)? == 0 {
+          continue;
         }
-      } else {
-        manifest_last_seq
-      };
+        log::info!("replaying WAL {number:06}.log (manifest_last_seq={manifest_last_seq})");
+        let file = fs.open_sequential(&log_path)?;
+        let seq = Self::recover_wal(file, &mem, manifest_last_seq, options.paranoid_checks)?;
+        actual_last_seq = actual_last_seq.max(seq);
+      }
+      log::info!("WAL replay complete: max_sequence={actual_last_seq}");
 
       // The write counter resumes after everything replayed; the VersionSet's
       // watermark (what recovery may skip) only advances once that data is in
@@ -2645,6 +2654,13 @@ fn delete_obsolete_files(
   // Step 1: snapshot live-file info under the lock, then release it.
   let (live_tables, log_number, manifest_number) = {
     let state = state.lock().unwrap();
+    // After a background error the MANIFEST may or may not hold the failed
+    // edit, and the in-memory state may already reflect it (`finish_flush`
+    // advances `log_number` first), so nothing here can say which files are
+    // obsolete.  Matches LevelDB's `DBImpl::RemoveObsoleteFiles`.
+    if state.background_error.is_some() {
+      return;
+    }
     let vs = match &state.version_set {
       Some(vs) => vs,
       None => return, // in-memory DB — nothing to clean up
@@ -5516,7 +5532,9 @@ mod tests {
   // ── Write path releases the DB mutex around WAL I/O ─────────────────────────
 
   /// `MemFileSystem` whose WAL files can be made to stall or fail on append,
-  /// so a test can observe what the rest of the database does meanwhile.
+  /// whose MANIFEST appends or syncs can be made to fail, and whose next SSTable
+  /// create can be made to stall, so a test can observe what the rest of the
+  /// database does meanwhile.
   mod gated_fs {
     use crate::env::{
       FileLock, FileSystem, MemFileSystem, RandomAccessFile, SequentialFile, WritableFile,
@@ -5530,9 +5548,15 @@ mod tests {
     pub struct Gate {
       /// The next WAL append blocks until `release()`.
       arm_block: AtomicBool,
+      /// The next SSTable create blocks until `release()`.
+      arm_table_block: AtomicBool,
       /// Every WAL append fails with an I/O error.
       fail: AtomicBool,
-      /// `(an append is blocked, released)`.
+      /// Every MANIFEST append fails with an I/O error.
+      fail_manifest_append: AtomicBool,
+      /// Every MANIFEST sync fails with an I/O error; appends still land.
+      fail_manifest_sync: AtomicBool,
+      /// `(a gated call is blocked, released)`.
       blocked: Mutex<(bool, bool)>,
       cv: Condvar,
     }
@@ -5540,6 +5564,9 @@ mod tests {
     impl Gate {
       pub fn block_next_append(&self) {
         self.arm_block.store(true, SeqCst);
+      }
+      pub fn block_next_table_create(&self) {
+        self.arm_table_block.store(true, SeqCst);
       }
       pub fn wait_until_blocked(&self) {
         let mut g = self.blocked.lock().unwrap();
@@ -5554,6 +5581,21 @@ mod tests {
       }
       pub fn fail_appends(&self, fail: bool) {
         self.fail.store(fail, SeqCst);
+      }
+      pub fn fail_manifest_appends(&self, fail: bool) {
+        self.fail_manifest_append.store(fail, SeqCst);
+      }
+      pub fn fail_manifest_syncs(&self, fail: bool) {
+        self.fail_manifest_sync.store(fail, SeqCst);
+      }
+      /// Block the calling thread until `release()`.
+      fn park(&self) {
+        let mut g = self.blocked.lock().unwrap();
+        g.0 = true;
+        self.cv.notify_all();
+        while !g.1 {
+          g = self.cv.wait(g).unwrap();
+        }
       }
     }
 
@@ -5570,12 +5612,7 @@ mod tests {
           )));
         }
         if self.gate.arm_block.swap(false, SeqCst) {
-          let mut g = self.gate.blocked.lock().unwrap();
-          g.0 = true;
-          self.gate.cv.notify_all();
-          while !g.1 {
-            g = self.gate.cv.wait(g).unwrap();
-          }
+          self.gate.park();
         }
         self.inner.write(data)
       }
@@ -5587,27 +5624,62 @@ mod tests {
       }
     }
 
+    struct GatedManifest {
+      inner: Box<dyn WritableFile>,
+      gate: Arc<Gate>,
+    }
+
+    impl WritableFile for GatedManifest {
+      fn write(&mut self, data: &[u8]) -> Result<(), Error> {
+        if self.gate.fail_manifest_append.load(SeqCst) {
+          return Err(Error::IoError(std::io::Error::other(
+            "injected MANIFEST append failure",
+          )));
+        }
+        self.inner.write(data)
+      }
+      fn flush(&mut self) -> Result<(), Error> {
+        self.inner.flush()
+      }
+      fn sync(&mut self) -> Result<(), Error> {
+        if self.gate.fail_manifest_sync.load(SeqCst) {
+          return Err(Error::IoError(std::io::Error::other(
+            "injected MANIFEST sync failure",
+          )));
+        }
+        self.inner.sync()
+      }
+    }
+
     pub struct GatedFs {
-      pub inner: MemFileSystem,
+      pub inner: Arc<MemFileSystem>,
       pub gate: Arc<Gate>,
     }
 
     impl GatedFs {
       pub fn gated() -> (Arc<dyn FileSystem>, Arc<Gate>) {
+        Self::over(Arc::new(MemFileSystem::new()))
+      }
+
+      /// Gate `disk`; the caller keeps its handle, e.g. to take a `crash_copy`.
+      pub fn over(disk: Arc<MemFileSystem>) -> (Arc<dyn FileSystem>, Arc<Gate>) {
         let gate = Arc::new(Gate::default());
         let fs = GatedFs {
-          inner: MemFileSystem::new(),
+          inner: disk,
           gate: Arc::clone(&gate),
         };
         (Arc::new(fs), gate)
       }
 
       fn wrap(&self, path: &Path, file: Box<dyn WritableFile>) -> Box<dyn WritableFile> {
+        let gate = Arc::clone(&self.gate);
         if path.extension().is_some_and(|e| e == "log") {
-          Box::new(GatedWal {
-            inner: file,
-            gate: Arc::clone(&self.gate),
-          })
+          Box::new(GatedWal { inner: file, gate })
+        } else if path
+          .file_name()
+          .is_some_and(|n| n.to_string_lossy().starts_with("MANIFEST-"))
+        {
+          Box::new(GatedManifest { inner: file, gate })
         } else {
           file
         }
@@ -5625,6 +5697,11 @@ mod tests {
         Ok(self.wrap(p, self.inner.open_appendable(p)?))
       }
       fn create_writable(&self, p: &Path) -> Result<Box<dyn WritableFile>, Error> {
+        if p.extension().is_some_and(|e| e == "ldb")
+          && self.gate.arm_table_block.swap(false, SeqCst)
+        {
+          self.gate.park();
+        }
         Ok(self.wrap(p, self.inner.create_writable(p)?))
       }
       fn file_size(&self, p: &Path) -> Result<u64, Error> {
@@ -5891,5 +5968,130 @@ mod tests {
     eprintln!("{}", db.get_property("leveldb.sstables").unwrap());
     eprintln!("setup keys missing: {missing}; writer keys missing: {missing_w}");
     assert_eq!(missing + missing_w, 0);
+  }
+
+  // ── Crashes and failures around a flush ─────────────────────────────────────
+
+  /// A write acknowledged while a flush is in flight lives only in the WAL
+  /// that `begin_flush` switched to, which the MANIFEST does not name until
+  /// the flush installs.  A crash before then must not lose it.
+  #[test]
+  fn sync_write_during_flush_survives_crash() {
+    use crate::env::MemFileSystem;
+    use std::sync::Arc;
+    let opts = |fs| Options {
+      create_if_missing: true,
+      file_system: fs,
+      ..Options::default()
+    };
+    let disk = Arc::new(MemFileSystem::new());
+    let (fs, gate) = gated_fs::GatedFs::over(Arc::clone(&disk));
+    let db = Db::open("/db", opts(fs)).unwrap();
+    db.put(b"a", b"1").unwrap();
+
+    // Switch to a new memtable and WAL, then stall the flush before its
+    // SSTable exists.
+    gate.block_next_table_create();
+    db.flush(&crate::FlushOptions { wait: false }).unwrap();
+    gate.wait_until_blocked();
+    let mut batch = WriteBatch::new();
+    batch.put(b"b", b"2");
+    db.write(&WriteOptions { sync: true }, batch).unwrap();
+
+    let crashed = disk.crash_copy();
+    gate.release();
+    drop(db);
+
+    let db = Db::open("/db", opts(Arc::new(crashed))).unwrap();
+    assert_eq!(db.get(b"a").unwrap(), b"1");
+    assert_eq!(db.get(b"b").unwrap(), b"2");
+  }
+
+  /// The MANIFEST never recorded the file number of the WAL a crashed flush
+  /// switched to.  Recovery must not hand that number out again: the next
+  /// flush would create its new WAL under it, truncating recovered writes.
+  #[test]
+  fn recovered_wal_survives_a_second_crash_mid_flush() {
+    use crate::env::MemFileSystem;
+    use std::sync::Arc;
+    // Keep the replayed memtable on open, so the recovered write stays in
+    // the WAL rather than being flushed to an SSTable by `Db::open`.
+    let opts = |fs| Options {
+      create_if_missing: true,
+      reuse_logs: true,
+      file_system: fs,
+      ..Options::default()
+    };
+    let crash_mid_flush = |disk: Arc<MemFileSystem>, write: &dyn Fn(&Db)| {
+      let (fs, gate) = gated_fs::GatedFs::over(Arc::clone(&disk));
+      let db = Db::open("/db", opts(fs)).unwrap();
+      gate.block_next_table_create();
+      db.flush(&crate::FlushOptions { wait: false }).unwrap();
+      gate.wait_until_blocked();
+      write(&db);
+      let crashed = disk.crash_copy();
+      gate.release();
+      drop(db);
+      Arc::new(crashed)
+    };
+
+    let disk = Arc::new(MemFileSystem::new());
+    {
+      let db = Db::open("/db", opts(Arc::clone(&disk) as _)).unwrap();
+      db.put(b"a", b"1").unwrap();
+    }
+    let disk = crash_mid_flush(disk, &|db| db.put(b"b", b"2").unwrap());
+    let disk = crash_mid_flush(disk, &|_| {});
+
+    let db = Db::open("/db", opts(disk)).unwrap();
+    assert_eq!(db.get(b"a").unwrap(), b"1");
+    assert_eq!(db.get(b"b").unwrap(), b"2");
+  }
+
+  /// A flush whose MANIFEST edit fails is not installed, so the old WAL is
+  /// still the only copy of its writes.  File GC must not delete it.
+  #[test]
+  fn write_survives_a_flush_whose_manifest_append_fails() {
+    use std::sync::Arc;
+    let (fs, gate) = gated_fs::GatedFs::gated();
+    let opts = || Options {
+      create_if_missing: true,
+      file_system: Arc::clone(&fs),
+      ..Options::default()
+    };
+    let db = Db::open("/db", opts()).unwrap();
+    db.put(b"a", b"1").unwrap();
+
+    gate.fail_manifest_appends(true);
+    assert!(db.flush(&crate::FlushOptions { wait: true }).is_err());
+    gate.fail_manifest_appends(false);
+    drop(db);
+
+    let db = Db::open("/db", opts()).unwrap();
+    assert_eq!(db.get(b"a").unwrap(), b"1");
+  }
+
+  /// A flush whose MANIFEST sync fails may still have its edit on disk, while
+  /// the in-memory `Version` never installed it.  File GC must not delete the
+  /// flush's SSTable that the MANIFEST on disk may now reference.
+  #[test]
+  fn write_survives_a_flush_whose_manifest_sync_fails() {
+    use std::sync::Arc;
+    let (fs, gate) = gated_fs::GatedFs::gated();
+    let opts = || Options {
+      create_if_missing: true,
+      file_system: Arc::clone(&fs),
+      ..Options::default()
+    };
+    let db = Db::open("/db", opts()).unwrap();
+    db.put(b"a", b"1").unwrap();
+
+    gate.fail_manifest_syncs(true);
+    assert!(db.flush(&crate::FlushOptions { wait: true }).is_err());
+    gate.fail_manifest_syncs(false);
+    drop(db);
+
+    let db = Db::open("/db", opts()).unwrap();
+    assert_eq!(db.get(b"a").unwrap(), b"1");
   }
 }

@@ -416,6 +416,28 @@ mod memfs {
         state: Arc::new(Mutex::new(State::default())),
       }
     }
+
+    /// An independent copy of every file and directory, without the locks:
+    /// what a crash would leave on disk right now.  Nothing here is ever
+    /// unsynced, so the copy holds every byte written so far.
+    pub fn crash_copy(&self) -> MemFileSystem {
+      let st = self.state.lock().unwrap();
+      let files = st
+        .files
+        .iter()
+        .map(|(path, inode)| {
+          let data = inode.lock().unwrap().clone();
+          (path.clone(), Arc::new(Mutex::new(data)))
+        })
+        .collect();
+      MemFileSystem {
+        state: Arc::new(Mutex::new(State {
+          files,
+          dirs: st.dirs.clone(),
+          locks: HashSet::new(),
+        })),
+      }
+    }
   }
 
   impl Default for MemFileSystem {

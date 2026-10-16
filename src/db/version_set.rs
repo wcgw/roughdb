@@ -267,6 +267,15 @@ impl VersionSet {
     n
   }
 
+  /// Never allocate `number` again: a file using it exists although no
+  /// MANIFEST edit accounts for it (e.g. the WAL a crashed flush created).
+  /// Port of LevelDB `VersionSet::MarkFileNumberUsed`.
+  pub(crate) fn mark_file_number_used(&mut self, number: u64) {
+    if self.next_file_number <= number {
+      self.next_file_number = number + 1;
+    }
+  }
+
   pub(crate) fn last_sequence(&self) -> u64 {
     self.last_sequence
   }
