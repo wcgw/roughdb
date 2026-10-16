@@ -1151,6 +1151,12 @@ impl Db {
     Ok(DbIter { inner })
   }
 
+  /// Destroy the database at `path`, deleting all of its files and the directory.
+  ///
+  /// Acquires the `LOCK` file before removing anything to ensure no other process
+  /// has the database open.  Returns [`Error::IoError`] immediately (without blocking)
+  /// if the lock cannot be acquired.
+  ///
   /// All recognised database files (`CURRENT`, `MANIFEST-*`, `*.log`, `*.ldb`, `LOCK`) are
   /// removed.  Unrecognised files are left in place; the directory is removed only if it is
   /// empty afterwards.
@@ -1200,12 +1206,11 @@ impl Db {
   /// compaction the updated version is used for the next level, so newly
   /// created files are eligible for further compaction in the same call.
   ///
-  /// No-op for in-memory databases (`Db::default()`).
-  /// Destroy the database at `path`, deleting all of its files and the directory.
+  /// A failed compaction stops the database, as a failed flush does: the error
+  /// is returned here and by every later write, flush, and `compact_range`
+  /// until the database is reopened.
   ///
-  /// Acquires the `LOCK` file before removing anything to ensure no other process
-  /// has the database open.  Returns [`Error::IoError`] immediately (without blocking)
-  /// if the lock cannot be acquired.
+  /// No-op for in-memory databases (`Db::default()`).
   pub fn compact_range(&self, begin: Option<&[u8]>, end: Option<&[u8]>) -> Result<(), Error> {
     use crate::db::version::NUM_LEVELS;
 
