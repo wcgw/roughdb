@@ -260,7 +260,7 @@ fn compaction_benchmarks(c: &mut Criterion) {
         (dir, db)
       },
       |(dir, db)| {
-        db.compact_range(None, None).unwrap();
+        db.compact_range(..).unwrap();
         black_box((dir, db));
       },
       BatchSize::PerIteration,
@@ -295,7 +295,7 @@ fn disk_read_benchmarks(c: &mut Criterion) {
     db.put(make_key(i), VALUE).unwrap();
   }
   db.flush(&FlushOptions { wait: true }).unwrap();
-  db.compact_range(None, None).unwrap();
+  db.compact_range(..).unwrap();
 
   // random gets against a leveled, on-disk database.
   group.bench_function("random", |b| {

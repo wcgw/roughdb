@@ -66,9 +66,12 @@ change no public API.  Items 6–10 do, and are acceptable as a 0.x minor bump.
   *Done:* `Display` reads `corruption: …`, `invalid argument: …`, `not supported: …`, `I/O error: …`; `Error` is
   `#[non_exhaustive]`, derives `Clone`, and documents each variant; a test pins `Send + Sync + 'static`.
 
-- [ ] **8. Rust naming and ranges.**  No `get_` prefixes: `get_snapshot` → `snapshot`, `get_property` →
+- [x] **8. Rust naming and ranges.**  No `get_` prefixes: `get_snapshot` → `snapshot`, `get_property` →
   `property`, `get_approximate_sizes` → `approximate_sizes`.  Ranges as Rust ranges: `db.compact_range(..)` rather
   than two `Option<&[u8]>`, and `&[Range<&[u8]>]` rather than `&[(&[u8], &[u8])]`.
+  *Done:* `snapshot`, `property`, `approximate_sizes`; `compact_range` takes `impl RangeBounds<&[u8]>` (`..`, or
+  slices such as `start..=end`; literal keys need `.as_slice()`).  The old `get_approximate_sizes` docs claimed an
+  empty `limit` meant "to the end": it sorts first, so such a range measured 0 bytes; the claim is gone.
 
 - [ ] **9. Open mode as an enum.**  `Options::create_if_missing` and `error_if_exists` admit "may not create, must
   not exist", which can only fail.  One `OpenMode` (open existing / open or create / create new, like

@@ -109,7 +109,7 @@ only writes that preceded the snapshot.
 ```rust
 use roughdb::ReadOptions;
 
-let snap = db.get_snapshot();
+let snap = db.snapshot();
 
 // Reads with this snapshot see the state at the moment it was taken.
 let opts = ReadOptions { snapshot: Some(&snap), ..ReadOptions::default() };
@@ -124,10 +124,10 @@ let mut it = db.new_iterator(&opts)?;
 
 ```rust
 // Compact everything
-db.compact_range(None, None)?;
+db.compact_range(..)?;
 
 // Compact a specific key range
-db.compact_range(Some(b"aaa"), Some(b"zzz"))?;
+db.compact_range(b"aaa".as_slice()..=b"zzz".as_slice())?;
 ```
 
 ## Building and testing
@@ -155,12 +155,12 @@ RoughDB is in active development. The on-disk format is LevelDB-compatible.
 - `flush` — explicit memtable flush to SSTable with optional wait (`FlushOptions`)
 - Batch-grouped writes — concurrent writers share one WAL record, amortising fsync cost
 - Bidirectional iteration (`seek_to_first`, `seek_to_last`, `seek`, `next`, `prev`)
-- Snapshots (`get_snapshot` / `release_snapshot`)
+- Snapshots (`snapshot`, released when dropped)
 - Bloom filter support (`Options::filter_policy`)
 - Block compression: Snappy (default) and Zstd (`Options::compression`)
-- `get_property` — `leveldb.num-files-at-level<N>`, `leveldb.stats`, `leveldb.sstables`,
+- `property` — `leveldb.num-files-at-level<N>`, `leveldb.stats`, `leveldb.sstables`,
   `leveldb.approximate-memory-usage`
-- `get_approximate_sizes` — byte-range estimation via index-block seeks
+- `approximate_sizes` — byte-range estimation via index-block seeks
 - `repair` — recovers a database from a corrupt or missing MANIFEST by scanning surviving SSTables
   and WAL files, converting WALs to SSTables, and writing a fresh MANIFEST
 - `destroy` — safely removes a database directory

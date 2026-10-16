@@ -98,7 +98,7 @@
 //! use roughdb::ReadOptions;
 //!
 //! db.put(b"k", b"v1")?;
-//! let snap = db.get_snapshot();
+//! let snap = db.snapshot();
 //! db.put(b"k", b"v2")?;
 //!
 //! let opts = ReadOptions { snapshot: Some(&snap), ..ReadOptions::default() };
@@ -116,6 +116,7 @@ use crate::logfile::writer::Writer as LogWriter;
 use crate::memtable::{ArcMemTableIter, Memtable, MemtableResult};
 use crate::table::builder::TableBuilder;
 use crate::table::reader::{LookupResult, Table};
+use std::ops::{Range, RangeBounds};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -152,7 +153,7 @@ pub mod bench {
 
 /// An immutable snapshot of the database state at a particular sequence number.
 ///
-/// Obtained via [`Db::get_snapshot`] and passed via [`ReadOptions::snapshot`] to pin reads to a
+/// Obtained via [`Db::snapshot`] and passed via [`ReadOptions::snapshot`] to pin reads to a
 /// specific point in time.  The snapshot is released automatically when it is dropped; compaction
 /// is then free to discard entries that were only retained because of it.
 ///
@@ -302,7 +303,7 @@ struct DbState {
   /// Tracks the set of live SSTable files and the MANIFEST.  Always empty for
   /// an in-memory database (`Db::default()`), which has no files.
   version_set: VersionSet,
-  /// Sequence numbers pinned by live snapshots (acquired via `get_snapshot`),
+  /// Sequence numbers pinned by live snapshots (acquired via `snapshot`),
   /// with a refcount per sequence — several snapshots taken with no writes in
   /// between share one sequence number, and releasing one must not un-pin the
   /// others.  Compaction uses the minimum key here as the visibility cutoff so
@@ -1000,7 +1001,7 @@ impl Db {
   /// longer than necessary.
   ///
   /// See `include/leveldb/db.h: DB::GetSnapshot`.
-  pub fn get_snapshot(&self) -> Snapshot<'_> {
+  pub fn snapshot(&self) -> Snapshot<'_> {
     let mut state = self.inner.state.lock().unwrap();
     let seq = state.last_sequence;
     *state.snapshots.entry(seq).or_insert(0) += 1;
@@ -1020,7 +1021,7 @@ impl Db {
   /// | `"leveldb.approximate-memory-usage"` | Memtable bytes as a decimal string |
   ///
   /// See `include/leveldb/db.h: DB::GetProperty`.
-  pub fn get_property(&self, property: &str) -> Option<String> {
+  pub fn property(&self, property: &str) -> Option<String> {
     let prop = property.strip_prefix("leveldb.")?;
 
     // Snapshot what we need under the lock, then release before formatting.
@@ -1069,20 +1070,17 @@ impl Db {
     }
   }
 
-  /// Return approximate on-disk byte sizes for each `(start, limit)` key range.
+  /// Return the approximate on-disk size, in bytes, of the data in each
+  /// user-key range `start..limit` (start inclusive, limit exclusive).
   ///
   /// Each element of the returned `Vec` corresponds to the same-indexed range
   /// in `ranges`.  The sizes are estimates only and do not account for
   /// compression or index-block overhead.  In-memory (unflushed) data is not
   /// counted.
   ///
-  /// An open-ended range can be expressed with `start = b""` or `limit = b""`,
-  /// which naturally compare as the logical minimum/maximum key respectively
-  /// in internal-key order.
-  ///
   /// See `include/leveldb/db.h: DB::GetApproximateSizes` and
   /// `db/db_impl.cc: DBImpl::GetApproximateSizes`.
-  pub fn get_approximate_sizes(&self, ranges: &[(&[u8], &[u8])]) -> Vec<u64> {
+  pub fn approximate_sizes(&self, ranges: &[Range<&[u8]>]) -> Vec<u64> {
     use crate::table::format::{make_internal_key, MAX_SEQUENCE_NUMBER, VALUE_TYPE_FOR_SEEK};
 
     // Snapshot the current version under the lock, then release.
@@ -1090,14 +1088,14 @@ impl Db {
 
     ranges
       .iter()
-      .map(|&(start, limit)| {
+      .map(|range| {
         let Some(p) = &self.inner.persistence else {
           return 0;
         };
         // Convert user keys to seek keys so they sort before all real entries
         // for the same user key.
-        let istart = make_internal_key(start, MAX_SEQUENCE_NUMBER, VALUE_TYPE_FOR_SEEK);
-        let ilimit = make_internal_key(limit, MAX_SEQUENCE_NUMBER, VALUE_TYPE_FOR_SEEK);
+        let istart = make_internal_key(range.start, MAX_SEQUENCE_NUMBER, VALUE_TYPE_FOR_SEEK);
+        let ilimit = make_internal_key(range.end, MAX_SEQUENCE_NUMBER, VALUE_TYPE_FOR_SEEK);
         let start_off = version.approximate_offset_of(&istart, &p.table_cache);
         let limit_off = version.approximate_offset_of(&ilimit, &p.table_cache);
         limit_off.saturating_sub(start_off)
@@ -1226,10 +1224,20 @@ impl Db {
     Ok(())
   }
 
-  /// Compact all SSTable files that overlap `[begin, end]` (user-key range)
-  /// down toward the deepest level, matching LevelDB's `CompactRange`.
+  /// Compact all SSTable files that overlap the user-key `range` down toward
+  /// the deepest level, matching LevelDB's `CompactRange`.
   ///
-  /// Both bounds are inclusive and optional (`None` means "no bound").
+  /// `..` compacts everything; `start..=end` matches LevelDB's inclusive
+  /// `[begin, end]`.  Compaction works on whole files, so any file holding a
+  /// key in the range is compacted.
+  ///
+  /// ```
+  /// # let db = roughdb::Db::default();
+  /// db.compact_range(..)?;
+  /// let (start, end): (&[u8], &[u8]) = (b"a", b"m");
+  /// db.compact_range(start..=end)?;
+  /// # Ok::<(), roughdb::Error>(())
+  /// ```
   ///
   /// The compaction is synchronous and runs level-by-level from L0 to the
   /// deepest level that currently has overlapping files.  After each level's
@@ -1241,8 +1249,10 @@ impl Db {
   /// until the database is reopened.
   ///
   /// No-op for in-memory databases (`Db::default()`).
-  pub fn compact_range(&self, begin: Option<&[u8]>, end: Option<&[u8]>) -> Result<(), Error> {
+  pub fn compact_range<'k>(&self, range: impl RangeBounds<&'k [u8]>) -> Result<(), Error> {
     use crate::db::version::NUM_LEVELS;
+
+    let range = (range.start_bound().cloned(), range.end_bound().cloned());
 
     if self.inner.persistence.is_none() {
       return Ok(());
@@ -1258,8 +1268,7 @@ impl Db {
           file_overlaps_range(
             ikey_user_key(&m.smallest),
             ikey_user_key(&m.largest),
-            begin,
-            end,
+            range,
             cmp,
           )
         });
@@ -1275,7 +1284,7 @@ impl Db {
     // level N+1, and there is no level above NUM_LEVELS-1.
     let stop = max_level.min(NUM_LEVELS - 2);
     for level in 0..=stop {
-      if let Err(e) = self.inner.compact_level_range(level, begin, end) {
+      if let Err(e) = self.inner.compact_level_range(level, range) {
         let mut g = self.inner.state.lock().unwrap();
         self.inner.record_background_error(&mut g, e.clone());
         return Err(e);
@@ -2296,6 +2305,7 @@ const L0_STOP_WRITES_TRIGGER: usize = 12;
 use crate::db::compaction::{
   do_compaction, file_overlaps_range, is_trivial_move, needs_compaction, pick_compaction,
   pick_level_for_memtable_output, pick_range_compaction, Compaction, CompactionOutput,
+  UserKeyRange,
 };
 /// Extract the user-key prefix from an SSTable internal key.
 /// Canonical implementation lives in `table::format`; aliased here for the
@@ -2434,12 +2444,7 @@ impl DbInner {
   ///
   /// Uses the same three-phase lock protocol as `maybe_compact`.
   /// Returns `Ok(true)` if a compaction ran, `Ok(false)` if nothing to compact.
-  fn compact_level_range(
-    &self,
-    level: usize,
-    begin: Option<&[u8]>,
-    end: Option<&[u8]>,
-  ) -> Result<bool, Error> {
+  fn compact_level_range(&self, level: usize, range: UserKeyRange<'_>) -> Result<bool, Error> {
     let Some(p) = &self.persistence else {
       return Ok(false);
     };
@@ -2453,7 +2458,7 @@ impl DbInner {
     };
 
     let cmp = &*self.options.comparator;
-    let Some(mut spec) = pick_range_compaction(&version, level, begin, end, cmp) else {
+    let Some(mut spec) = pick_range_compaction(&version, level, range, cmp) else {
       return Ok(false);
     };
 
@@ -3702,7 +3707,7 @@ mod tests {
       db.put(format!("k{i:04}").as_bytes(), format!("v{i:04}").as_bytes())
         .unwrap();
     }
-    db.compact_range(None, None).unwrap();
+    db.compact_range(..).unwrap();
     for i in 0u32..100 {
       assert_eq!(
         db.get(format!("k{i:04}").as_bytes()).unwrap().unwrap(),
@@ -3722,7 +3727,8 @@ mod tests {
       db.put(format!("k{i:04}").as_bytes(), b"v").unwrap();
     }
     // Compact only the middle third.
-    db.compact_range(Some(b"k0033"), Some(b"k0066")).unwrap();
+    db.compact_range(b"k0033".as_slice()..=b"k0066".as_slice())
+      .unwrap();
     // All keys must still be readable.
     for i in 0u32..100 {
       assert!(
@@ -3741,7 +3747,7 @@ mod tests {
     for i in 0u32..200 {
       db.put(format!("k{i:05}").as_bytes(), b"v").unwrap();
     }
-    db.compact_range(None, None).unwrap();
+    db.compact_range(..).unwrap();
     let l0_count = {
       let g = db.inner.state.lock().unwrap();
       g.version_set.current().files_at(0).len()
@@ -3764,7 +3770,7 @@ mod tests {
     for i in 100u32..200 {
       db.put(format!("filler{i:05}").as_bytes(), b"x").unwrap();
     }
-    db.compact_range(None, None).unwrap();
+    db.compact_range(..).unwrap();
     assert!(
       db.get(b"gone").unwrap().is_none(),
       "deleted key must not reappear after compact_range"
@@ -3776,7 +3782,7 @@ mod tests {
   fn compact_range_noop_on_inmemory_db() {
     let db = Db::default();
     db.put(b"k", b"v").unwrap();
-    db.compact_range(None, None).unwrap(); // must not panic
+    db.compact_range(..).unwrap(); // must not panic
     assert_eq!(db.get(b"k").unwrap().unwrap(), b"v");
   }
 
@@ -3791,7 +3797,7 @@ mod tests {
         db.put(format!("k{i:04}").as_bytes(), format!("v{i:04}").as_bytes())
           .unwrap();
       }
-      db.compact_range(None, None).unwrap();
+      db.compact_range(..).unwrap();
     }
     let db = Db::open(dir.path(), Options::default()).unwrap();
     for i in 0u32..100 {
@@ -3914,7 +3920,7 @@ mod tests {
   fn snapshot_pins_sequence_number() {
     let db = Db::default();
     db.put(b"k", b"v1").unwrap();
-    let snap = db.get_snapshot();
+    let snap = db.snapshot();
     db.put(b"k", b"v2").unwrap();
 
     // Without a snapshot we see the latest value.
@@ -3936,7 +3942,7 @@ mod tests {
   fn snapshot_sees_key_not_yet_deleted() {
     let db = Db::default();
     db.put(b"x", b"alive").unwrap();
-    let snap = db.get_snapshot();
+    let snap = db.snapshot();
     db.delete(b"x").unwrap();
 
     // Snapshot was taken before the deletion — key should be visible.
@@ -3955,7 +3961,7 @@ mod tests {
     let db = Db::default();
     db.put(b"a", b"1").unwrap();
     db.put(b"b", b"2").unwrap();
-    let snap = db.get_snapshot();
+    let snap = db.snapshot();
     db.put(b"c", b"3").unwrap();
     db.delete(b"a").unwrap();
 
@@ -3982,9 +3988,9 @@ mod tests {
   fn multiple_snapshots_independent() {
     let db = Db::default();
     db.put(b"k", b"v1").unwrap();
-    let snap1 = db.get_snapshot();
+    let snap1 = db.snapshot();
     db.put(b"k", b"v2").unwrap();
-    let snap2 = db.get_snapshot();
+    let snap2 = db.snapshot();
     db.put(b"k", b"v3").unwrap();
 
     let opts1 = ReadOptions {
@@ -4022,14 +4028,14 @@ mod tests {
       db.put(format!("k{i:05}").as_bytes(), value).unwrap();
     }
     db.flush(&FlushOptions { wait: true }).unwrap();
-    db.compact_range(None, None).unwrap();
+    db.compact_range(..).unwrap();
 
     // Sanity: the data really is spread over multiple files at one L1+ level
     // (the flush may place its output at L1 or L2, and compact_range pushes
     // one level deeper from wherever it landed).
     let files_below_l0: usize = (1..7)
       .map(|l| {
-        db.get_property(&format!("leveldb.num-files-at-level{l}"))
+        db.property(&format!("leveldb.num-files-at-level{l}"))
           .unwrap()
           .parse::<usize>()
           .unwrap()
@@ -4074,8 +4080,8 @@ mod tests {
     db.put(b"k", b"v1").unwrap();
     db.flush(&FlushOptions { wait: true }).unwrap(); // k@1 = v1 into an SSTable
 
-    let snap_kept = db.get_snapshot();
-    let snap_released = db.get_snapshot();
+    let snap_kept = db.snapshot();
+    let snap_released = db.snapshot();
     assert_eq!(snap_kept.seq, snap_released.seq); // no writes in between — same seq
     drop(snap_released);
 
@@ -4084,7 +4090,7 @@ mod tests {
 
     // Merge the SSTables.  Shadow-key pruning must keep k@1 because
     // `snap_kept` still pins it.
-    db.compact_range(None, None).unwrap();
+    db.compact_range(..).unwrap();
 
     let read = ReadOptions {
       snapshot: Some(&snap_kept),
@@ -4180,7 +4186,7 @@ mod tests {
     }
   }
 
-  // ── get_property ─────────────────────────────────────────────────────────
+  // ── property ─────────────────────────────────────────────────────────
 
   /// Helper: open a DB, write enough data to trigger at least one L0 flush,
   /// and return the open database.
@@ -4201,20 +4207,20 @@ mod tests {
   }
 
   #[test]
-  fn get_property_unknown_returns_none() {
+  fn property_unknown_returns_none() {
     let (_dir, db) = db_with_l0_files();
-    assert!(db.get_property("leveldb.unknown").is_none());
-    assert!(db.get_property("unknown").is_none());
-    assert!(db.get_property("leveldb.num-files-at-level99").is_none());
+    assert!(db.property("leveldb.unknown").is_none());
+    assert!(db.property("unknown").is_none());
+    assert!(db.property("leveldb.num-files-at-level99").is_none());
   }
 
   #[test]
-  fn get_property_num_files_at_level() {
+  fn property_num_files_at_level() {
     let (_dir, db) = db_with_l0_files();
     // At least one file must exist across all levels (data may have compacted to L1).
     let total: usize = (0..7)
       .map(|l| {
-        db.get_property(&format!("leveldb.num-files-at-level{l}"))
+        db.property(&format!("leveldb.num-files-at-level{l}"))
           .unwrap()
           .parse::<usize>()
           .unwrap()
@@ -4226,7 +4232,7 @@ mod tests {
     );
     // Level 6 should be empty given the small dataset.
     let l6: usize = db
-      .get_property("leveldb.num-files-at-level6")
+      .property("leveldb.num-files-at-level6")
       .unwrap()
       .parse()
       .unwrap();
@@ -4234,10 +4240,10 @@ mod tests {
   }
 
   #[test]
-  fn get_property_approximate_memory_usage() {
+  fn property_approximate_memory_usage() {
     let (_dir, db) = db_with_l0_files();
     let usage: usize = db
-      .get_property("leveldb.approximate-memory-usage")
+      .property("leveldb.approximate-memory-usage")
       .unwrap()
       .parse()
       .unwrap();
@@ -4246,9 +4252,9 @@ mod tests {
   }
 
   #[test]
-  fn get_property_stats_contains_header() {
+  fn property_stats_contains_header() {
     let (_dir, db) = db_with_l0_files();
-    let stats = db.get_property("leveldb.stats").unwrap();
+    let stats = db.property("leveldb.stats").unwrap();
     assert!(stats.contains("Level"), "stats missing header: {stats}");
     assert!(
       stats.contains("Files"),
@@ -4257,9 +4263,9 @@ mod tests {
   }
 
   #[test]
-  fn get_property_sstables_lists_files() {
+  fn property_sstables_lists_files() {
     let (_dir, db) = db_with_l0_files();
-    let tables = db.get_property("leveldb.sstables").unwrap();
+    let tables = db.property("leveldb.sstables").unwrap();
     // All seven level headers must appear.
     for level in 0..7 {
       assert!(
@@ -4275,47 +4281,47 @@ mod tests {
   }
 
   #[test]
-  fn get_property_in_memory_db_returns_sensible_values() {
+  fn property_in_memory_db_returns_sensible_values() {
     let db = Db::default();
     db.put(b"k", b"v").unwrap();
     // In-memory DB has no VersionSet, so file counts are all 0.
     let count: usize = db
-      .get_property("leveldb.num-files-at-level0")
+      .property("leveldb.num-files-at-level0")
       .unwrap()
       .parse()
       .unwrap();
     assert_eq!(count, 0);
     // But memory usage should reflect the memtable contents.
     let usage: usize = db
-      .get_property("leveldb.approximate-memory-usage")
+      .property("leveldb.approximate-memory-usage")
       .unwrap()
       .parse()
       .unwrap();
     assert!(usage > 0);
   }
 
-  // ── get_approximate_sizes ─────────────────────────────────────────────────
+  // ── approximate_sizes ─────────────────────────────────────────────────
 
   #[test]
-  fn get_approximate_sizes_empty_ranges() {
+  fn approximate_sizes_empty_ranges() {
     let (_dir, db) = db_with_l0_files();
-    let sizes = db.get_approximate_sizes(&[]);
+    let sizes = db.approximate_sizes(&[]);
     assert!(sizes.is_empty());
   }
 
   #[test]
-  fn get_approximate_sizes_in_memory_db_returns_zeros() {
+  fn approximate_sizes_in_memory_db_returns_zeros() {
     let db = Db::default();
     db.put(b"a", b"v").unwrap();
-    let sizes = db.get_approximate_sizes(&[(b"a".as_ref(), b"z".as_ref())]);
+    let sizes = db.approximate_sizes(&[b"a".as_slice()..b"z".as_slice()]);
     assert_eq!(sizes, vec![0]);
   }
 
   #[test]
-  fn get_approximate_sizes_wide_range_covers_data() {
+  fn approximate_sizes_wide_range_covers_data() {
     let (_dir, db) = db_with_l0_files();
     // A range that spans all written keys should return a non-zero size.
-    let sizes = db.get_approximate_sizes(&[(b"\x00".as_ref(), b"\xff".as_ref())]);
+    let sizes = db.approximate_sizes(&[b"\x00".as_slice()..b"\xff".as_slice()]);
     assert_eq!(sizes.len(), 1);
     assert!(
       sizes[0] > 0,
@@ -4325,25 +4331,25 @@ mod tests {
   }
 
   #[test]
-  fn get_approximate_sizes_multiple_ranges() {
+  fn approximate_sizes_multiple_ranges() {
     let (_dir, db) = db_with_l0_files();
-    let sizes = db.get_approximate_sizes(&[
-      (b"\x00".as_ref(), b"\x80".as_ref()),
-      (b"\x80".as_ref(), b"\xff".as_ref()),
+    let sizes = db.approximate_sizes(&[
+      b"\x00".as_slice()..b"\x80".as_slice(),
+      b"\x80".as_slice()..b"\xff".as_slice(),
     ]);
     assert_eq!(sizes.len(), 2);
     // Both halves may be 0 if all keys land in one half, but their sum
     // should equal the total across the full range (approximately).
-    let total_sizes = db.get_approximate_sizes(&[(b"\x00".as_ref(), b"\xff".as_ref())]);
+    let total_sizes = db.approximate_sizes(&[b"\x00".as_slice()..b"\xff".as_slice()]);
     // Individual sizes should be <= total (saturating arithmetic).
     assert!(sizes[0] + sizes[1] <= total_sizes[0] + 4096 * 8);
   }
 
   #[test]
-  fn get_approximate_sizes_empty_range_returns_zero() {
+  fn approximate_sizes_empty_range_returns_zero() {
     let (_dir, db) = db_with_l0_files();
     // start == limit → empty range; approximate_offset_of returns the same value.
-    let sizes = db.get_approximate_sizes(&[(b"key".as_ref(), b"key".as_ref())]);
+    let sizes = db.approximate_sizes(&[b"key".as_slice()..b"key".as_slice()]);
     assert_eq!(sizes, vec![0]);
   }
 
@@ -5002,12 +5008,12 @@ mod tests {
     let db = Db::open(dir.path(), create_options()).unwrap();
     db.put(b"hello", b"world").unwrap();
     // Before flush: L0 should be empty.
-    assert_eq!(db.get_property("leveldb.num-files-at-level0").unwrap(), "0");
+    assert_eq!(db.property("leveldb.num-files-at-level0").unwrap(), "0");
     db.flush(&crate::FlushOptions::default()).unwrap();
     // After flush: at least one L0 (or higher) SSTable should exist.
     let total_files: usize = (0..7)
       .map(|l| {
-        db.get_property(&format!("leveldb.num-files-at-level{l}"))
+        db.property(&format!("leveldb.num-files-at-level{l}"))
           .unwrap_or_else(|| "0".into())
           .parse::<usize>()
           .unwrap_or(0)
@@ -5319,7 +5325,7 @@ mod tests {
       // At least one SSTable should exist (the flushed WAL data).
       let total_files: usize = (0..7)
         .map(|l| {
-          db.get_property(&format!("leveldb.num-files-at-level{l}"))
+          db.property(&format!("leveldb.num-files-at-level{l}"))
             .unwrap_or_else(|| "0".into())
             .parse::<usize>()
             .unwrap_or(0)
@@ -5352,7 +5358,7 @@ mod tests {
       assert_eq!(db.get(b"key").unwrap().unwrap(), b"value");
       // Memory usage should be > 0 (data in memtable, not flushed).
       let mem_usage: usize = db
-        .get_property("leveldb.approximate-memory-usage")
+        .property("leveldb.approximate-memory-usage")
         .unwrap()
         .parse()
         .unwrap();
@@ -5454,7 +5460,7 @@ mod tests {
     db.flush(&crate::FlushOptions::default()).unwrap();
 
     // Force compaction so the filter runs.
-    db.compact_range(None, None).unwrap();
+    db.compact_range(..).unwrap();
 
     // "keep_" keys should survive.
     for i in 0..20u32 {
@@ -5496,7 +5502,7 @@ mod tests {
     }
 
     db.flush(&crate::FlushOptions::default()).unwrap();
-    db.compact_range(None, None).unwrap();
+    db.compact_range(..).unwrap();
 
     for i in 0..20u32 {
       let val = db.get(format!("key{i:03}").as_bytes()).unwrap().unwrap();
@@ -5789,7 +5795,7 @@ mod tests {
     // published: it is invisible now, and stays invisible to a snapshot
     // taken now even after it completes.
     assert!(db.get(b"b").unwrap().is_none());
-    let snap = db.get_snapshot();
+    let snap = db.snapshot();
 
     gate.release();
     writer.join().unwrap().unwrap();
@@ -5909,12 +5915,12 @@ mod tests {
     db.put(b"b", b"2").unwrap();
     flush(&db);
     db.put(b"c", b"3").unwrap();
-    db.compact_range(None, None).unwrap();
+    db.compact_range(..).unwrap();
     // One non-overlapping L0 file, an unflushed write, then a trivial move.
     db.put(b"z", b"4").unwrap();
     flush(&db);
     db.put(b"q", b"5").unwrap();
-    db.compact_range(None, None).unwrap();
+    db.compact_range(..).unwrap();
     let watermark = {
       let g = db.inner.state.lock().unwrap();
       g.version_set.last_sequence()
@@ -5978,7 +5984,7 @@ mod tests {
     let missing_w = (2 * n..2 * n + 4729)
       .filter(|&i| db.get(key(i).as_bytes()).unwrap().is_none())
       .count();
-    eprintln!("{}", db.get_property("leveldb.sstables").unwrap());
+    eprintln!("{}", db.property("leveldb.sstables").unwrap());
     eprintln!("setup keys missing: {missing}; writer keys missing: {missing_w}");
     assert_eq!(missing + missing_w, 0);
   }
@@ -6132,7 +6138,7 @@ mod tests {
     flush(&db).unwrap();
 
     gate.fail_manifest_syncs(true);
-    assert!(db.compact_range(None, None).is_err());
+    assert!(db.compact_range(..).is_err());
     gate.fail_manifest_syncs(false);
     assert!(db.put(b"c", b"1").is_err());
     assert!(flush(&db).is_err());
@@ -6164,14 +6170,14 @@ mod tests {
     gate.fail_appends(true);
     assert!(db.put(b"b", b"2").is_err());
     gate.fail_appends(false);
-    assert!(db.compact_range(None, None).is_err());
+    assert!(db.compact_range(..).is_err());
   }
 
   /// Flush overlapping memtables until L0 is one file short of the compaction
   /// trigger.  Returns the number of the last round written.
   fn fill_l0_to_one_below_trigger(db: &Db) -> u32 {
     let l0_files = || {
-      let n = db.get_property("leveldb.num-files-at-level0").unwrap();
+      let n = db.property("leveldb.num-files-at-level0").unwrap();
       n.parse::<usize>().unwrap()
     };
     let mut round = 0;

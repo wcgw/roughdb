@@ -79,7 +79,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Command::Put { key, value } => db.put(key, value)?,
     Command::Delete { key } => db.delete(key)?,
     Command::Flush => db.flush(&FlushOptions::default())?,
-    Command::Compact => db.compact_range(None, None)?,
+    Command::Compact => db.compact_range(..)?,
   }
 
   Ok(())

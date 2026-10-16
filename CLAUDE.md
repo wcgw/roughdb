@@ -296,8 +296,8 @@ what remains is compaction, the full Iterator/Snapshot API, and operational hygi
   (`L0_STOP_WRITES_TRIGGER`), and waits for an in-progress flush if `imm` is occupied. Level-score scheduling,
   compact-pointer round-robin, seek-based compaction, trivial-move optimisation, and grandparent-overlap limiting
   are all implemented. See `db/db_impl.cc: DBImpl::BackgroundCompaction`, `DoCompactionWork`, `MakeRoomForWrite`.
-- [x] **`Db::compact_range(begin, end)`**: Manual compaction of a user-key range (`Option<&[u8]>` for open bounds).
-  Finds the deepest level with files overlapping `[begin, end]`, then calls `compact_level_range` for each level
+- [x] **`Db::compact_range(range)`**: Manual compaction of a user-key range (`impl RangeBounds<&[u8]>`; `..` for all).
+  Finds the deepest level with files overlapping the range, then calls `compact_level_range` for each level
   from 0 to `max_level - 1`.  Each call uses the three-phase lock protocol; newly compacted files are visible to
   subsequent levels' compactions via a fresh version snapshot.  `pick_range_compaction` selects files at `level`
   that overlap `[begin, end]` plus next-level files that overlap the union range; reuses `do_compaction` and
@@ -317,8 +317,8 @@ what remains is compaction, the full Iterator/Snapshot API, and operational hygi
   `TwoLevelIterator` per SSTable from the current `Version`. Builds `MergingIterator` → `DbIterator`. Exposes:
   `valid`, `seek_to_first`, `seek_to_last`, `seek`, `next`, `prev`, `key`, `value`, `status`. `DbState.mem` and
   `.imm` changed to `Arc<Memtable>` to enable Arc cloning for the iterator. See `db/db_impl.cc`.
-- [x] **`Db::GetSnapshot` / `ReleaseSnapshot`**: `get_snapshot()` locks, reads `last_sequence`, inserts into
-  `DbState::snapshots: BTreeSet<u64>`, returns `Snapshot(seq)`. `release_snapshot(snap)` removes from the set.
+- [x] **`Db::GetSnapshot` / `ReleaseSnapshot`**: `snapshot()` locks, reads `last_sequence`, inserts into
+  `DbState::snapshots` (a refcount per sequence), returns a `Snapshot` whose `Drop` releases it.
   Compaction (`do_compaction`, `maybe_compact`, `compact_level_range`) uses `oldest_snapshot = snapshots.min()
   .unwrap_or(last_sequence)` as the visibility cutoff so entries observable through any live snapshot are not
   pruned. See `db/snapshot.h`.
@@ -330,14 +330,14 @@ what remains is compaction, the full Iterator/Snapshot API, and operational hygi
 
 **Remaining user-facing API surface** *(in `include/leveldb/db.h`)*
 
-- [x] **`Db::GetProperty(property)`**: `get_property(&self, property: &str) -> Option<String>`. Supported
+- [x] **`Db::GetProperty(property)`**: `property(&self, property: &str) -> Option<String>`. Supported
   properties: `"leveldb.num-files-at-level<N>"` (file count at level N), `"leveldb.stats"` (per-level file
   count and size; time/read/write columns emit `0` since compaction stats are not tracked),
   `"leveldb.sstables"` (one line per SSTable with file number, size, and escaped user-key range),
   `"leveldb.approximate-memory-usage"` (memtable bytes). Returns `None` for unknown properties or invalid level
   numbers. Helpers `num_files`, `level_bytes`, `debug_string` added to `Version`.
   See `db/db_impl.cc: DBImpl::GetProperty`.
-- [x] **`Db::GetApproximateSizes(ranges)`**: Given a slice of `(start_key, end_key)` ranges, return approximate
+- [x] **`Db::GetApproximateSizes(ranges)`**: `approximate_sizes(&[Range<&[u8]>])`: return approximate
   on-disk byte count for each range by walking the index blocks of overlapping SSTables. Used by tools to estimate
   data distribution. `Version::approximate_offset_of` accumulates `file_size` for files entirely before the key
   and delegates to `Table::approximate_offset_of` (index-block seek, returns block start offset or `metaindex_offset`

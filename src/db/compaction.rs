@@ -750,16 +750,27 @@ pub(crate) fn do_compaction(
 pub(crate) fn file_overlaps_range(
   file_small: &[u8],
   file_large: &[u8],
-  begin: Option<&[u8]>,
-  end: Option<&[u8]>,
+  (start, end): UserKeyRange<'_>,
   cmp: &dyn crate::comparator::Comparator,
 ) -> bool {
-  begin.is_none_or(|b| cmp.compare(file_large, b).is_ge())
-    && end.is_none_or(|e| cmp.compare(file_small, e).is_le())
+  use std::ops::Bound::{Excluded, Included, Unbounded};
+  let ends_after_start = match start {
+    Included(start) => cmp.compare(file_large, start).is_ge(),
+    Excluded(start) => cmp.compare(file_large, start).is_gt(),
+    Unbounded => true,
+  };
+  let starts_before_end = match end {
+    Included(end) => cmp.compare(file_small, end).is_le(),
+    Excluded(end) => cmp.compare(file_small, end).is_lt(),
+    Unbounded => true,
+  };
+  ends_after_start && starts_before_end
 }
 
-/// Plan a manual compaction of `level` → `level + 1` over the user-key range
-/// `[begin, end]` (`None` = unbounded).
+/// A range of user keys, as the bounds of a [`RangeBounds`](std::ops::RangeBounds).
+pub(crate) type UserKeyRange<'k> = (std::ops::Bound<&'k [u8]>, std::ops::Bound<&'k [u8]>);
+
+/// Plan a manual compaction of `level` → `level + 1` over the user-key `range`.
 ///
 /// The inputs are the files at `level` that overlap the range and the
 /// `level+1` files that overlap their union.  Returns `None` if no file at
@@ -767,8 +778,7 @@ pub(crate) fn file_overlaps_range(
 pub(crate) fn pick_range_compaction(
   version: &Arc<crate::db::version::Version>,
   level: usize,
-  begin: Option<&[u8]>,
-  end: Option<&[u8]>,
+  range: UserKeyRange<'_>,
   cmp: &dyn crate::comparator::Comparator,
 ) -> Option<Compaction> {
   use crate::db::version::NUM_LEVELS;
@@ -784,8 +794,7 @@ pub(crate) fn pick_range_compaction(
       file_overlaps_range(
         ikey_user_key(&m.smallest),
         ikey_user_key(&m.largest),
-        begin,
-        end,
+        range,
         cmp,
       )
     })
