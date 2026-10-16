@@ -5,11 +5,15 @@ change no public API.  Items 6–10 do, and are acceptable as a 0.x minor bump.
 
 ## Internal (no public API change)
 
-- [ ] **1. `lib.rs` free functions become methods on `DbInner` / `DbState`.**  About a dozen free functions take
+- [x] **1. `lib.rs` free functions become methods on `DbInner` / `DbState`.**  About a dozen free functions take
   `&Mutex<DbState>` or `&mut DbState` plus `path`, `opts`, `tc` or `fs`, all of which are fields of `DbInner` or
   `Persistence`: `compact_level_range(path, state, opts, tc, level, begin, end)`, `maybe_compact(path, state, opts,
   tc)`, `delete_obsolete_files(path, state, fs)`, `begin_flush(path, state, comparator, fs)`, …  As methods, the
   pass-through parameters disappear.
+  *Done:* scheduling, the background loop (`run_background_work`), flush phases 1 and 3, compaction and file GC are
+  `DbInner` methods; lock-held transitions (`take_group_batch`, `update_stats`, `install_*`, and a new
+  `oldest_snapshot` replacing two copies) are `DbState` methods; flush phase 2 is `FlushPrep::write_table`.
+  `begin_flush` also hands the sealed memtable to the background thread, which its three callers each did by hand.
 
 - [ ] **2. Typed internal keys.**  `parse_internal_key` returns `Option<(&[u8], u64, u8)>`, and `ValueType` is
   private to `memtable/entry.rs`, so other modules compare against bare literals (`vtype == 0` in
