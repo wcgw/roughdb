@@ -95,9 +95,11 @@ change no public API.  Items 6–10 do, and are acceptable as a 0.x minor bump.
   bytes used to be stored as the tombstone's unread value).  Not covered by a test: a tombstone only reaches the
   filter when the key has data below the output level, which `compact_range` alone cannot set up.
 
-- [ ] **12. `DbIter` is `Send`.**  It boxes `dyn InternalIterator`, which has no `Send` bound, so an iterator cannot
+- [x] **12. `DbIter` is `Send`.**  It boxes `dyn InternalIterator`, which has no `Send` bound, so an iterator cannot
   move to another thread, as a LevelDB iterator can.  Adding `Send` is additive.  Found while doing the auto-trait
   test below.
+  *Done:* `InternalIterator: Send` and a `Send` block opener were all it took; every implementor already was.  The
+  auto-trait test pins `DbIter: Send`.
 
 ## Small items
 

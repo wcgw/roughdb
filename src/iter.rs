@@ -17,7 +17,10 @@ use crate::error::Error;
 /// All iterators start invalid; callers must invoke `seek_to_first()` or `seek()`
 /// before reading `key()` / `value()`.  Keys are internal keys
 /// (`user_key || 8-byte LE tag`); values are raw value bytes.
-pub(crate) trait InternalIterator {
+///
+/// `Send`, so that a [`DbIter`](crate::DbIter) built from them can move to
+/// another thread.
+pub(crate) trait InternalIterator: Send {
   fn valid(&self) -> bool;
   fn seek_to_first(&mut self);
   /// Position at the last entry.

@@ -498,6 +498,9 @@ struct FlushResult {
 /// [`seek_to_first`]: DbIter::seek_to_first
 /// [`seek_to_last`]: DbIter::seek_to_last
 /// [`seek`]: DbIter::seek
+/// A `DbIter` holds its own references to the memtables and SSTables it
+/// reads, so it can be moved to another thread (`Send`) and outlive any lock.
+///
 /// [`next`]: DbIter::next
 /// [`prev`]: DbIter::prev
 pub struct DbIter {
@@ -2894,6 +2897,9 @@ mod tests {
     assert_send_sync::<crate::Snapshot<'static>>();
     assert_send_sync::<WriteBatch>();
     assert_send_sync::<Options>();
+    // An iterator may move to another thread, though not be shared by two.
+    fn assert_send<T: Send>() {}
+    assert_send::<crate::DbIter>();
   }
 
   #[test]

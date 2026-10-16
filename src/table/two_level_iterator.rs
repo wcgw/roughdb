@@ -15,7 +15,7 @@ use crate::iter::InternalIterator;
 
 /// Given the value bytes of an index entry (an encoded `BlockHandle`), open
 /// the corresponding data block and return an iterator over it.
-pub(crate) type BlockFn = Box<dyn Fn(&[u8]) -> Result<Box<dyn InternalIterator>, Error>>;
+pub(crate) type BlockFn = Box<dyn Fn(&[u8]) -> Result<Box<dyn InternalIterator>, Error> + Send>;
 
 /// Composes an index iterator with a block-opener function to provide a
 /// transparent, seek-able view over all entries in an SSTable.
