@@ -15,23 +15,15 @@ use std::fmt;
 /// Mirrors LevelDB's `Status` error codes (excluding `Ok`, which is `Result::Ok`).
 #[derive(Debug)]
 pub enum Error {
-  NotFound,
   Corruption(String),
   InvalidArgument(String),
   NotSupported(String),
   IoError(std::io::Error),
 }
 
-impl Error {
-  pub fn is_not_found(&self) -> bool {
-    matches!(self, Error::NotFound)
-  }
-}
-
 impl fmt::Display for Error {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     match self {
-      Error::NotFound => write!(f, "NotFound"),
       Error::Corruption(msg) => write!(f, "Corruption: {msg}"),
       Error::InvalidArgument(msg) => write!(f, "InvalidArgument: {msg}"),
       Error::NotSupported(msg) => write!(f, "NotSupported: {msg}"),
@@ -58,7 +50,6 @@ impl From<std::io::Error> for Error {
 impl Clone for Error {
   fn clone(&self) -> Self {
     match self {
-      Error::NotFound => Error::NotFound,
       Error::Corruption(s) => Error::Corruption(s.clone()),
       Error::InvalidArgument(s) => Error::InvalidArgument(s.clone()),
       Error::NotSupported(s) => Error::NotSupported(s.clone()),

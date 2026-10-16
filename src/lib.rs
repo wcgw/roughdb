@@ -43,10 +43,9 @@
 //! # let db = roughdb::Db::default();
 //! db.put(b"hello", b"world")?;
 //!
-//! match db.get(b"hello") {
-//!     Ok(value) => println!("got: {}", String::from_utf8_lossy(&value)),
-//!     Err(e) if e.is_not_found() => println!("not found"),
-//!     Err(e) => return Err(e),
+//! match db.get(b"hello")? {
+//!     Some(value) => println!("got: {}", String::from_utf8_lossy(&value)),
+//!     None => println!("not found"),
 //! }
 //!
 //! db.delete(b"hello")?;
@@ -103,7 +102,7 @@
 //! db.put(b"k", b"v2")?;
 //!
 //! let opts = ReadOptions { snapshot: Some(&snap), ..ReadOptions::default() };
-//! assert_eq!(db.get_with_options(&opts, b"k")?, b"v1");
+//! assert_eq!(db.get_with_options(&opts, b"k")?, Some(b"v1".to_vec()));
 //!
 //! // snap releases automatically here when it goes out of scope.
 //! # Ok::<(), roughdb::Error>(())
@@ -902,20 +901,21 @@ impl Db {
     Ok(max_sequence)
   }
 
-  /// Look up `key` in the database, returning its value.
+  /// Look up `key` in the database, returning its value, or `None` if `key`
+  /// does not exist or was deleted.
   ///
-  /// Returns [`Error::NotFound`] if `key` does not exist or was deleted.
   /// Equivalent to calling [`get_with_options`] with [`ReadOptions::default`].
   ///
   /// [`get_with_options`]: Db::get_with_options
-  pub fn get<K>(&self, key: K) -> Result<Vec<u8>, Error>
+  pub fn get<K>(&self, key: K) -> Result<Option<Vec<u8>>, Error>
   where
     K: AsRef<[u8]>,
   {
     self.get_with_options(&ReadOptions::default(), key)
   }
 
-  /// Look up `key` in the database with explicit read options, returning its value.
+  /// Look up `key` in the database with explicit read options, returning its
+  /// value, or `None` if `key` does not exist or was deleted.
   ///
   /// The lookup order mirrors LevelDB's `DBImpl::Get`:
   /// 1. Active memtable (lock-free after a brief snapshot under the lock).
@@ -929,10 +929,8 @@ impl Db {
   /// If `opts.snapshot` is set, only writes that preceded the snapshot are visible; otherwise
   /// the read sees all writes committed before this call.
   ///
-  /// Returns [`Error::NotFound`] if `key` does not exist or was deleted.
-  ///
   /// See `db/db_impl.cc: DBImpl::Get`.
-  pub fn get_with_options<K>(&self, opts: &ReadOptions, key: K) -> Result<Vec<u8>, Error>
+  pub fn get_with_options<K>(&self, opts: &ReadOptions, key: K) -> Result<Option<Vec<u8>>, Error>
   where
     K: AsRef<[u8]>,
   {
@@ -955,15 +953,15 @@ impl Db {
     let fill_cache = opts.fill_cache;
 
     match mem.get(key, sequence) {
-      MemtableResult::Hit(v) => return Ok(v),
-      MemtableResult::Deleted => return Err(Error::NotFound),
+      MemtableResult::Hit(v) => return Ok(Some(v)),
+      MemtableResult::Deleted => return Ok(None),
       MemtableResult::Miss => {}
     }
 
     if let Some(imm) = imm {
       match imm.get(key, sequence) {
-        MemtableResult::Hit(v) => return Ok(v),
-        MemtableResult::Deleted => return Err(Error::NotFound),
+        MemtableResult::Hit(v) => return Ok(Some(v)),
+        MemtableResult::Deleted => return Ok(None),
         MemtableResult::Miss => {}
       }
     }
@@ -983,13 +981,13 @@ impl Db {
         self.inner.maybe_schedule_compaction(&mut g);
       }
       match result {
-        LookupResult::Value(v) => return Ok(v),
-        LookupResult::Deleted => return Err(Error::NotFound),
+        LookupResult::Value(v) => return Ok(Some(v)),
+        LookupResult::Deleted => return Ok(None),
         LookupResult::NotInTable => {}
       }
     }
 
-    Err(Error::NotFound)
+    Ok(None)
   }
 
   /// Return an immutable snapshot of the current database state.
@@ -2760,11 +2758,14 @@ mod tests {
   #[test]
   fn in_memory_round_trip() {
     let db = Db::default();
-    assert!(db.get(b"42").unwrap_err().is_not_found());
+    assert!(db.get(b"42").unwrap().is_none());
     db.put(b"42", b"An answer to some question").unwrap();
-    assert_eq!(db.get(b"42").unwrap(), b"An answer to some question");
+    assert_eq!(
+      db.get(b"42").unwrap().unwrap(),
+      b"An answer to some question"
+    );
     db.delete(b"42").unwrap();
-    assert!(db.get(b"42").unwrap_err().is_not_found());
+    assert!(db.get(b"42").unwrap().is_none());
   }
 
   #[test]
@@ -2778,15 +2779,15 @@ mod tests {
     }
     // Reopen: recovery must restore state from the WAL.
     let db = Db::open(dir.path(), Options::default()).unwrap();
-    assert_eq!(db.get(b"key").unwrap(), b"value");
-    assert!(db.get(b"foo").unwrap_err().is_not_found());
+    assert_eq!(db.get(b"key").unwrap().unwrap(), b"value");
+    assert!(db.get(b"foo").unwrap().is_none());
   }
 
   #[test]
   fn open_empty_db_is_empty() {
     let dir = tempfile::tempdir().unwrap();
     let db = Db::open(dir.path(), create_options()).unwrap();
-    assert!(db.get(b"anything").unwrap_err().is_not_found());
+    assert!(db.get(b"anything").unwrap().is_none());
   }
 
   #[test]
@@ -2805,7 +2806,7 @@ mod tests {
     let dir = tempfile::tempdir().unwrap();
     let db = Db::open(dir.path(), create_options()).unwrap();
     db.put(b"k", b"v").unwrap();
-    assert_eq!(db.get(b"k").unwrap(), b"v");
+    assert_eq!(db.get(b"k").unwrap().unwrap(), b"v");
   }
 
   #[test]
@@ -2832,7 +2833,7 @@ mod tests {
     // Default error_if_exists = false — reopening must succeed.
     let db = Db::open(dir.path(), Options::default()).unwrap();
     // DB is empty but opens without error.
-    assert!(db.get(b"k").unwrap_err().is_not_found());
+    assert!(db.get(b"k").unwrap().is_none());
   }
 
   #[test]
@@ -2868,7 +2869,7 @@ mod tests {
     drop(db); // releases the flock
               // Reopening after drop must succeed.
     let db2 = Db::open(dir.path(), Options::default()).unwrap();
-    assert_eq!(db2.get(b"k").unwrap(), b"v");
+    assert_eq!(db2.get(b"k").unwrap().unwrap(), b"v");
   }
 
   // ── Db::destroy tests ──────────────────────────────────────────────────────
@@ -2939,9 +2940,9 @@ mod tests {
       db.write(&WriteOptions::default(), batch).unwrap();
     }
     let db = Db::open(dir.path(), Options::default()).unwrap();
-    assert_eq!(db.get("a").unwrap(), b"1");
-    assert_eq!(db.get("b").unwrap(), b"2");
-    assert_eq!(db.get("c").unwrap(), b"3");
+    assert_eq!(db.get("a").unwrap().unwrap(), b"1");
+    assert_eq!(db.get("b").unwrap().unwrap(), b"2");
+    assert_eq!(db.get("c").unwrap().unwrap(), b"3");
   }
 
   #[test]
@@ -2956,7 +2957,7 @@ mod tests {
       db.put(b"k", b"second").unwrap();
     }
     let db = Db::open(dir.path(), Options::default()).unwrap();
-    assert_eq!(db.get(b"k").unwrap(), b"second");
+    assert_eq!(db.get(b"k").unwrap().unwrap(), b"second");
   }
 
   // ── L0 flush + disk read tests ─────────────────────────────────────────────
@@ -3027,7 +3028,7 @@ mod tests {
     for i in 0u32..20 {
       let expected = format!("val{i:04}");
       assert_eq!(
-        db.get(format!("key{i:04}").as_bytes()).unwrap(),
+        db.get(format!("key{i:04}").as_bytes()).unwrap().unwrap(),
         expected.as_bytes()
       );
     }
@@ -3046,9 +3047,9 @@ mod tests {
     db.delete(b"fk0000").unwrap();
 
     // The tombstone in mem must shadow the value in L0.
-    assert!(db.get(b"fk0000").unwrap_err().is_not_found());
+    assert!(db.get(b"fk0000").unwrap().is_none());
     // Other keys are still readable.
-    assert_eq!(db.get(b"fk0001").unwrap(), b"v");
+    assert_eq!(db.get(b"fk0001").unwrap().unwrap(), b"v");
   }
 
   #[test]
@@ -3133,7 +3134,10 @@ mod tests {
     // Reopen must succeed and all keys must be readable.
     let db = Db::open(dir.path(), Options::default()).unwrap();
     for i in 0u32..20 {
-      assert_eq!(db.get(format!("k{i:04}").as_bytes()).unwrap(), b"v");
+      assert_eq!(
+        db.get(format!("k{i:04}").as_bytes()).unwrap().unwrap(),
+        b"v"
+      );
     }
   }
 
@@ -3167,7 +3171,7 @@ mod tests {
     for i in 0u32..20 {
       let expected = format!("v{i:04}");
       assert_eq!(
-        db.get(format!("k{i:04}").as_bytes()).unwrap(),
+        db.get(format!("k{i:04}").as_bytes()).unwrap().unwrap(),
         expected.as_bytes(),
         "key k{i:04} not found after reopen"
       );
@@ -3215,12 +3219,12 @@ mod tests {
     for i in 0u32..50 {
       let expected = format!("v{i:04}");
       assert_eq!(
-        db.get(format!("k{i:04}").as_bytes()).unwrap(),
+        db.get(format!("k{i:04}").as_bytes()).unwrap().unwrap(),
         expected.as_bytes(),
         "key k{i:04} missing after in-memory reopen"
       );
     }
-    assert_eq!(db.get(b"unflushed").unwrap(), b"tail");
+    assert_eq!(db.get(b"unflushed").unwrap().unwrap(), b"tail");
   }
 
   // ── new_iterator tests ─────────────────────────────────────────────────────
@@ -3462,7 +3466,7 @@ mod tests {
     assert_eq!(count_files(dir.path(), ".ldb"), 3);
     // And data is still fully readable.
     for j in 0..i {
-      assert!(db.get(format!("key{j:04}").as_bytes()).is_ok());
+      assert!(db.get(format!("key{j:04}").as_bytes()).unwrap().is_some());
     }
   }
 
@@ -3605,7 +3609,7 @@ mod tests {
     for i in 0u32..100 {
       let expected = format!("v{i:04}");
       assert_eq!(
-        db.get(format!("k{i:04}").as_bytes()).unwrap(),
+        db.get(format!("k{i:04}").as_bytes()).unwrap().unwrap(),
         expected.as_bytes(),
         "key k{i:04} not readable after compaction"
       );
@@ -3633,7 +3637,7 @@ mod tests {
     }
 
     assert!(
-      db.get(b"target").unwrap_err().is_not_found(),
+      db.get(b"target").unwrap().is_none(),
       "tombstone must shadow value in L1"
     );
   }
@@ -3655,7 +3659,7 @@ mod tests {
     for i in 0u32..100 {
       let expected = format!("v{i:04}");
       assert_eq!(
-        db.get(format!("k{i:04}").as_bytes()).unwrap(),
+        db.get(format!("k{i:04}").as_bytes()).unwrap().unwrap(),
         expected.as_bytes(),
         "key k{i:04} not found after reopen"
       );
@@ -3701,7 +3705,7 @@ mod tests {
     db.compact_range(None, None).unwrap();
     for i in 0u32..100 {
       assert_eq!(
-        db.get(format!("k{i:04}").as_bytes()).unwrap(),
+        db.get(format!("k{i:04}").as_bytes()).unwrap().unwrap(),
         format!("v{i:04}").as_bytes(),
         "key k{i:04} missing after compact_range"
       );
@@ -3722,7 +3726,7 @@ mod tests {
     // All keys must still be readable.
     for i in 0u32..100 {
       assert!(
-        db.get(format!("k{i:04}").as_bytes()).is_ok(),
+        db.get(format!("k{i:04}").as_bytes()).unwrap().is_some(),
         "key k{i:04} missing after partial compact_range"
       );
     }
@@ -3762,7 +3766,7 @@ mod tests {
     }
     db.compact_range(None, None).unwrap();
     assert!(
-      db.get(b"gone").unwrap_err().is_not_found(),
+      db.get(b"gone").unwrap().is_none(),
       "deleted key must not reappear after compact_range"
     );
   }
@@ -3773,7 +3777,7 @@ mod tests {
     let db = Db::default();
     db.put(b"k", b"v").unwrap();
     db.compact_range(None, None).unwrap(); // must not panic
-    assert_eq!(db.get(b"k").unwrap(), b"v");
+    assert_eq!(db.get(b"k").unwrap().unwrap(), b"v");
   }
 
   #[test]
@@ -3792,7 +3796,7 @@ mod tests {
     let db = Db::open(dir.path(), Options::default()).unwrap();
     for i in 0u32..100 {
       assert_eq!(
-        db.get(format!("k{i:04}").as_bytes()).unwrap(),
+        db.get(format!("k{i:04}").as_bytes()).unwrap().unwrap(),
         format!("v{i:04}").as_bytes()
       );
     }
@@ -3810,7 +3814,7 @@ mod tests {
     };
     let db = Db::open(dir.path(), opts).unwrap();
     db.put(b"hello", b"world").unwrap();
-    assert_eq!(db.get(b"hello").unwrap(), b"world");
+    assert_eq!(db.get(b"hello").unwrap().unwrap(), b"world");
   }
 
   #[test]
@@ -3829,7 +3833,7 @@ mod tests {
       ..Options::default()
     };
     let db = Db::open(dir.path(), opts).unwrap();
-    assert_eq!(db.get(b"k0000").unwrap(), b"v0000");
+    assert_eq!(db.get(b"k0000").unwrap().unwrap(), b"v0000");
     let mut it = db
       .new_iterator(&ReadOptions {
         verify_checksums: true,
@@ -3914,18 +3918,18 @@ mod tests {
     db.put(b"k", b"v2").unwrap();
 
     // Without a snapshot we see the latest value.
-    assert_eq!(db.get(b"k").unwrap(), b"v2");
+    assert_eq!(db.get(b"k").unwrap().unwrap(), b"v2");
 
     // With the snapshot we see the value as of when it was taken.
     let opts = ReadOptions {
       snapshot: Some(&snap),
       ..ReadOptions::default()
     };
-    assert_eq!(db.get_with_options(&opts, b"k").unwrap(), b"v1");
+    assert_eq!(db.get_with_options(&opts, b"k").unwrap().unwrap(), b"v1");
 
     drop(snap);
     // After release, reads still see the latest value.
-    assert_eq!(db.get(b"k").unwrap(), b"v2");
+    assert_eq!(db.get(b"k").unwrap().unwrap(), b"v2");
   }
 
   #[test]
@@ -3940,10 +3944,10 @@ mod tests {
       snapshot: Some(&snap),
       ..ReadOptions::default()
     };
-    assert_eq!(db.get_with_options(&opts, b"x").unwrap(), b"alive");
+    assert_eq!(db.get_with_options(&opts, b"x").unwrap().unwrap(), b"alive");
 
     // Current view sees the deletion.
-    assert!(db.get(b"x").unwrap_err().is_not_found());
+    assert!(db.get(b"x").unwrap().is_none());
   }
 
   #[test]
@@ -3991,9 +3995,9 @@ mod tests {
       snapshot: Some(&snap2),
       ..ReadOptions::default()
     };
-    assert_eq!(db.get_with_options(&opts1, b"k").unwrap(), b"v1");
-    assert_eq!(db.get_with_options(&opts2, b"k").unwrap(), b"v2");
-    assert_eq!(db.get(b"k").unwrap(), b"v3");
+    assert_eq!(db.get_with_options(&opts1, b"k").unwrap().unwrap(), b"v1");
+    assert_eq!(db.get_with_options(&opts2, b"k").unwrap().unwrap(), b"v2");
+    assert_eq!(db.get(b"k").unwrap().unwrap(), b"v3");
   }
 
   #[test]
@@ -4038,15 +4042,15 @@ mod tests {
 
     for i in 0u32..2000 {
       assert_eq!(
-        db.get(format!("k{i:05}").as_bytes()).unwrap(),
+        db.get(format!("k{i:05}").as_bytes()).unwrap().unwrap(),
         value,
         "k{i:05} must be readable after multi-file compaction"
       );
     }
     // Before the first file, between-file gaps don't exist for contiguous
     // keys, and after the last file: all must miss cleanly.
-    assert!(db.get(b"a").unwrap_err().is_not_found());
-    assert!(db.get(b"k99999").unwrap_err().is_not_found());
+    assert!(db.get(b"a").unwrap().is_none());
+    assert!(db.get(b"k99999").unwrap().is_none());
   }
 
   #[test]
@@ -4087,7 +4091,7 @@ mod tests {
       ..ReadOptions::default()
     };
     assert_eq!(
-      db.get_with_options(&read, b"k").unwrap(),
+      db.get_with_options(&read, b"k").unwrap().unwrap(),
       b"v1",
       "snapshot lost its pinned version after sibling release + compaction"
     );
@@ -4113,7 +4117,10 @@ mod tests {
     }
     // All keys must be readable after flush.
     for i in 0u32..50 {
-      assert_eq!(db.get(format!("key{i:04}").as_bytes()).unwrap(), b"val");
+      assert_eq!(
+        db.get(format!("key{i:04}").as_bytes()).unwrap().unwrap(),
+        b"val"
+      );
     }
   }
 
@@ -4124,9 +4131,9 @@ mod tests {
     for i in 0u32..50 {
       db.put(format!("key{i:04}").as_bytes(), b"val").unwrap();
     }
-    // Absent keys must return NotFound (the filter must not cause false negatives).
-    assert!(db.get(b"absent").is_err());
-    assert!(db.get(b"nope").is_err());
+    // Absent keys must read as absent (the filter must not cause false negatives).
+    assert!(db.get(b"absent").unwrap().is_none());
+    assert!(db.get(b"nope").unwrap().is_none());
   }
 
   #[test]
@@ -4141,9 +4148,12 @@ mod tests {
     // Reopen with the same filter policy — filter blocks should be read back.
     let db2 = Db::open(dir.path(), bloom_options()).unwrap();
     for i in 0u32..50 {
-      assert_eq!(db2.get(format!("key{i:04}").as_bytes()).unwrap(), b"val");
+      assert_eq!(
+        db2.get(format!("key{i:04}").as_bytes()).unwrap().unwrap(),
+        b"val"
+      );
     }
-    assert!(db2.get(b"absent").is_err());
+    assert!(db2.get(b"absent").unwrap().is_none());
   }
 
   #[test]
@@ -4163,7 +4173,10 @@ mod tests {
     };
     let db2 = Db::open(dir.path(), opts_no_filter).unwrap();
     for i in 0u32..50 {
-      assert_eq!(db2.get(format!("key{i:04}").as_bytes()).unwrap(), b"val");
+      assert_eq!(
+        db2.get(format!("key{i:04}").as_bytes()).unwrap().unwrap(),
+        b"val"
+      );
     }
   }
 
@@ -4356,7 +4369,7 @@ mod tests {
     }
     for i in 0..n {
       let key = format!("key{i:04}");
-      assert_eq!(db.get(key.as_bytes()).unwrap(), b"val");
+      assert_eq!(db.get(key.as_bytes()).unwrap().unwrap(), b"val");
     }
   }
 
@@ -4383,8 +4396,8 @@ mod tests {
     t1.join().unwrap();
     t2.join().unwrap();
 
-    assert_eq!(db.get(b"alpha").unwrap(), b"1");
-    assert_eq!(db.get(b"beta").unwrap(), b"2");
+    assert_eq!(db.get(b"alpha").unwrap().unwrap(), b"1");
+    assert_eq!(db.get(b"beta").unwrap().unwrap(), b"2");
   }
 
   /// Sequence numbers remain monotone under concurrent writes.
@@ -4445,7 +4458,7 @@ mod tests {
 
     for i in 0..3usize {
       let key = format!("skey{i}");
-      assert_eq!(db.get(key.as_bytes()).unwrap(), b"v");
+      assert_eq!(db.get(key.as_bytes()).unwrap().unwrap(), b"v");
     }
   }
 
@@ -4602,8 +4615,8 @@ mod tests {
     assert_eq!(l2, 1, "expected one file at L2 (MAX_MEM_COMPACT_LEVEL)");
 
     // Verify data is readable regardless of which level it landed at.
-    assert_eq!(db.get(b"flush0000").unwrap(), b"value");
-    assert_eq!(db.get(b"flush0199").unwrap(), b"value");
+    assert_eq!(db.get(b"flush0000").unwrap().unwrap(), b"value");
+    assert_eq!(db.get(b"flush0199").unwrap().unwrap(), b"value");
   }
 
   /// When L0 already has files that overlap the flush range, the output must
@@ -4635,7 +4648,7 @@ mod tests {
 
     // Both flushes should have completed; data must be readable.
     for i in 0u32..200 {
-      let val = db.get(format!("key{i:04}").as_bytes()).unwrap();
+      let val = db.get(format!("key{i:04}").as_bytes()).unwrap().unwrap();
       assert_eq!(val, b"v2");
     }
   }
@@ -4692,7 +4705,7 @@ mod tests {
       let mut expected = large_val.clone();
       let bytes = i.to_le_bytes();
       expected[..4].copy_from_slice(&bytes);
-      let val = db.get(format!("key{i:07}").as_bytes()).unwrap();
+      let val = db.get(format!("key{i:07}").as_bytes()).unwrap().unwrap();
       assert_eq!(val, expected.as_slice());
     }
   }
@@ -4735,7 +4748,7 @@ mod tests {
     // Reopen and verify all keys readable with latest values.
     let db2 = Db::open(dir.path(), opts).unwrap();
     for i in 0u32..10 {
-      let val = db2.get(format!("aaa{i:03}").as_bytes()).unwrap();
+      let val = db2.get(format!("aaa{i:03}").as_bytes()).unwrap().unwrap();
       assert_eq!(val, b"secondbatch");
     }
   }
@@ -4778,9 +4791,9 @@ mod tests {
     // Reopen and verify correctness.
     let db2 = Db::open(dir.path(), opts).unwrap();
     for k in 0u32..20 {
-      let result = db2.get(format!("k{k:04}").as_bytes());
+      let result = db2.get(format!("k{k:04}").as_bytes()).unwrap();
       assert!(
-        result.is_ok(),
+        result.is_some(),
         "key k{k:04} should be readable after compaction"
       );
       assert_eq!(result.unwrap(), val);
@@ -4956,7 +4969,7 @@ mod tests {
 
     // Verify all original keys still readable.
     for k in 0u32..5 {
-      let val = db.get(format!("key{k:02}").as_bytes()).unwrap();
+      let val = db.get(format!("key{k:02}").as_bytes()).unwrap().unwrap();
       assert!(
         val.starts_with(b"val"),
         "key{k:02} should still be readable"
@@ -4971,7 +4984,7 @@ mod tests {
     let db = Db::default();
     db.put(b"k", b"v").unwrap();
     db.flush(&crate::FlushOptions::default()).unwrap();
-    assert_eq!(db.get(b"k").unwrap(), b"v");
+    assert_eq!(db.get(b"k").unwrap().unwrap(), b"v");
   }
 
   #[test]
@@ -5005,7 +5018,7 @@ mod tests {
       "expected at least one SSTable after flush"
     );
     // Data must still be readable.
-    assert_eq!(db.get(b"hello").unwrap(), b"world");
+    assert_eq!(db.get(b"hello").unwrap().unwrap(), b"world");
   }
 
   #[serial(fd)]
@@ -5020,7 +5033,7 @@ mod tests {
     }
     // Reopen without writing anything: data must come from the SSTable.
     let db = Db::open(dir.path(), Options::default()).unwrap();
-    assert_eq!(db.get(b"persist").unwrap(), b"yes");
+    assert_eq!(db.get(b"persist").unwrap().unwrap(), b"yes");
   }
 
   #[serial(fd)]
@@ -5034,7 +5047,7 @@ mod tests {
     // Non-blocking flush: should return immediately.
     db.flush(&crate::FlushOptions { wait: false }).unwrap();
     // Data must be readable regardless of whether the flush has completed yet.
-    assert_eq!(db.get(b"k0").unwrap(), b"v");
+    assert_eq!(db.get(b"k0").unwrap().unwrap(), b"v");
   }
 
   // ── ForwardIter tests ────────────────────────────────────────────────────
@@ -5142,7 +5155,7 @@ mod tests {
     // At least some keys should be recoverable from SSTables.
     let mut found = 0;
     for i in 0..20u32 {
-      if db.get(format!("key{i:03}").as_bytes()).is_ok() {
+      if matches!(db.get(format!("key{i:03}").as_bytes()), Ok(Some(_))) {
         found += 1;
       }
     }
@@ -5168,7 +5181,7 @@ mod tests {
     }
     Db::repair(dir.path(), create_options()).unwrap();
     let db = Db::open(dir.path(), Options::default()).unwrap();
-    assert_eq!(db.get(b"from_wal").unwrap(), b"yes");
+    assert_eq!(db.get(b"from_wal").unwrap().unwrap(), b"yes");
   }
 
   #[test]
@@ -5249,7 +5262,7 @@ mod tests {
     }
     // Reopen with the same comparator.
     let db = Db::open(dir.path(), opts).unwrap();
-    assert_eq!(db.get(b"b").unwrap(), b"2");
+    assert_eq!(db.get(b"b").unwrap().unwrap(), b"2");
 
     let mut it = db.new_iterator(&ReadOptions::default()).unwrap();
     it.seek_to_first();
@@ -5302,7 +5315,7 @@ mod tests {
         ..Default::default()
       };
       let db = Db::open(dir.path(), opts).unwrap();
-      assert_eq!(db.get(b"key").unwrap(), b"value");
+      assert_eq!(db.get(b"key").unwrap().unwrap(), b"value");
       // At least one SSTable should exist (the flushed WAL data).
       let total_files: usize = (0..7)
         .map(|l| {
@@ -5336,7 +5349,7 @@ mod tests {
         ..Default::default()
       };
       let db = Db::open(dir.path(), opts).unwrap();
-      assert_eq!(db.get(b"key").unwrap(), b"value");
+      assert_eq!(db.get(b"key").unwrap().unwrap(), b"value");
       // Memory usage should be > 0 (data in memtable, not flushed).
       let mem_usage: usize = db
         .get_property("leveldb.approximate-memory-usage")
@@ -5445,12 +5458,15 @@ mod tests {
 
     // "keep_" keys should survive.
     for i in 0..20u32 {
-      assert_eq!(db.get(format!("keep_{i:03}").as_bytes()).unwrap(), b"hi");
+      assert_eq!(
+        db.get(format!("keep_{i:03}").as_bytes()).unwrap().unwrap(),
+        b"hi"
+      );
     }
     // "drop_" keys should be gone.
     for i in 0..20u32 {
       assert!(
-        db.get(format!("drop_{i:03}").as_bytes()).is_err(),
+        db.get(format!("drop_{i:03}").as_bytes()).unwrap().is_none(),
         "drop_{i:03} should have been removed by compaction filter"
       );
     }
@@ -5483,7 +5499,7 @@ mod tests {
     db.compact_range(None, None).unwrap();
 
     for i in 0..20u32 {
-      let val = db.get(format!("key{i:03}").as_bytes()).unwrap();
+      let val = db.get(format!("key{i:03}").as_bytes()).unwrap().unwrap();
       let expected = format!("HELLO{i:03}");
       assert_eq!(
         val,
@@ -5770,24 +5786,21 @@ mod tests {
     let got = rx
       .recv_timeout(Duration::from_secs(10))
       .expect("get blocked behind an in-flight WAL append");
-    assert_eq!(got.unwrap(), b"1");
+    assert_eq!(got.unwrap().unwrap(), b"1");
     // The sequence number of the in-flight write is reserved but not yet
     // published: it is invisible now, and stays invisible to a snapshot
     // taken now even after it completes.
-    assert!(db.get(b"b").unwrap_err().is_not_found());
+    assert!(db.get(b"b").unwrap().is_none());
     let snap = db.get_snapshot();
 
     gate.release();
     writer.join().unwrap().unwrap();
-    assert_eq!(db.get(b"b").unwrap(), b"2");
+    assert_eq!(db.get(b"b").unwrap().unwrap(), b"2");
     let at_snap = ReadOptions {
       snapshot: Some(&snap),
       ..ReadOptions::default()
     };
-    assert!(db
-      .get_with_options(&at_snap, b"b")
-      .unwrap_err()
-      .is_not_found());
+    assert!(db.get_with_options(&at_snap, b"b").unwrap().is_none());
   }
 
   /// `Db::flush` rotates the memtable and WAL; it must wait for a leader whose
@@ -5814,7 +5827,8 @@ mod tests {
           let key = format!("w{w}-{i:04}");
           let got = db
             .get(key.as_bytes())
-            .unwrap_or_else(|e| panic!("{phase}: {key} → {e:?}"));
+            .unwrap_or_else(|e| panic!("{phase}: {key} → {e:?}"))
+            .unwrap_or_else(|| panic!("{phase}: {key} missing"));
           assert_eq!(got, format!("{w}:{i}").as_bytes(), "{phase}: {key}");
         }
       }
@@ -5868,9 +5882,9 @@ mod tests {
     assert!(db.put(b"c", b"3").is_err());
     assert!(db.flush(&crate::FlushOptions { wait: true }).is_err());
 
-    assert_eq!(db.get(b"a").unwrap(), b"1");
-    assert!(db.get(b"b").unwrap_err().is_not_found());
-    assert!(db.get(b"c").unwrap_err().is_not_found());
+    assert_eq!(db.get(b"a").unwrap().unwrap(), b"1");
+    assert!(db.get(b"b").unwrap().is_none());
+    assert!(db.get(b"c").unwrap().is_none());
   }
 
   /// The MANIFEST's `last_sequence` is the recovery watermark: WAL records at
@@ -5921,7 +5935,12 @@ mod tests {
       (b"z", b"4"),
       (b"q", b"5"),
     ] {
-      assert_eq!(db.get(k).unwrap(), v, "{}", String::from_utf8_lossy(k));
+      assert_eq!(
+        db.get(k).unwrap().unwrap(),
+        v,
+        "{}",
+        String::from_utf8_lossy(k)
+      );
     }
   }
 
@@ -5956,10 +5975,10 @@ mod tests {
     }
     db.flush(&crate::FlushOptions { wait: true }).unwrap();
     let missing = (0..n)
-      .filter(|&i| db.get(key(i).as_bytes()).is_err())
+      .filter(|&i| db.get(key(i).as_bytes()).unwrap().is_none())
       .count();
     let missing_w = (2 * n..2 * n + 4729)
-      .filter(|&i| db.get(key(i).as_bytes()).is_err())
+      .filter(|&i| db.get(key(i).as_bytes()).unwrap().is_none())
       .count();
     eprintln!("{}", db.get_property("leveldb.sstables").unwrap());
     eprintln!("setup keys missing: {missing}; writer keys missing: {missing_w}");
@@ -5999,8 +6018,8 @@ mod tests {
     drop(db);
 
     let db = Db::open("/db", opts(Arc::new(crashed))).unwrap();
-    assert_eq!(db.get(b"a").unwrap(), b"1");
-    assert_eq!(db.get(b"b").unwrap(), b"2");
+    assert_eq!(db.get(b"a").unwrap().unwrap(), b"1");
+    assert_eq!(db.get(b"b").unwrap().unwrap(), b"2");
   }
 
   /// The MANIFEST never recorded the file number of the WAL a crashed flush
@@ -6040,8 +6059,8 @@ mod tests {
     let disk = crash_mid_flush(disk, &|_| {});
 
     let db = Db::open("/db", opts(disk)).unwrap();
-    assert_eq!(db.get(b"a").unwrap(), b"1");
-    assert_eq!(db.get(b"b").unwrap(), b"2");
+    assert_eq!(db.get(b"a").unwrap().unwrap(), b"1");
+    assert_eq!(db.get(b"b").unwrap().unwrap(), b"2");
   }
 
   /// A flush whose MANIFEST edit fails is not installed, so the old WAL is
@@ -6064,7 +6083,7 @@ mod tests {
     drop(db);
 
     let db = Db::open("/db", opts()).unwrap();
-    assert_eq!(db.get(b"a").unwrap(), b"1");
+    assert_eq!(db.get(b"a").unwrap().unwrap(), b"1");
   }
 
   /// A flush whose MANIFEST sync fails may still have its edit on disk, while
@@ -6088,7 +6107,7 @@ mod tests {
     drop(db);
 
     let db = Db::open("/db", opts()).unwrap();
-    assert_eq!(db.get(b"a").unwrap(), b"1");
+    assert_eq!(db.get(b"a").unwrap().unwrap(), b"1");
   }
 
   // ── Compaction failures are sticky ──────────────────────────────────────────
@@ -6122,8 +6141,8 @@ mod tests {
     drop(db);
 
     let db = Db::open("/db", opts()).unwrap();
-    assert_eq!(db.get(b"a").unwrap(), b"2");
-    assert_eq!(db.get(b"b").unwrap(), b"1");
+    assert_eq!(db.get(b"a").unwrap().unwrap(), b"2");
+    assert_eq!(db.get(b"b").unwrap().unwrap(), b"1");
   }
 
   /// After a background error nothing more may be installed in the MANIFEST.
@@ -6210,8 +6229,8 @@ mod tests {
     drop(db);
 
     let db = Db::open("/db", opts()).unwrap();
-    assert_eq!(db.get(b"a").unwrap(), round.to_string().as_bytes());
-    assert_eq!(db.get(b"z").unwrap(), round.to_string().as_bytes());
+    assert_eq!(db.get(b"a").unwrap().unwrap(), round.to_string().as_bytes());
+    assert_eq!(db.get(b"z").unwrap().unwrap(), round.to_string().as_bytes());
   }
 
   /// A compaction that cannot write its output is not retried in a loop by
@@ -6258,7 +6277,7 @@ mod tests {
 
     Db::repair("/db", opts()).unwrap();
     let db = Db::open("/db", opts()).unwrap();
-    assert_eq!(db.get(b"a").unwrap(), b"1");
+    assert_eq!(db.get(b"a").unwrap().unwrap(), b"1");
   }
 
   /// A crash during the first write to a fresh WAL can leave less than one
@@ -6291,6 +6310,6 @@ mod tests {
     drop(file);
 
     let db = Db::open("/db", opts()).unwrap();
-    assert_eq!(db.get(b"a").unwrap(), b"1");
+    assert_eq!(db.get(b"a").unwrap().unwrap(), b"1");
   }
 }

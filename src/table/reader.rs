@@ -32,7 +32,7 @@ pub(crate) enum LookupResult {
   /// The key was found and has this value.
   Value(Vec<u8>),
   /// The key has a deletion tombstone in this table.  The caller should
-  /// return `NotFound` without consulting older files.
+  /// report the key as absent without consulting older files.
   Deleted,
   /// The key is not present in this table at all.  The caller may check
   /// older (lower-numbered) L0 files.

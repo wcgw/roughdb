@@ -50,10 +50,9 @@ db.put(b"hello", b"world")?;
 db.delete(b"hello")?;
 
 // Read
-match db.get(b"hello") {
-    Ok(value) => println!("got: {}", String::from_utf8_lossy(&value)),
-    Err(e) if e.is_not_found() => println!("not found"),
-    Err(e) => return Err(e),
+match db.get(b"hello")? {
+    Some(value) => println!("got: {}", String::from_utf8_lossy(&value)),
+    None => println!("not found"),
 }
 ```
 

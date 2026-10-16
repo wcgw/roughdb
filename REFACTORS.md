@@ -53,9 +53,12 @@ change no public API.  Items 6–10 do, and are acceptable as a 0.x minor bump.
 
 ## Public API (breaking)
 
-- [ ] **6. `get` returns `Result<Option<Vec<u8>>, Error>`; `Error::NotFound` goes.**  A missing key is not a
+- [x] **6. `get` returns `Result<Option<Vec<u8>>, Error>`; `Error::NotFound` goes.**  A missing key is not a
   failure, yet every caller writes `Err(e) if e.is_not_found()` (README, crate docs, `examples/cli.rs`, benches).
   `NotFound` is LevelDB's C++ `Status` showing through.
+  *Done:* `get` and `get_with_options` return `Ok(None)` for an absent or deleted key; `Error::NotFound` and
+  `Error::is_not_found` are gone.  README, crate docs, `examples/cli.rs` and the benches match; the benches now
+  assert hits are present instead of only that the call succeeded.
 
 - [ ] **7. Error type polish.**  `Display` as lowercase one-liners (today `"NotFound"`, `"Corruption: …"`);
   `#[non_exhaustive]` (used nowhere in the crate); `IoError(Arc<io::Error>)`, so that the `Clone` the sticky

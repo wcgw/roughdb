@@ -385,10 +385,11 @@ mod tests {
     db.write(&WriteOptions::default(), batch).unwrap();
     assert!(db
       .get_with_options(&ReadOptions::default(), b"foo")
-      .unwrap_err()
-      .is_not_found());
+      .unwrap()
+      .is_none());
     assert_eq!(
       db.get_with_options(&ReadOptions::default(), b"baz")
+        .unwrap()
         .unwrap(),
       b"qux"
     );

@@ -123,8 +123,9 @@ Features are listed in dependency order. Each phase must be complete before the 
 
 *Prerequisite for everything.*
 
-- [x] **`Error`** (`src/error.rs`): `Result`-based error type with variants `NotFound`, `Corruption`, `InvalidArgument`,
-  `NotSupported`, `IoError`. `Db::get/put/delete` now return `Result<_, Error>`. See `include/leveldb/status.h`.
+- [x] **`Error`** (`src/error.rs`): `Result`-based error type with variants `Corruption`, `InvalidArgument`,
+  `NotSupported`, `IoError`. `Db::get/put/delete` now return `Result<_, Error>`; `get` returns `Ok(None)` for an
+  absent key (LevelDB's `NotFound` status is not an error variant). See `include/leveldb/status.h`.
 - [x] **`WriteBatch`**: Serialises a sequence of Put/Delete operations into a byte buffer. Batch format: `[seq:
   u64][count: u32][records…]` where each record is `[vtype: u8][klen: varint][key][vlen: varint][value]`. Exposes `put`,
   `delete`, `iterate(Handler)`, `approximate_size`. `Clone`-able. `Db::put`/`delete` are thin wrappers over `Db::write`.
