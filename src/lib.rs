@@ -1248,7 +1248,7 @@ impl Db {
     // level N+1, and there is no level above NUM_LEVELS-1.
     let stop = max_level.min(NUM_LEVELS - 2);
     for level in 0..=stop {
-      compact_level_range(
+      if let Err(e) = compact_level_range(
         path,
         &self.inner.state,
         &self.inner.options,
@@ -1256,7 +1256,11 @@ impl Db {
         level,
         begin,
         end,
-      )?;
+      ) {
+        let mut g = self.inner.state.lock().unwrap();
+        record_background_error(&self.inner, &mut g, e.clone());
+        return Err(e);
+      }
     }
 
     Ok(())
@@ -1829,6 +1833,20 @@ fn maybe_schedule_compaction(inner: &Arc<DbInner>, g: &mut DbState) {
   inner.bg_condvar.notify_one();
 }
 
+/// Make `e` the sticky background error, unless one is already set, and wake
+/// every writer waiting on the background thread so it sees it.
+///
+/// A failed compaction is fatal for the same reason a failed flush is: its
+/// MANIFEST edit may or may not have reached disk, so neither the MANIFEST
+/// nor the in-memory `Version` can be trusted to say which files are live.
+/// Port of LevelDB `DBImpl::RecordBackgroundError`.
+fn record_background_error(inner: &DbInner, g: &mut DbState, e: Error) {
+  if g.background_error.is_none() {
+    g.background_error = Some(e);
+    inner.write_condvar.notify_all();
+  }
+}
+
 /// Called by the write leader (while holding the lock) to ensure there is room
 /// in the memtable.  May sleep or wait on `write_condvar` if the system is
 /// under write pressure.  Returns the (possibly re-acquired) lock guard.
@@ -1946,7 +1964,10 @@ fn bg_worker(inner: Arc<DbInner>) {
     } else if !shutting_down {
       // ── Compaction (skipped on shutdown path) ────────────────────────────
       drop(g);
-      maybe_compact(&path, &inner.state, &inner.options, &tc);
+      if let Err(e) = maybe_compact(&path, &inner.state, &inner.options, &tc) {
+        log::error!("bg: compaction failed: {e}, stopping writes");
+        record_background_error(&inner, &mut inner.state.lock().unwrap(), e);
+      }
       delete_obsolete_files(&path, &inner.state, &*fs);
       inner.write_condvar.notify_all();
       g = inner.state.lock().unwrap();
@@ -2329,6 +2350,10 @@ fn install_compaction(
   outputs: Vec<CompactionOutput>,
   tc: &crate::db::table_cache::TableCache,
 ) -> Result<(), Error> {
+  // Nothing may be installed once the MANIFEST's state is unknown.
+  if let Some(e) = &state.background_error {
+    return Err(e.clone());
+  }
   let vs = state
     .version_set
     .as_mut()
@@ -2385,6 +2410,9 @@ fn compact_level_range(
   // Phase 1: snapshot.
   let (version, oldest_snapshot) = {
     let g = state.lock().unwrap();
+    if let Some(e) = &g.background_error {
+      return Err(e.clone());
+    }
     let vs = match &g.version_set {
       Some(vs) => vs,
       None => return Ok(false),
@@ -2445,6 +2473,10 @@ fn install_trivial_move(
   spec: &Compaction,
   tc: &crate::db::table_cache::TableCache,
 ) -> Result<(), Error> {
+  // As in `install_compaction`.
+  if let Some(e) = &state.background_error {
+    return Err(e.clone());
+  }
   let vs = state
     .version_set
     .as_mut()
@@ -2491,20 +2523,22 @@ fn install_trivial_move(
 ///   2. Run I/O (MergingIterator + SSTable writes) without the lock.
 ///   3. Install the result (VersionEdit + log_and_apply) under the lock.
 ///
-/// Errors are silently ignored — a failed compaction does not affect
-/// correctness; the triggering level will be retried on the next call.
+/// Any failure is returned for the caller to record as the sticky background
+/// error (see `record_background_error`), as LevelDB's `DoCompactionWork`
+/// does: a failed install leaves the MANIFEST in an unknown state, and a
+/// failed merge would only be retried in a loop.
 fn maybe_compact(
   path: &std::path::Path,
   state: &Mutex<DbState>,
   opts: &Options,
   tc: &crate::db::table_cache::TableCache,
-) {
+) -> Result<(), Error> {
   // Phase 1: snapshot.
   let (version, oldest_snapshot, compact_pointer, seek_compact_file) = {
     let mut g = state.lock().unwrap();
     let (current, compact_ptr) = match &g.version_set {
       Some(vs) => (vs.current(), vs.compact_pointer().clone()),
-      None => return,
+      None => return Ok(()),
     };
     let oldest = g
       .snapshots
@@ -2520,13 +2554,13 @@ fn maybe_compact(
   };
 
   if !needs_compaction(&version, seek_compact_file.is_some()) {
-    return;
+    return Ok(());
   }
 
   let mut spec = match pick_compaction(&version, &compact_pointer, opts, seek_compact_file.as_ref())
   {
     Some(s) => s,
-    None => return,
+    None => return Ok(()),
   };
 
   // Trivial move: single file, no L+1 overlap, acceptable grandparent overlap.
@@ -2540,13 +2574,9 @@ fn maybe_compact(
       spec.level,
       spec.level + 1,
     );
-    let mut g = state.lock().unwrap();
-    if let Err(e) = install_trivial_move(&mut g, &spec, tc) {
-      log::warn!("trivial move failed: {e}");
-    }
-    drop(g);
+    install_trivial_move(&mut state.lock().unwrap(), &spec, tc)?;
     delete_obsolete_files(path, state, &*opts.file_system);
-    return;
+    return Ok(());
   }
 
   // Phase 2: I/O (no lock; the allocator takes it briefly per output file).
@@ -2554,28 +2584,13 @@ fn maybe_compact(
     let mut g = state.lock().unwrap();
     g.version_set.as_mut().unwrap().next_file_number()
   };
-  let outputs = match do_compaction(path, &mut alloc, &mut spec, oldest_snapshot, opts, tc) {
-    Ok(o) => o,
-    Err(e) => {
-      log::warn!("compaction L{}→L{} failed: {e}", spec.level, spec.level + 1);
-      return;
-    }
-  };
+  let outputs = do_compaction(path, &mut alloc, &mut spec, oldest_snapshot, opts, tc)?;
 
   // Phase 3: install.
-  {
-    let mut g = state.lock().unwrap();
-    if let Err(e) = install_compaction(&mut g, &spec, outputs, tc) {
-      log::warn!(
-        "install_compaction L{}→L{} failed: {e}",
-        spec.level,
-        spec.level + 1
-      );
-      return;
-    }
-  }
+  install_compaction(&mut state.lock().unwrap(), &spec, outputs, tc)?;
 
   delete_obsolete_files(path, state, &*opts.file_system);
+  Ok(())
 }
 
 // ── DeleteObsoleteFiles ───────────────────────────────────────────────────────
@@ -5541,8 +5556,21 @@ mod tests {
     };
     use crate::error::Error;
     use std::path::Path;
-    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
     use std::sync::{Arc, Condvar, Mutex};
+
+    /// Count one call against an armed countdown (see `fail_manifest_sync_after`);
+    /// `true` for the one call it was armed to fail.
+    fn countdown(calls_left: &AtomicUsize) -> bool {
+      let mut n = calls_left.load(SeqCst);
+      while n > 0 {
+        match calls_left.compare_exchange(n, n - 1, SeqCst, SeqCst) {
+          Ok(_) => return n == 1,
+          Err(current) => n = current,
+        }
+      }
+      false
+    }
 
     #[derive(Default)]
     pub struct Gate {
@@ -5556,6 +5584,10 @@ mod tests {
       fail_manifest_append: AtomicBool,
       /// Every MANIFEST sync fails with an I/O error; appends still land.
       fail_manifest_sync: AtomicBool,
+      /// Countdown to the one MANIFEST sync that fails; 0 when disarmed.
+      manifest_syncs_until_failure: AtomicUsize,
+      /// Countdown to the one SSTable create that fails; 0 when disarmed.
+      table_creates_until_failure: AtomicUsize,
       /// `(a gated call is blocked, released)`.
       blocked: Mutex<(bool, bool)>,
       cv: Condvar,
@@ -5587,6 +5619,14 @@ mod tests {
       }
       pub fn fail_manifest_syncs(&self, fail: bool) {
         self.fail_manifest_sync.store(fail, SeqCst);
+      }
+      /// Let the next `n` MANIFEST syncs succeed, then fail exactly one.
+      pub fn fail_manifest_sync_after(&self, n: usize) {
+        self.manifest_syncs_until_failure.store(n + 1, SeqCst);
+      }
+      /// Let the next `n` SSTable creates succeed, then fail exactly one.
+      pub fn fail_table_create_after(&self, n: usize) {
+        self.table_creates_until_failure.store(n + 1, SeqCst);
       }
       /// Block the calling thread until `release()`.
       fn park(&self) {
@@ -5642,7 +5682,9 @@ mod tests {
         self.inner.flush()
       }
       fn sync(&mut self) -> Result<(), Error> {
-        if self.gate.fail_manifest_sync.load(SeqCst) {
+        if self.gate.fail_manifest_sync.load(SeqCst)
+          || countdown(&self.gate.manifest_syncs_until_failure)
+        {
           return Err(Error::IoError(std::io::Error::other(
             "injected MANIFEST sync failure",
           )));
@@ -5697,10 +5739,15 @@ mod tests {
         Ok(self.wrap(p, self.inner.open_appendable(p)?))
       }
       fn create_writable(&self, p: &Path) -> Result<Box<dyn WritableFile>, Error> {
-        if p.extension().is_some_and(|e| e == "ldb")
-          && self.gate.arm_table_block.swap(false, SeqCst)
-        {
-          self.gate.park();
+        if p.extension().is_some_and(|e| e == "ldb") {
+          if self.gate.arm_table_block.swap(false, SeqCst) {
+            self.gate.park();
+          }
+          if countdown(&self.gate.table_creates_until_failure) {
+            return Err(Error::IoError(std::io::Error::other(
+              "injected SSTable create failure",
+            )));
+          }
         }
         Ok(self.wrap(p, self.inner.create_writable(p)?))
       }
@@ -6093,5 +6140,152 @@ mod tests {
 
     let db = Db::open("/db", opts()).unwrap();
     assert_eq!(db.get(b"a").unwrap(), b"1");
+  }
+
+  // ── Compaction failures are sticky ──────────────────────────────────────────
+
+  /// A compaction whose MANIFEST sync fails may still have its edit on disk,
+  /// naming outputs the in-memory `Version` never installed.  The failure must
+  /// stop writes: otherwise the next flush's file GC deletes those outputs,
+  /// and the reopened database cannot read what they hold.
+  #[test]
+  fn compact_range_whose_manifest_sync_fails_stops_writes() {
+    use std::sync::Arc;
+    let (fs, gate) = gated_fs::GatedFs::gated();
+    let opts = || Options {
+      create_if_missing: true,
+      file_system: Arc::clone(&fs),
+      ..Options::default()
+    };
+    let flush = |db: &Db| db.flush(&crate::FlushOptions { wait: true });
+    let db = Db::open("/db", opts()).unwrap();
+    db.put(b"a", b"1").unwrap();
+    flush(&db).unwrap();
+    db.put(b"a", b"2").unwrap();
+    db.put(b"b", b"1").unwrap();
+    flush(&db).unwrap();
+
+    gate.fail_manifest_syncs(true);
+    assert!(db.compact_range(None, None).is_err());
+    gate.fail_manifest_syncs(false);
+    assert!(db.put(b"c", b"1").is_err());
+    assert!(flush(&db).is_err());
+    drop(db);
+
+    let db = Db::open("/db", opts()).unwrap();
+    assert_eq!(db.get(b"a").unwrap(), b"2");
+    assert_eq!(db.get(b"b").unwrap(), b"1");
+  }
+
+  /// After a background error nothing more may be installed in the MANIFEST.
+  /// A retried compaction would otherwise add its outputs next to the outputs
+  /// of an edit that failed but may be on disk, overlapping them at L1.
+  #[test]
+  fn compact_range_after_a_background_error_fails() {
+    let (fs, gate) = gated_fs::GatedFs::gated();
+    let db = Db::open(
+      "/db",
+      Options {
+        create_if_missing: true,
+        file_system: fs,
+        ..Options::default()
+      },
+    )
+    .unwrap();
+    db.put(b"a", b"1").unwrap();
+    db.flush(&crate::FlushOptions { wait: true }).unwrap();
+
+    gate.fail_appends(true);
+    assert!(db.put(b"b", b"2").is_err());
+    gate.fail_appends(false);
+    assert!(db.compact_range(None, None).is_err());
+  }
+
+  /// Flush overlapping memtables until L0 is one file short of the compaction
+  /// trigger.  Returns the number of the last round written.
+  fn fill_l0_to_one_below_trigger(db: &Db) -> u32 {
+    let l0_files = || {
+      let n = db.get_property("leveldb.num-files-at-level0").unwrap();
+      n.parse::<usize>().unwrap()
+    };
+    let mut round = 0;
+    while l0_files() + 1 < crate::db::version::L0_COMPACTION_TRIGGER {
+      round += 1;
+      write_round(db, round);
+      db.flush(&crate::FlushOptions { wait: true }).unwrap();
+      assert!(round < 20, "L0 does not fill up");
+    }
+    round
+  }
+
+  /// Write `a` and `z`, so that every flush overlaps the previous one.
+  fn write_round(db: &Db, round: u32) {
+    db.put(b"a", round.to_string()).unwrap();
+    db.put(b"z", round.to_string()).unwrap();
+  }
+
+  /// Wait for the background thread to record an error; `Db::flush` reports
+  /// it once it is set.
+  fn wait_for_background_error(db: &Db) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while db.flush(&crate::FlushOptions { wait: true }).is_ok() {
+      assert!(
+        std::time::Instant::now() < deadline,
+        "no background error recorded"
+      );
+      std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+  }
+
+  /// The background thread's compactions follow the same rule as
+  /// `compact_range`: a failed install stops writes, and nothing is lost.
+  #[test]
+  fn background_compaction_whose_manifest_sync_fails_stops_writes() {
+    use std::sync::Arc;
+    let (fs, gate) = gated_fs::GatedFs::gated();
+    let opts = || Options {
+      create_if_missing: true,
+      file_system: Arc::clone(&fs),
+      ..Options::default()
+    };
+    let db = Db::open("/db", opts()).unwrap();
+    let round = fill_l0_to_one_below_trigger(&db) + 1;
+    // This flush's MANIFEST sync succeeds; the compaction it triggers fails.
+    // The flush may return after the compaction already failed, and then
+    // reports that error, so its result is not checked.
+    gate.fail_manifest_sync_after(1);
+    write_round(&db, round);
+    let _ = db.flush(&crate::FlushOptions { wait: true });
+    wait_for_background_error(&db);
+    assert!(db.put(b"b", b"1").is_err());
+    drop(db);
+
+    let db = Db::open("/db", opts()).unwrap();
+    assert_eq!(db.get(b"a").unwrap(), round.to_string().as_bytes());
+    assert_eq!(db.get(b"z").unwrap(), round.to_string().as_bytes());
+  }
+
+  /// A compaction that cannot write its output is not retried in a loop by
+  /// the background thread: the error sticks, as in LevelDB.
+  #[test]
+  fn background_compaction_whose_output_create_fails_stops_writes() {
+    let (fs, gate) = gated_fs::GatedFs::gated();
+    let db = Db::open(
+      "/db",
+      Options {
+        create_if_missing: true,
+        file_system: fs,
+        ..Options::default()
+      },
+    )
+    .unwrap();
+    let round = fill_l0_to_one_below_trigger(&db) + 1;
+    // This flush creates its SSTable; the compaction it triggers cannot.  As
+    // above, the flush may already report the compaction's error.
+    gate.fail_table_create_after(1);
+    write_round(&db, round);
+    let _ = db.flush(&crate::FlushOptions { wait: true });
+    wait_for_background_error(&db);
+    assert!(db.put(b"b", b"1").is_err());
   }
 }

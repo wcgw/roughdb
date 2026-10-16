@@ -46,7 +46,9 @@ The read path checks `mem` → `imm` → each level of SSTables (newest to oldes
   the `DbState` mutex, releases it for the WAL append / fsync / memtable insert (LevelDB's `mutex_.Unlock()` around
   `AddRecord`), then re-locks to publish `last_sequence` and retire the group.  `DbState::write_in_progress` marks
   that window; `Db::flush` waits for it before rotating the memtable or WAL.  A WAL write/sync error becomes the
-  sticky `background_error`.
+  sticky `background_error`, as does any flush or compaction failure (`record_background_error`, LevelDB's
+  `RecordBackgroundError`): a failed MANIFEST edit may or may not be on disk, so after one nothing more is
+  installed and file GC stops.
 - **Recovery watermark**: `VersionSet::last_sequence` (persisted in every MANIFEST edit) is the highest sequence
   whose data is in an SSTable, not the live write counter; `Db::open` skips WAL records at or below it.  Only a
   flush advances it (`last_sequence_at_rotation`); compactions and `reuse_logs` recovery must leave it alone, or a
